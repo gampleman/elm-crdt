@@ -1,0 +1,9 @@
+elm-stuff/
+node_modules/
+docs.json
+
+# demo build artifact
+demo/elm.js
+
+# editor / OS
+.DS_Store

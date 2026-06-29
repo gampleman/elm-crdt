@@ -1,0 +1,82 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  elm:
+    name: Elm package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache ~/.elm
+        uses: actions/cache@v4
+        with:
+          path: ~/.elm
+          key: elm-${{ hashFiles('elm.json', 'review/elm.json') }}
+          restore-keys: elm-
+
+      - name: Install Elm tooling
+        run: npm ci
+
+      - name: Compile package (with docs)
+        run: npm run test:make
+
+      - name: Check formatting
+        run: npm run test:format
+
+      - name: Run elm-review
+        run: npm run test:review
+
+      - name: Run tests
+        run: npm run test:unit
+
+  demo:
+    name: Demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache ~/.elm
+        uses: actions/cache@v4
+        with:
+          path: ~/.elm
+          key: elm-${{ hashFiles('elm.json', 'demo/elm.json') }}
+          restore-keys: elm-
+
+      - name: Install Elm tooling
+        run: npm ci
+
+      - name: Build demo
+        run: npm run build:demo
+
+  publish-elm:
+    name: Publish Elm package
+    needs: [elm, demo]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Elm tooling
+        run: npm ci
+
+      - name: Publish
+        uses: dillonkearns/elm-publish-action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-elm: ./node_modules/.bin/elm

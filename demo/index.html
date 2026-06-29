@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>elm-crdt — collaborative board</title>
+    <style>
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1a1a2e;
+      }
+      body {
+        margin: 0;
+        background: #f4f5fb;
+      }
+      .app {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 1.5rem;
+      }
+      .header {
+        display: flex;
+        align-items: baseline;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+      .header h1 {
+        font-size: 1.25rem;
+        margin: 0;
+      }
+      .replica {
+        font-family: ui-monospace, monospace;
+        color: #6b6b8a;
+        font-size: 0.85rem;
+      }
+      .status.online {
+        color: #1b8a5a;
+      }
+      .status.offline {
+        color: #c0392b;
+      }
+      .columns {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 1.5rem;
+        margin-top: 1rem;
+      }
+      .board,
+      .sidebar > div {
+        background: #fff;
+        border-radius: 10px;
+        padding: 1rem 1.25rem;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+      }
+      .sidebar > div {
+        margin-bottom: 1rem;
+      }
+      h2 {
+        font-size: 0.95rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #6b6b8a;
+        margin: 1rem 0 0.5rem;
+      }
+      input {
+        font: inherit;
+        padding: 0.35rem 0.5rem;
+        border: 1px solid #d6d6e7;
+        border-radius: 6px;
+      }
+      input[type="checkbox"] {
+        width: auto;
+      }
+      button {
+        font: inherit;
+        cursor: pointer;
+        border: 1px solid #d6d6e7;
+        background: #fafaff;
+        border-radius: 6px;
+        padding: 0.3rem 0.6rem;
+      }
+      ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }
+      .todo,
+      .notes li {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        margin-bottom: 0.4rem;
+      }
+      .add-row {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+      }
+      .peer {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.35rem;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        display: inline-block;
+      }
+      .editing {
+        font-size: 0.8rem;
+        color: #6b6b8a;
+      }
+      .checkpoint {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.85rem;
+        margin-bottom: 0.35rem;
+      }
+      .checkpoint.active {
+        font-weight: 600;
+      }
+      .cp-msg {
+        flex: 1;
+      }
+      .cp-author {
+        font-family: ui-monospace, monospace;
+        color: #9a9ab5;
+        font-size: 0.75rem;
+      }
+      .preview-banner {
+        margin-top: 0.5rem;
+        padding: 0.5rem;
+        background: #fff7e6;
+        border-radius: 6px;
+        font-size: 0.85rem;
+      }
+      .error {
+        color: #c0392b;
+        padding: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="elm.js"></script>
+    <script src="index.js"></script>
+  </body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "name": "elm-crdt",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tooling for the gampleman/elm-crdt Elm package and its demo",
+  "scripts": {
+    "test": "npm-run-all test:make test:format test:review test:unit",
+    "test:make": "elm make --docs=docs.json",
+    "test:format": "elm-format --validate src/ tests/ review/src/",
+    "test:review": "elm-review",
+    "test:unit": "elm-test-rs",
+    "build:demo": "cd demo && elm make src/Main.elm --output elm.js",
+    "docs": "elm-doc-preview",
+    "fix": "npm-run-all fix:format fix:review",
+    "fix:format": "elm-format --yes src/ tests/ review/src/",
+    "fix:review": "elm-review --fix-all",
+    "elm-bump": "npm run test && elm bump && npm run fix:review"
+  },
+  "dependencies": {
+    "elm": "0.19.1-6",
+    "elm-doc-preview": "6.0.1",
+    "elm-format": "0.8.8",
+    "elm-json": "0.2.13",
+    "elm-review": "2.13.5",
+    "elm-test-rs": "3.0.2-0",
+    "npm-run-all": "4.1.5"
+  }
+}

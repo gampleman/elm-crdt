@@ -1,0 +1,18 @@
+{
+  "name": "elm-crdt-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Collaborative board demo for gampleman/elm-crdt",
+  "scripts": {
+    "start": "run-p start:relay start:client",
+    "start:relay": "node server/relay.js",
+    "start:client": "elm-live src/Main.elm --port=8000 --open --hot -- --output=elm.js",
+    "build": "elm make src/Main.elm --output=elm.js"
+  },
+  "dependencies": {
+    "elm": "0.19.1-6",
+    "elm-live": "4.0.2",
+    "npm-run-all": "4.1.5",
+    "ws": "^8.18.0"
+  }
+}
