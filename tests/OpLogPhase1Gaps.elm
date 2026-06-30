@@ -74,7 +74,17 @@ suite =
         --   now uses these instead of a local checkpoint list. Tested.
         -- Remaining history work:
         , todo "explicit fork/branch type from a Version + a way to diff/compare two branches"
-        , todo "undo/redo emit inverse ops that sync, replacing Crdt.History's local whole-root snapshot stacks"
+        -- undo/redo DONE (Loro-style LOCAL, op-log): OpDoc.recordEdit/undo/redo/
+        -- canUndo/canRedo. Inverts THIS replica's own ops as fresh ops (so it syncs
+        -- and converges), NOT a whole-state diff — a peer's concurrent edit to the
+        -- same list survives my undo. delete-undo re-creates content with a fresh id
+        -- (tombstones permanent); undo/redo self-record so cycles stay valid. Tested
+        -- tests/UndoTests.elm (16, incl. concurrent-survives, undo-syncs-to-peer,
+        -- stacks-survive-merge). Demo: undo/redo buttons; typing session (focus→blur)
+        -- and a whole drag-reorder each collapse to one step. (Old state-based
+        -- Crdt.History.undo/redo still exists for the legacy Crdt.Doc flavor.)
+        , test "undo/redo emit inverse ops that sync (DONE — see UndoTests)" <|
+            \_ -> Expect.pass
 
         -- Phase 5: moves + GC
         -- MoveElem: DONE via Crdt.MoveList (move-cells, max-OpId-cell wins) rather

@@ -164,6 +164,14 @@ type alias Model =
     -- dragged (local, ephemeral — never replicated)
     , dragging : Maybe Int
 
+    -- the document version captured at the start of a drag, so the whole reorder
+    -- (which emits a move op per slot crossed) records as ONE undo step on drop
+    , dragStartVersion : Maybe Version
+
+    -- version captured when a text field gained focus, so a whole typing session
+    -- (many keystroke ops) collapses into ONE undo step when the field blurs
+    , editStartVersion : Maybe Version
+
     -- history / version control (checkpoints now live in the doc itself)
     , checkpointMsg : String
     , viewing : Maybe Version -- Just v => time-travel preview (read-only)
@@ -203,6 +211,8 @@ init flags =
       , newTodo = ""
       , newNoteKey = ""
       , dragging = Nothing
+      , dragStartVersion = Nothing
+      , editStartVersion = Nothing
       , checkpointMsg = ""
       , viewing = Nothing
       , connected = False
@@ -242,6 +252,10 @@ type Msg
     | SaveCheckpoint
     | PreviewVersion Version
     | LeavePreview
+    | Scrub Int
+    | RestoreHere
+    | Undo
+    | Redo
       -- networking
     | GotMessage JD.Value
     | ConnectionChanged Bool
@@ -267,6 +281,9 @@ update msg model =
 
             else
                 let
+                    before =
+                        OpDoc.version model.doc
+
                     -- append a fresh todo subtree at the end of the list
                     doc1 =
                         model.doc
@@ -274,10 +291,13 @@ update msg model =
                                 (todoSchema |> S.with (Todo model.newTodo False))
                             |> orKeep model.doc
                 in
-                pushDoc { model | doc = doc1, newTodo = "" }
+                recordPush before { model | doc = doc1, newTodo = "" }
 
         ToggleTodo i ->
             let
+                before =
+                    OpDoc.version model.doc
+
                 current =
                     OpDoc.read model.doc
                         |> Result.toMaybe
@@ -290,17 +310,21 @@ update msg model =
                         |> OpDoc.setBool (todoDonePath i) (not current)
                         |> orKeep model.doc
             in
-            pushDoc { model | doc = doc1 }
+            recordPush before { model | doc = doc1 }
 
         RemoveTodo i ->
             let
+                before =
+                    OpDoc.version model.doc
+
                 doc1 =
                     model.doc |> OpDoc.listRemove todosPath i |> orKeep model.doc
             in
-            pushDoc { model | doc = doc1 }
+            recordPush before { model | doc = doc1 }
 
         DragStart i ->
-            ( { model | dragging = Just i }, Cmd.none )
+            -- capture the version now so the whole drag undoes as one step
+            ( { model | dragging = Just i, dragStartVersion = Just (OpDoc.version model.doc) }, Cmd.none )
 
         DragOver target ->
             case model.dragging of
@@ -323,7 +347,19 @@ update msg model =
                     ( model, Cmd.none )
 
         DragEnd ->
-            ( { model | dragging = Nothing }, Cmd.none )
+            -- record the entire reorder (all the per-slot moves) as one undo step
+            case model.dragStartVersion of
+                Just before ->
+                    ( { model
+                        | dragging = Nothing
+                        , dragStartVersion = Nothing
+                        , doc = OpDoc.recordEdit before model.doc
+                      }
+                    , Cmd.none
+                    )
+
+                Nothing ->
+                    ( { model | dragging = Nothing }, Cmd.none )
 
         NewNoteKeyChanged s ->
             ( { model | newNoteKey = s }, Cmd.none )
@@ -334,25 +370,57 @@ update msg model =
 
             else
                 let
+                    before =
+                        OpDoc.version model.doc
+
                     doc1 =
                         model.doc
                             |> OpDoc.setKey notesPath model.newNoteKey (S.text |> S.with "")
                             |> orKeep model.doc
                 in
-                pushDoc { model | doc = doc1, newNoteKey = "" }
+                recordPush before { model | doc = doc1, newNoteKey = "" }
 
         RemoveNote k ->
             let
+                before =
+                    OpDoc.version model.doc
+
                 doc1 =
                     model.doc |> OpDoc.removeKey notesPath k |> orKeep model.doc
             in
-            pushDoc { model | doc = doc1 }
+            recordPush before { model | doc = doc1 }
 
         FocusField fieldName ->
-            setEditing (Just fieldName) model
+            -- mark the start of a typing session so it undoes as one step
+            setEditing (Just fieldName) { model | editStartVersion = Just (OpDoc.version model.doc) }
 
         BlurField ->
-            setEditing Nothing model
+            -- close the typing session: record everything typed since focus as one
+            -- undo step (no-op if nothing changed)
+            let
+                model1 =
+                    case model.editStartVersion of
+                        Just before ->
+                            { model | doc = OpDoc.recordEdit before model.doc, editStartVersion = Nothing }
+
+                        Nothing ->
+                            model
+            in
+            setEditing Nothing model1
+
+        Undo ->
+            if OpDoc.canUndo model.doc then
+                pushDoc { model | doc = OpDoc.undo model.doc, viewing = Nothing }
+
+            else
+                ( model, Cmd.none )
+
+        Redo ->
+            if OpDoc.canRedo model.doc then
+                pushDoc { model | doc = OpDoc.redo model.doc, viewing = Nothing }
+
+            else
+                ( model, Cmd.none )
 
         CheckpointMsgChanged s ->
             ( { model | checkpointMsg = s }, Cmd.none )
@@ -376,6 +444,25 @@ update msg model =
 
         LeavePreview ->
             ( { model | viewing = Nothing }, Cmd.none )
+
+        Scrub n ->
+            -- scrubbing previews the version after the first `n` ops; dragging to
+            -- the end (n == historyLength) drops back to the live document
+            if n >= OpDoc.historyLength model.doc then
+                ( { model | viewing = Nothing }, Cmd.none )
+
+            else
+                ( { model | viewing = Just (OpDoc.versionAt n model.doc) }, Cmd.none )
+
+        RestoreHere ->
+            case model.viewing of
+                Just v ->
+                    -- restore emits fresh winning ops, so it syncs like any edit;
+                    -- leave the preview and broadcast the revert
+                    pushDoc { model | doc = OpDoc.restoreTo v model.doc, viewing = Nothing }
+
+                Nothing ->
+                    ( model, Cmd.none )
 
         GotMessage raw ->
             case decodeEnvelope raw of
@@ -488,6 +575,16 @@ publishCaret path caretOffset model =
 orKeep : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
 orKeep fallback result =
     Result.withDefault fallback result
+
+
+{-| Record the just-made edit on the local undo stack (bracketing it with the
+`before` version), then broadcast it. `model.doc` already holds the post-edit
+document; `before` is the version captured before the edit. Used by every discrete
+todo/note action so each is one Ctrl-Z step.
+-}
+recordPush : Version -> Model -> ( Model, Cmd Msg )
+recordPush before model =
+    pushDoc { model | doc = OpDoc.recordEdit before model.doc }
 
 
 {-| After any local change, broadcast only the **delta** since our last
@@ -950,6 +1047,15 @@ viewHistory : Model -> Html Msg
 viewHistory model =
     div [ class "history" ]
         [ h2 [] [ text "History" ]
+        , div [ class "undo-row" ]
+            [ button
+                [ onClick Undo, A.disabled (not (OpDoc.canUndo model.doc)), A.title "undo your last edit" ]
+                [ text "↶ undo" ]
+            , button
+                [ onClick Redo, A.disabled (not (OpDoc.canRedo model.doc)), A.title "redo" ]
+                [ text "↷ redo" ]
+            ]
+        , viewScrubber model
         , div [ class "add-row" ]
             [ input
                 [ value model.checkpointMsg
@@ -972,6 +1078,81 @@ viewHistory model =
             Nothing ->
                 text ""
         ]
+
+
+{-| A slider over the document's linear op history. Dragging it previews the state
+at that step (`OpDoc.versionAt`); the slider sits at the far right (live) when not
+previewing. While parked in the past, a "restore to here" button rewinds the live
+document to that point — as new ops, so the revert syncs to every peer.
+-}
+viewScrubber : Model -> Html Msg
+viewScrubber model =
+    let
+        len =
+            OpDoc.historyLength model.doc
+
+        pos =
+            scrubPosition model
+
+        previewing =
+            model.viewing /= Nothing
+    in
+    if len == 0 then
+        div [ class "scrubber empty" ] [ text "no history yet — make an edit" ]
+
+    else
+        div [ class "scrubber" ]
+            [ input
+                [ A.type_ "range"
+                , A.min "0"
+                , A.max (String.fromInt len)
+                , value (String.fromInt pos)
+                , A.step "1"
+                , class "scrub-range"
+                , on "input"
+                    (JD.at [ "target", "value" ] JD.string
+                        |> JD.map (\s -> Scrub (String.toInt s |> Maybe.withDefault len))
+                    )
+                ]
+                []
+            , div [ class "scrub-row" ]
+                [ span [ class "scrub-label" ]
+                    [ text
+                        (if previewing then
+                            "step " ++ String.fromInt pos ++ " of " ++ String.fromInt len
+
+                         else
+                            "live (" ++ String.fromInt len ++ " edits)"
+                        )
+                    ]
+                , if previewing then
+                    button [ class "restore-btn", onClick RestoreHere ] [ text "restore to here" ]
+
+                  else
+                    text ""
+                ]
+            ]
+
+
+{-| The slider's current step: the live end unless we're previewing a version
+reachable by scrubbing, in which case the matching step. (Checkpoint previews that
+don't line up with a scrub step just leave the thumb at the live end.)
+-}
+scrubPosition : Model -> Int
+scrubPosition model =
+    let
+        len =
+            OpDoc.historyLength model.doc
+    in
+    case model.viewing of
+        Nothing ->
+            len
+
+        Just v ->
+            List.range 0 len
+                |> List.filter (\n -> OpDoc.versionAt n model.doc == v)
+                |> List.head
+                |> Maybe.withDefault len
 
 
 viewCheckpoint : Maybe Version -> Checkpoint -> Html Msg

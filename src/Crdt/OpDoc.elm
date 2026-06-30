@@ -7,6 +7,8 @@ module Crdt.OpDoc exposing
     , opCount, cacheConsistent
     , cursorAt, cursorOffset, cursorRange
     , Version, version, readAt
+    , historyLength, versionAt, restoreTo
+    , recordEdit, undo, redo, canUndo, canRedo
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
     , gc
     , encode, encodeSince, decodeInto
@@ -33,6 +35,8 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs opCount, cacheConsistent
 @docs cursorAt, cursorOffset, cursorRange
 @docs Version, version, readAt
+@docs historyLength, versionAt, restoreTo
+@docs recordEdit, undo, redo, canUndo, canRedo
 @docs Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
 @docs gc
 @docs encode, encodeSince, decodeInto
@@ -95,7 +99,34 @@ type OpDoc a
         -- frontier) with a label + author, so a checkpoint is collaborative
         -- time-travel, not a local snapshot.
         , checkpoints : List Checkpoint
+
+        -- Loro-style LOCAL undo/redo. Each entry is the list of reverse actions
+        -- that inverts ONE local change — the inverses of exactly the ops that
+        -- change emitted (an insert ⇒ delete *that* element id; a `done` toggle ⇒
+        -- set it back; a counter +3 ⇒ −3). Because we invert our own ops rather
+        -- than diffing whole states, a peer's concurrent insert into the same list
+        -- is untouched, and a same-path conflict resolves by LWW (the undo, being a
+        -- fresh op, wins). The reverts are new ops, so undo/redo sync to peers.
+        --
+        -- Undo and redo each *self-record*: applying an entry emits ops, and the
+        -- opposite stack is rebuilt from the inverses of *those just-emitted* ops.
+        -- That keeps the stacks valid across cycles even though re-creating a
+        -- tombstoned element (delete is permanent) mints a fresh id each time.
+        --
+        -- Local and non-replicated (like checkpoints); preserved across `merge`.
+        , undoStack : List (List RevAction)
+        , redoStack : List (List RevAction)
         }
+
+
+{-| A single reverse step emitted during undo/redo. `Rev` carries an action ready
+to emit verbatim (with a fresh op id); `ReInsert` re-creates an element a delete
+removed — its id is minted at apply time (tombstones are permanent, so the revived
+element is a fresh one), positioned after `afterValue` in the live container.
+-}
+type RevAction
+    = Rev Action
+    | ReInsert { container : List TargetStep, afterValue : Maybe OpId, content : Node }
 
 
 {-| A named point in history: a label, the replica that saved it, and the
@@ -138,6 +169,8 @@ init replica schema =
         , lastAppend = Nothing
         , checkpoints = []
         , baseFrontier = []
+        , undoStack = []
+        , redoStack = []
         }
 
 
@@ -435,6 +468,590 @@ The live document is unchanged; this is a read-only view of the past.
 readAt : Version -> OpDoc a -> Result Schema.Error a
 readAt v ((OpDoc d) as doc) =
     Schema.decodeNode d.schema (stateAt v doc)
+
+
+{-| How many ops the live history holds — the number of distinct edit steps you
+can scrub through. `versionAt 0` is the empty document; `versionAt (historyLength
+doc)` is the current state. (Ops folded away by `gc` are no longer scrubbable.)
+-}
+historyLength : OpDoc a -> Int
+historyLength (OpDoc d) =
+    List.length (OpLog.causalOrder d.store)
+
+
+{-| The `Version` after the first `step` ops in causal order — a scrubber handle
+into linear history. `readAt (versionAt n doc) doc` shows the document as it stood
+after its `n`th edit. `step` is clamped to `[0, historyLength]`.
+
+A prefix of the causal order is downward-closed (every op's deps precede it), so
+the frontier of that prefix checks out exactly those ops.
+
+-}
+versionAt : Int -> OpDoc a -> Version
+versionAt step (OpDoc d) =
+    OpLog.causalOrder d.store
+        |> List.take (max 0 step)
+        |> frontierOfOps
+        |> Version
+
+
+{-| The causal tips of a set of ops: those no other op in the set depends on.
+For a causal-order prefix this is the frontier that checks out exactly the prefix.
+-}
+frontierOfOps : List Op -> OpLog.Frontier
+frontierOfOps ops =
+    let
+        depended =
+            List.concatMap .deps ops
+                |> List.map Id.opIdToString
+                |> Set.fromList
+    in
+    ops
+        |> List.map .id
+        |> List.filter (\id -> not (Set.member (Id.opIdToString id) depended))
+
+
+{-| Revert the live document to a past `Version`, **as new edits** — `restoreTo`
+diffs the past state against the current one and emits the fresh, winning ops that
+turn the latter back into the former. Because it goes through the op log like any
+other edit, the revert **syncs to peers and converges**; it does not silently
+rewind only the local replica (which a later merge would clobber).
+
+Identity is preserved where it can be: the past state replays a subset of the same
+ops that built the present, so unchanged registers/elements keep their ids (a
+cursor or in-flight move anchored to a surviving item still resolves). Only items
+that were _deleted_ since the version are re-created with fresh ids — the originals
+are tombstoned forever. Restoring to the current version is a no-op.
+
+-}
+restoreTo : Version -> OpDoc a -> OpDoc a
+restoreTo v doc =
+    restoreNode [] (stateAt v doc) (state doc) doc
+
+
+{-| Emit one op against the current frontier, advancing the clock and folding it
+onto the cache (the same O(1) path as any single edit).
+-}
+emit : Action -> OpDoc a -> OpDoc a
+emit action doc =
+    let
+        ( id, doc1 ) =
+            mint doc
+    in
+    commit [ op id (frontierOf doc1) action ] doc1
+
+
+{-| Emit an `InsertElem` whose op id _is_ the new element id (the convention the
+materializer relies on), returning that id so callers can position it afterwards.
+-}
+emitInsert : List TargetStep -> Maybe OpId -> Node -> OpDoc a -> ( OpId, OpDoc a )
+emitInsert target after seed doc =
+    let
+        ( elemId, doc1 ) =
+            mint doc
+    in
+    ( elemId
+    , commit [ op elemId (frontierOf doc1) (InsertElem { container = target, elemId = elemId, after = after, seed = seed }) ] doc1
+    )
+
+
+ctxOf : OpDoc a -> Ctx
+ctxOf (OpDoc d) =
+    d.ctx
+
+
+withCtx : Ctx -> OpDoc a -> OpDoc a
+withCtx ctx (OpDoc d) =
+    OpDoc { d | ctx = ctx }
+
+
+{-| Emit the ops that turn `current` (at `target`) back into `old`. Recurses
+structurally; under one schema both nodes always share a shape at every path.
+-}
+restoreNode : List TargetStep -> Node -> Node -> OpDoc a -> OpDoc a
+restoreNode target old current doc =
+    case ( old, current ) of
+        ( Node.Reg ro, Node.Reg rc ) ->
+            if ro.value == rc.value then
+                doc
+
+            else
+                emit (SetReg target ro.value) doc
+
+        ( Node.Cnt _, Node.Cnt _ ) ->
+            let
+                diff =
+                    Maybe.withDefault 0 (Node.asCounter old) - Maybe.withDefault 0 (Node.asCounter current)
+            in
+            if diff == 0 then
+                doc
+
+            else
+                emit (Increment { target = target, delta = diff }) doc
+
+        ( Node.Map mo, Node.Map mc ) ->
+            restoreMap target mo mc doc
+
+        ( Node.Seq _, Node.Seq _ ) ->
+            restoreSeq target (visibleElems old) (visibleElems current) doc
+
+        ( Node.Txt _, Node.Txt _ ) ->
+            restoreSeq target (visibleElems old) (visibleElems current) doc
+
+        ( Node.Mov mo, Node.Mov mc ) ->
+            restoreMov target (MoveList.toEntries mo) (MoveList.toEntries mc) doc
+
+        _ ->
+            -- shapes differ (shouldn't happen under a fixed schema): leave as-is
+            doc
+
+
+{-| The visible (id, content) pairs of a `Seq`/`Txt` node, in order.
+-}
+visibleElems : Node -> List ( OpId, Node )
+visibleElems node =
+    let
+        fromRga rga =
+            Rga.toElementsInOrder rga
+                |> List.filter (not << .deleted)
+                |> List.map (\e -> ( e.id, e.content ))
+    in
+    case Node.asSeq node of
+        Just rga ->
+            fromRga rga
+
+        Nothing ->
+            case Node.asTxt node of
+                Just rga ->
+                    fromRga rga
+
+                Nothing ->
+                    []
+
+
+restoreMap : List TargetStep -> Dict.Dict String Node.Entry -> Dict.Dict String Node.Entry -> OpDoc a -> OpDoc a
+restoreMap target mo mc doc =
+    (Dict.keys mo ++ Dict.keys mc)
+        |> Set.fromList
+        |> Set.foldl (\k d -> restoreMapKey (target ++ [ IntoKey k ]) (Dict.get k mo) (Dict.get k mc) d) doc
+
+
+restoreMapKey : List TargetStep -> Maybe Node.Entry -> Maybe Node.Entry -> OpDoc a -> OpDoc a
+restoreMapKey keyTarget mOld mCur doc =
+    case ( mOld, mCur ) of
+        ( Just oe, Just ce ) ->
+            let
+                d1 =
+                    if oe.present == ce.present then
+                        doc
+
+                    else
+                        emit (SetPresence { target = keyTarget, present = oe.present, seed = emptyMap }) doc
+            in
+            if oe.present then
+                restoreNode keyTarget oe.value ce.value d1
+
+            else
+                d1
+
+        ( Just oe, Nothing ) ->
+            -- key existed at the version but not now: re-create it with a fresh,
+            -- deep-restamped value subtree
+            let
+                ( seedNode, ctx1 ) =
+                    Node.reStamp (ctxOf doc) oe.value
+            in
+            emit (SetPresence { target = keyTarget, present = oe.present, seed = seedNode }) (withCtx ctx1 doc)
+
+        ( Nothing, Just ce ) ->
+            -- key added after the version: tombstone it
+            if ce.present then
+                emit (SetPresence { target = keyTarget, present = False, seed = emptyMap }) doc
+
+            else
+                doc
+
+        ( Nothing, Nothing ) ->
+            doc
+
+
+{-| Restore a `Seq`/`Txt`. Sequences cannot reorder, so survivors keep their
+order: delete current-only elements, recurse into kept ones (identity preserved),
+and re-insert version-only ones (deleted since) as fresh elements, chained into
+position.
+-}
+restoreSeq : List TargetStep -> List ( OpId, Node ) -> List ( OpId, Node ) -> OpDoc a -> OpDoc a
+restoreSeq target oldEls curEls doc =
+    let
+        oldKeys =
+            List.map (Tuple.first >> Id.opIdToString) oldEls |> Set.fromList
+
+        curById =
+            List.map (\( id, c ) -> ( Id.opIdToString id, c )) curEls |> Dict.fromList
+
+        afterDeletes =
+            List.foldl
+                (\( id, _ ) d ->
+                    if Set.member (Id.opIdToString id) oldKeys then
+                        d
+
+                    else
+                        emit (DeleteElem { container = target, elem = id }) d
+                )
+                doc
+                curEls
+    in
+    List.foldl
+        (\( oid, oContent ) ( d, after ) ->
+            case Dict.get (Id.opIdToString oid) curById of
+                Just cContent ->
+                    ( restoreNode (target ++ [ IntoElem oid ]) oContent cContent d, Just oid )
+
+                Nothing ->
+                    let
+                        ( seedNode, ctx1 ) =
+                            Node.reStamp (ctxOf d) oContent
+
+                        ( newId, d1 ) =
+                            emitInsert target after seedNode (withCtx ctx1 d)
+                    in
+                    ( d1, Just newId )
+        )
+        ( afterDeletes, Nothing )
+        oldEls
+        |> Tuple.first
+
+
+{-| Restore a `Mov` (movable list). Reconcile membership like `restoreSeq`
+(delete extras, recurse into survivors, re-insert deleted), then a positioning
+pass moves each item after the previous one's home cell so the final visible order
+matches the version's.
+-}
+restoreMov : List TargetStep -> List ( OpId, Node ) -> List ( OpId, Node ) -> OpDoc a -> OpDoc a
+restoreMov target oldEntries curEntries doc =
+    let
+        oldKeys =
+            List.map (Tuple.first >> Id.opIdToString) oldEntries |> Set.fromList
+
+        curById =
+            List.map (\( id, c ) -> ( Id.opIdToString id, c )) curEntries |> Dict.fromList
+
+        afterDeletes =
+            List.foldl
+                (\( id, _ ) d ->
+                    if Set.member (Id.opIdToString id) oldKeys then
+                        d
+
+                    else
+                        emit (DeleteElem { container = target, elem = id }) d
+                )
+                doc
+                curEntries
+
+        -- recurse into survivors / re-insert deleted; collect the live valueId of
+        -- each version entry, in the version's order
+        ( afterContent, liveOrder ) =
+            List.foldl
+                (\( oid, oContent ) ( d, acc ) ->
+                    case Dict.get (Id.opIdToString oid) curById of
+                        Just cContent ->
+                            ( restoreNode (target ++ [ IntoElem oid ]) oContent cContent d, acc ++ [ oid ] )
+
+                        Nothing ->
+                            let
+                                ( seedNode, ctx1 ) =
+                                    Node.reStamp (ctxOf d) oContent
+
+                                ( newId, d1 ) =
+                                    emitInsert target Nothing seedNode (withCtx ctx1 d)
+                            in
+                            ( d1, acc ++ [ newId ] )
+                )
+                ( afterDeletes, [] )
+                oldEntries
+    in
+    -- positioning pass: chain each item after the previous one's current home cell
+    List.foldl
+        (\valueId ( d, prev ) ->
+            let
+                anchor =
+                    case prev of
+                        Nothing ->
+                            Nothing
+
+                        Just prevId ->
+                            navigateTarget target (state d)
+                                |> Maybe.andThen Node.asMov
+                                |> Maybe.andThen (MoveList.homeCell prevId)
+            in
+            ( emit (MoveElem { container = target, elem = valueId, after = anchor }) d, Just valueId )
+        )
+        ( afterContent, Nothing )
+        liveOrder
+        |> Tuple.first
+
+
+
+-- LOCAL UNDO / REDO ----------------------------------------------------------
+
+
+{-| Record a local change for undo, given the version **before** it and the doc
+**after** it. The library does not know which of your `OpDoc` calls form one
+user-level "edit", so you bracket them: capture `version doc` before, make your
+edits, then call `recordEdit before edited`. The inverse of exactly the ops added
+in between is pushed onto the undo stack and the redo stack is cleared (a new edit
+forks history), matching every editor's undo model.
+
+This is **local, Loro-style** undo: `undo` later inverts _your_ ops as fresh ops,
+so a peer's concurrent edit to another field survives and the revert still syncs.
+A no-op change (no ops added) records nothing.
+
+-}
+recordEdit : Version -> OpDoc a -> OpDoc a
+recordEdit before ((OpDoc d) as doc) =
+    case inverseBetween before doc of
+        [] ->
+            doc
+
+        revs ->
+            OpDoc { d | undoStack = revs :: d.undoStack, redoStack = [] }
+
+
+{-| Whether there is a local edit to undo.
+-}
+canUndo : OpDoc a -> Bool
+canUndo (OpDoc d) =
+    not (List.isEmpty d.undoStack)
+
+
+{-| Whether there is an undone local edit to redo.
+-}
+canRedo : OpDoc a -> Bool
+canRedo (OpDoc d) =
+    not (List.isEmpty d.redoStack)
+
+
+{-| Undo the most recent recorded local edit: emit the inverse ops (so the undo
+propagates to peers), and push the inverse-of-the-inverse onto the redo stack so
+`redo` can replay it. No-op when there is nothing to undo.
+-}
+undo : OpDoc a -> OpDoc a
+undo ((OpDoc d) as doc) =
+    case d.undoStack of
+        [] ->
+            doc
+
+        revs :: rest ->
+            let
+                before =
+                    version doc
+
+                applied =
+                    applyRevs revs doc
+
+                redoEntry =
+                    inverseBetween before applied
+            in
+            case applied of
+                OpDoc ad ->
+                    OpDoc { ad | undoStack = rest, redoStack = redoEntry :: ad.redoStack }
+
+
+{-| Redo the most recently undone edit. Symmetric to `undo`.
+-}
+redo : OpDoc a -> OpDoc a
+redo ((OpDoc d) as doc) =
+    case d.redoStack of
+        [] ->
+            doc
+
+        revs :: rest ->
+            let
+                before =
+                    version doc
+
+                applied =
+                    applyRevs revs doc
+
+                undoEntry =
+                    inverseBetween before applied
+            in
+            case applied of
+                OpDoc ad ->
+                    OpDoc { ad | redoStack = rest, undoStack = undoEntry :: ad.undoStack }
+
+
+{-| The reverse actions that undo every op added between `before` and the current
+state — i.e. the inverses of this replica's just-made ops, newest first (so they
+unwind in reverse emission order). Each inverse is computed against the state
+**as the op was applied** (the checkout at that op), so a `done` toggle inverts to
+its prior value and a counter delta to its negation.
+-}
+inverseBetween : Version -> OpDoc a -> List RevAction
+inverseBetween (Version beforeFrontier) (OpDoc d) =
+    let
+        beforeKeys =
+            OpLog.ancestorKeys beforeFrontier d.store
+
+        -- the ops this replica added after `before`, in causal (emission) order
+        added =
+            OpLog.causalOrder d.store
+                |> List.filter (\o -> not (Set.member (Id.opIdToString o.id) beforeKeys))
+    in
+    -- fold forward, materializing the pre-op state for each, collecting inverses;
+    -- reverse at the end so undo unwinds last-emitted first
+    added
+        |> List.foldl
+            (\o ( preState, acc ) ->
+                ( OpLog.applyOps preState [ o ]
+                , inverseOf o preState ++ acc
+                )
+            )
+            ( OpLog.checkout beforeFrontier d.base d.store, [] )
+        |> Tuple.second
+
+
+{-| The reverse action(s) for one op, given the state **just before** it applied.
+-}
+inverseOf : Op -> Node -> List RevAction
+inverseOf theOp preState =
+    case theOp.action of
+        SetReg target _ ->
+            case navigateTarget target preState |> Maybe.andThen Node.asPrim of
+                Just prior ->
+                    [ Rev (SetReg target prior) ]
+
+                Nothing ->
+                    []
+
+        Increment { target, delta } ->
+            [ Rev (Increment { target = target, delta = -delta }) ]
+
+        SetPresence { target, present } ->
+            -- invert the presence bit; on re-adding a key the seed is irrelevant
+            -- (the value subtree still exists), so reuse an empty map.
+            [ Rev (SetPresence { target = target, present = not present, seed = emptyMap }) ]
+
+        InsertElem { container, elemId } ->
+            -- undo an insert by deleting exactly the element it created
+            [ Rev (DeleteElem { container = container, elem = elemId }) ]
+
+        MoveElem { container, elem } ->
+            -- undo a move by moving the element back to where it was before
+            case navigateTarget container preState of
+                Just node ->
+                    [ Rev (MoveElem { container = container, elem = elem, after = priorAnchor elem node }) ]
+
+                Nothing ->
+                    []
+
+        DeleteElem { container, elem } ->
+            -- undo a delete by re-inserting the deleted element's content after its
+            -- prior neighbour. The element is tombstoned forever, so this revives a
+            -- fresh copy (new id) — content and position preserved, identity not.
+            case navigateTarget container preState of
+                Just node ->
+                    case elementContent elem node of
+                        Just content ->
+                            [ ReInsert { container = container, afterValue = priorAnchor elem node, content = content } ]
+
+                        Nothing ->
+                            []
+
+                Nothing ->
+                    []
+
+
+{-| Apply a list of reverse actions as fresh ops (each syncs). `ReInsert` mints a
+new element id at apply time and positions it after the still-live `afterValue`.
+-}
+applyRevs : List RevAction -> OpDoc a -> OpDoc a
+applyRevs revs doc =
+    List.foldl applyRev doc revs
+
+
+applyRev : RevAction -> OpDoc a -> OpDoc a
+applyRev rev doc =
+    case rev of
+        Rev action ->
+            emit action doc
+
+        ReInsert { container, afterValue, content } ->
+            let
+                -- re-seed with fresh ids so the revived element is a clean new one
+                ( seedNode, ctx1 ) =
+                    Node.reStamp (ctxOf doc) content
+
+                after =
+                    liveAnchor container afterValue (state doc)
+            in
+            emitInsert container after seedNode (withCtx ctx1 doc)
+                |> Tuple.second
+
+
+{-| The element to anchor _after_ to put `elem` back where it was: the id of its
+predecessor in the current order, or `Nothing` if it was at the head.
+-}
+priorAnchor : OpId -> Node -> Maybe OpId
+priorAnchor elem node =
+    let
+        ids =
+            orderedIds node |> Maybe.withDefault []
+
+        elemKey =
+            Id.opIdToString elem
+    in
+    ids
+        |> List.foldl
+            (\id ( prev, found ) ->
+                if found then
+                    ( prev, found )
+
+                else if Id.opIdToString id == elemKey then
+                    ( prev, True )
+
+                else
+                    ( Just id, False )
+            )
+            ( Nothing, False )
+        |> Tuple.first
+
+
+{-| Resolve a re-insert anchor against the live container: if the recorded
+predecessor `afterValue` is still present use it, else fall back to the head
+(`Nothing`) — its predecessor may have been concurrently deleted.
+-}
+liveAnchor : List TargetStep -> Maybe OpId -> Node -> Maybe OpId
+liveAnchor container afterValue root =
+    case afterValue of
+        Nothing ->
+            Nothing
+
+        Just a ->
+            case navigateTarget container root |> Maybe.andThen orderedIds of
+                Just ids ->
+                    if List.any (\id -> Id.opIdToString id == Id.opIdToString a) ids then
+                        Just a
+
+                    else
+                        Nothing
+
+                Nothing ->
+                    Nothing
+
+
+{-| The content node of element `elem` in a `Seq`/`Txt`/`Mov` container.
+-}
+elementContent : OpId -> Node -> Maybe Node
+elementContent elem node =
+    case Node.asMov node of
+        Just ml ->
+            MoveList.get elem ml
+
+        Nothing ->
+            seqRga node
+                |> Maybe.andThen (Rga.get elem)
+                |> Maybe.map .content
 
 
 

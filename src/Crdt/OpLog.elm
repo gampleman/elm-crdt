@@ -2,7 +2,7 @@ module Crdt.OpLog exposing
     ( Op, Action(..), Target, TargetStep(..), Frontier
     , OpStore, empty, insert, ops, member, merge
     , causalOrder, applyOps, materialize, checkout
-    , frontier, opsAfter, compact
+    , frontier, opsAfter, compact, ancestorKeys
     )
 
 {-| The operation log: the source of truth for an op-log-based document.
@@ -26,7 +26,7 @@ materialize + checkout. It is not yet wired into the public `Crdt` module.
 @docs Op, Action, Target, TargetStep, Frontier
 @docs OpStore, empty, insert, ops, member, merge
 @docs causalOrder, applyOps, materialize, checkout
-@docs frontier, opsAfter, compact
+@docs frontier, opsAfter, compact, ancestorKeys
 
 -}
 

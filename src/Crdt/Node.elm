@@ -3,7 +3,7 @@ module Crdt.Node exposing
     , reg, mapFromEntries, entry, seq, txt, counter, increment, mov
     , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov
     , merge, maxCounter
-    , restore
+    , restore, reStamp
     , Element, RgaNode
     )
 
@@ -29,7 +29,7 @@ convergence correctness lives here and nowhere else.
 @docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov
 @docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov
 @docs merge, maxCounter
-@docs restore
+@docs restore, reStamp
 @docs Element, RgaNode
 
 -}
