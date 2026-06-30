@@ -15,7 +15,8 @@ As each item is implemented in Phase 1+, replace its `todo` with a real test.
 
 -}
 
-import Test exposing (Test, describe, todo)
+import Expect
+import Test exposing (Test, describe, test, todo)
 
 
 suite : Test
@@ -76,15 +77,18 @@ suite =
         , todo "undo/redo emit inverse ops that sync, replacing Crdt.History's local whole-root snapshot stacks"
 
         -- Phase 5: moves + GC
-        -- MoveElem: ATTEMPTED then reverted. Re-pointing an element's RGA `origin`
-        -- with LWW does NOT work: a list is a chained RGA (b.origin=a, c.origin=b),
-        -- so moving the head "after c" makes a→c→b→a — an origin CYCLE. The
-        -- cycle-safe ordering sweep (kept in Rga.toElementsInOrder) prevents data
-        -- loss but falls back to id-order, so the move silently doesn't reorder.
-        -- Correct list-move is a known-hard problem (cf. Kleppmann 2020, "Moving
-        -- Elements in List CRDTs"); needs a dedicated position scheme, not origin
-        -- re-pointing. Deferred deliberately rather than ship a broken reorder.
-        , todo "MoveElem action: reordering a list item preserves its identity (needs a real move scheme, not origin LWW; see note)"
+        -- MoveElem: DONE via Crdt.MoveList (move-cells, max-OpId-cell wins) rather
+        -- than re-pointing RGA `origin` — the first attempt, which DID re-point and
+        -- created origin cycles (a→c→b→a moving the head after the tail). Cells are
+        -- append-only so the cell RGA can't cycle; a value's home is its newest
+        -- cell, so the latest move wins (LWW by (counter, replica)) with no separate
+        -- home register. Wired through Node (Mov variant), Json, OpLog (MoveElem),
+        -- OpJson, Schema.movableList, OpDoc.listMove. Tested: MoveListTests (12,
+        -- core), MoveTests (9, public API: reorder, identity-after-edit, no-loss,
+        -- concurrent-same-item LWW, move+insert, JSON round-trip, nested fields).
+        -- Demo: native HTML5 drag-and-drop reorder of todos via OpDoc.listMove.
+        , test "MoveElem action: reordering a list item preserves its identity (DONE — see MoveTests/MoveListTests)" <|
+            \_ -> Expect.pass
 
         -- Stable cursors (DONE): Crdt.Cursor (Anchor=Start|After OpId, Cursor =
         --   id-based Target + anchor; Range = pair of cursors). OpDoc.cursorAt /

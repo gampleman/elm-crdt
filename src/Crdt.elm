@@ -38,6 +38,7 @@ wiring.
 import Crdt.Id as Id exposing (OpId, ReplicaId)
 import Crdt.Internal as I
 import Crdt.Json as Json
+import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node)
 import Crdt.Rga as Rga
 import Crdt.Schema as Schema exposing (Crdt)
@@ -191,6 +192,13 @@ collectOpIds node =
 
         Node.Cnt contributions ->
             Dict.foldl (\_ inc acc -> inc.stamp :: acc) [] contributions
+
+        Node.Mov ml ->
+            -- cell ids (each insert/move mints one) + nested content ids. Cell
+            -- *content* is a valueId that equals some insert cell's id, so we
+            -- don't double-count it here.
+            (MoveList.cells ml |> Rga.elements |> List.map .id)
+                ++ (MoveList.values ml |> Dict.values |> List.concatMap collectOpIds)
 
 
 collectRgaOpIds : Node.RgaNode -> List OpId

@@ -22,7 +22,7 @@ import Crdt.Schema as S exposing (Crdt)
 import Dict exposing (Dict)
 import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
 import Html.Attributes as A exposing (class, placeholder, value)
-import Html.Events exposing (on, onBlur, onClick, onFocus, onInput)
+import Html.Events exposing (on, onBlur, onClick, onFocus, onInput, preventDefaultOn)
 import Json.Decode as JD
 import Json.Encode as JE
 import Ports
@@ -55,7 +55,7 @@ schema : Crdt Board
 schema =
     S.record Board
         |> S.field "title" .title S.text
-        |> S.field "todos" .todos (S.list todoSchema)
+        |> S.field "todos" .todos (S.movableList todoSchema)
         |> S.field "notes" .notes (S.dict S.text)
         |> S.build
 
@@ -160,6 +160,10 @@ type alias Model =
     , newTodo : String
     , newNoteKey : String
 
+    -- drag-and-drop reorder: the visible index of the todo currently being
+    -- dragged (local, ephemeral — never replicated)
+    , dragging : Maybe Int
+
     -- history / version control (checkpoints now live in the doc itself)
     , checkpointMsg : String
     , viewing : Maybe Version -- Just v => time-travel preview (read-only)
@@ -198,6 +202,7 @@ init flags =
       , peers = presence
       , newTodo = ""
       , newNoteKey = ""
+      , dragging = Nothing
       , checkpointMsg = ""
       , viewing = Nothing
       , connected = False
@@ -221,6 +226,10 @@ type Msg
     | AddTodo
     | ToggleTodo Int
     | RemoveTodo Int
+      -- drag-and-drop reorder
+    | DragStart Int
+    | DragOver Int
+    | DragEnd
       -- notes (dict)
     | NewNoteKeyChanged String
     | AddNote
@@ -289,6 +298,32 @@ update msg model =
                     model.doc |> OpDoc.listRemove todosPath i |> orKeep model.doc
             in
             pushDoc { model | doc = doc1 }
+
+        DragStart i ->
+            ( { model | dragging = Just i }, Cmd.none )
+
+        DragOver target ->
+            case model.dragging of
+                Just from ->
+                    if from == target then
+                        ( model, Cmd.none )
+
+                    else
+                        -- reorder live as the row is dragged over a new slot, so
+                        -- the move converges through the same op path as any edit
+                        let
+                            doc1 =
+                                model.doc
+                                    |> OpDoc.listMove todosPath from target
+                                    |> orKeep model.doc
+                        in
+                        pushDoc { model | doc = doc1, dragging = Just target }
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        DragEnd ->
+            ( { model | dragging = Nothing }, Cmd.none )
 
         NewNoteKeyChanged s ->
             ( { model | newNoteKey = s }, Cmd.none )
@@ -800,8 +835,35 @@ viewBoard readOnly model board =
 
 viewTodo : Bool -> Model -> Int -> Todo -> Html Msg
 viewTodo readOnly model i todo =
-    li [ class "todo" ]
-        [ input
+    let
+        dragging =
+            model.dragging == Just i
+
+        -- the row is a drop target while a drag is in progress: hovering over it
+        -- reorders live. `preventDefault` on dragover is what makes a drop legal.
+        dropAttrs =
+            if readOnly then
+                []
+
+            else
+                [ preventDefaultOn "dragover" (JD.succeed ( DragOver i, True ))
+                , A.classList [ ( "dragging", dragging ) ]
+                ]
+    in
+    li (class "todo" :: dropAttrs)
+        [ if readOnly then
+            text ""
+
+          else
+            span
+                [ class "drag-handle"
+                , A.draggable "true"
+                , A.title "drag to reorder"
+                , on "dragstart" (JD.succeed (DragStart i))
+                , on "dragend" (JD.succeed DragEnd)
+                ]
+                [ text "⠿" ]
+        , input
             [ A.type_ "checkbox"
             , A.checked todo.done
             , onClick (ToggleTodo i)

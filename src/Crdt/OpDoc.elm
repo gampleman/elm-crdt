@@ -2,7 +2,7 @@ module Crdt.OpDoc exposing
     ( OpDoc, Error(..)
     , init, read, merge
     , setText, setBool, setInt, setString, increment
-    , listAppend, listRemove
+    , listAppend, listRemove, listMove
     , setKey, removeKey
     , opCount, cacheConsistent
     , cursorAt, cursorOffset, cursorRange
@@ -28,7 +28,7 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs OpDoc, Error
 @docs init, read, merge
 @docs setText, setBool, setInt, setString, increment
-@docs listAppend, listRemove
+@docs listAppend, listRemove, listMove
 @docs setKey, removeKey
 @docs opCount, cacheConsistent
 @docs cursorAt, cursorOffset, cursorRange
@@ -44,6 +44,7 @@ import Crdt.Cursor as Cursor exposing (Cursor)
 import Crdt.Id as Id exposing (Ctx, OpId, ReplicaId)
 import Crdt.Internal as I exposing (Seed)
 import Crdt.Json as Json
+import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.OpJson as OpJson
 import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, Target, TargetStep(..))
@@ -454,21 +455,22 @@ cursorAt path offset doc =
     resolve path doc
         |> Result.andThen
             (\( tgt, node ) ->
-                case seqRga node of
-                    Just rga ->
+                case orderedIds node of
+                    Just ids ->
                         let
                             anchor =
                                 if offset <= 0 then
                                     Cursor.Start
 
                                 else
-                                    case Rga.idAtVisibleIndex (offset - 1) rga of
+                                    -- anchor to the element just before `offset`;
+                                    -- clamp past-the-end to the last element.
+                                    case List.drop (offset - 1) ids |> List.head of
                                         Just id ->
                                             Cursor.After id
 
                                         Nothing ->
-                                            -- offset past the end: anchor to the last element
-                                            case Rga.lastVisibleId rga of
+                                            case List.reverse ids |> List.head of
                                                 Just id ->
                                                     Cursor.After id
 
@@ -483,22 +485,56 @@ cursorAt path offset doc =
 
 
 {-| Resolve a `Cursor` to its current visible offset in this document. `Nothing`
-if the cursor's container no longer exists here. Robust across concurrent edits
-(and deletion of the anchored element) — see `Crdt.Rga.liveCountThrough`.
+if the cursor's container no longer exists here. For `Seq`/`Txt` this is robust
+across deletion of the anchored element (tombstones retained — see
+`Crdt.Rga.liveCountThrough`); for `Mov` it counts live values at-or-before the
+anchor in the current order.
 -}
 cursorOffset : Cursor -> OpDoc a -> Maybe Int
 cursorOffset cursor doc =
-    navigateTarget (Cursor.steps cursor) (state doc)
-        |> Maybe.andThen seqRga
-        |> Maybe.map
-            (\rga ->
-                case Cursor.anchor cursor of
-                    Cursor.Start ->
-                        0
+    let
+        node =
+            navigateTarget (Cursor.steps cursor) (state doc)
+    in
+    case Cursor.anchor cursor of
+        Cursor.Start ->
+            node |> Maybe.andThen orderedIds |> Maybe.map (always 0)
 
-                    Cursor.After id ->
-                        Rga.liveCountThrough id rga
-            )
+        Cursor.After id ->
+            case node |> Maybe.andThen seqRga of
+                Just rga ->
+                    -- RGA path: robust across deletion of the anchor (tombstones)
+                    Just (Rga.liveCountThrough id rga)
+
+                Nothing ->
+                    -- Mov (or other ordered): count visible ids up to & incl. the anchor
+                    node
+                        |> Maybe.andThen orderedIds
+                        |> Maybe.map (countThrough id)
+
+
+{-| 1 + the index of `anchor` in `ids` (i.e. the offset just after it); if the
+anchor isn't present, the count of all ids (caret at the end).
+-}
+countThrough : OpId -> List OpId -> Int
+countThrough anchor ids =
+    let
+        anchorKey =
+            Id.opIdToString anchor
+
+        go n remaining =
+            case remaining of
+                [] ->
+                    n
+
+                x :: rest ->
+                    if Id.opIdToString x == anchorKey then
+                        n + 1
+
+                    else
+                        go (n + 1) rest
+    in
+    go 0 ids
 
 
 {-| Resolve a selection `Range` to a `(start, end)` pair of visible offsets in
@@ -525,9 +561,38 @@ seqRga node =
             Node.asTxt node
 
 
+{-| The visible element/value ids of an ordered node — `Seq`/`Txt` (RGA) **or**
+`Mov` (movable list) — in order. The uniform "ordered, id-addressed sequence"
+view that list edits and cursors resolve against, so they work for both kinds.
+-}
+orderedIds : Node -> Maybe (List OpId)
+orderedIds node =
+    case Node.asMov node of
+        Just ml ->
+            Just (MoveList.toEntries ml |> List.map Tuple.first)
+
+        Nothing ->
+            seqRga node |> Maybe.map Rga.visibleIds
+
+
+{-| The id of the element/value at visible index `i` of an ordered node.
+-}
+elemIdAt : Int -> Node -> Maybe OpId
+elemIdAt i node =
+    orderedIds node |> Maybe.andThen (List.drop i >> List.head)
+
+
+{-| The id of the last visible element/value (the append anchor).
+-}
+lastElemId : Node -> Maybe OpId
+lastElemId node =
+    orderedIds node |> Maybe.andThen (List.reverse >> List.head)
+
+
 {-| Navigate an **id-based** `Target` into a node, returning the addressed node.
 Mirrors `walk` but keyed by element id rather than visible index, so it is the
-read-only inverse used to resolve a stable cursor.
+read-only inverse used to resolve a stable cursor. Handles `Mov` (value-by-id) as
+well as `Seq`/`Txt` (element-by-id).
 -}
 navigateTarget : Target -> Node -> Maybe Node
 navigateTarget tgt node =
@@ -541,9 +606,15 @@ navigateTarget tgt node =
                 |> Maybe.andThen (\entry -> navigateTarget rest entry.value)
 
         (IntoElem id) :: rest ->
-            seqRga node
-                |> Maybe.andThen (Rga.get id)
-                |> Maybe.andThen (\el -> navigateTarget rest el.content)
+            case Node.asMov node of
+                Just ml ->
+                    MoveList.get id ml
+                        |> Maybe.andThen (\content -> navigateTarget rest content)
+
+                Nothing ->
+                    seqRga node
+                        |> Maybe.andThen (Rga.get id)
+                        |> Maybe.andThen (\el -> navigateTarget rest el.content)
 
 
 {-| Save a named checkpoint pinning the current version. Records the label and
@@ -809,22 +880,58 @@ listAppend path seed doc =
     resolve path doc
         |> Result.andThen
             (\( target, node ) ->
-                case node of
-                    Node.Seq rga ->
-                        let
-                            after =
-                                case appendCacheFor target doc of
-                                    Just cachedLast ->
-                                        Just cachedLast
+                if isOrdered node then
+                    let
+                        after =
+                            case appendCacheFor target doc of
+                                Just cachedLast ->
+                                    Just cachedLast
 
-                                    Nothing ->
-                                        Rga.lastVisibleId rga
-                        in
-                        Ok (emitAppend target after seed doc)
+                                Nothing ->
+                                    appendAnchor node
+                    in
+                    Ok (emitAppend target after seed doc)
 
-                    _ ->
-                        Err (WrongNodeType "expected list node for listAppend")
+                else
+                    Err (WrongNodeType "expected list node for listAppend")
             )
+
+
+{-| Whether a node is an ordered, id-addressed sequence (`Seq`/`Txt`/`Mov`).
+-}
+isOrdered : Node -> Bool
+isOrdered node =
+    orderedIds node /= Nothing
+
+
+{-| The anchor to append after: the last visible element's id for `Seq`/`Txt`, or
+the last value's **home cell** for `Mov` (inserts/moves anchor after a cell).
+-}
+appendAnchor : Node -> Maybe OpId
+appendAnchor node =
+    case Node.asMov node of
+        Just ml ->
+            lastElemId node |> Maybe.andThen (\vid -> MoveList.homeCell vid ml)
+
+        Nothing ->
+            lastElemId node
+
+
+{-| The cell/element to anchor _after_ when inserting/moving to visible index `i`
+(i.e. just after the item currently at `i-1`). `Nothing` = head.
+-}
+anchorBefore : Int -> Node -> Maybe OpId
+anchorBefore i node =
+    if i <= 0 then
+        Nothing
+
+    else
+        case Node.asMov node of
+            Just ml ->
+                elemIdAt (i - 1) node |> Maybe.andThen (\vid -> MoveList.homeCell vid ml)
+
+            Nothing ->
+                elemIdAt (i - 1) node
 
 
 {-| The cached last-appended id for `target`, if the append fast-path is live for
@@ -851,21 +958,65 @@ listRemove path i doc =
     resolve path doc
         |> Result.andThen
             (\( target, node ) ->
-                case node of
-                    Node.Seq rga ->
-                        case Rga.idAtVisibleIndex i rga of
-                            Just elemId ->
+                if isOrdered node then
+                    case elemIdAt i node of
+                        Just elemId ->
+                            let
+                                ( id, doc1 ) =
+                                    mint doc
+                            in
+                            Ok (commit [ op id (frontierOf doc1) (DeleteElem { container = target, elem = elemId }) ] doc1)
+
+                        Nothing ->
+                            Err (PathNotFound ("list index " ++ String.fromInt i))
+
+                else
+                    Err (WrongNodeType "expected list node for listRemove")
+            )
+
+
+{-| Move the item at visible index `from` to sit at visible index `to`, on a
+`movableList`. The item keeps its identity (nested edits and cursors follow it).
+On a plain `list` (`Seq`) this fails — only `movableList` supports moves.
+-}
+listMove : Path -> Int -> Int -> OpDoc a -> Result Error (OpDoc a)
+listMove path from to doc =
+    resolve path doc
+        |> Result.andThen
+            (\( target, node ) ->
+                case Node.asMov node of
+                    Just _ ->
+                        case elemIdAt from node of
+                            Just valueId ->
                                 let
+                                    -- We anchor the moved item *after* the item that
+                                    -- should precede it at the destination, computed
+                                    -- against the list with the moved item removed.
+                                    -- Moving DOWN (to > from): removing the item
+                                    -- shifts later indices down by one, so the new
+                                    -- predecessor is the item currently at `to`.
+                                    -- Moving UP (to <= from): the predecessor is the
+                                    -- item currently at `to - 1`.
+                                    after =
+                                        if to <= 0 then
+                                            Nothing
+
+                                        else if to > from then
+                                            anchorBefore (to + 1) node
+
+                                        else
+                                            anchorBefore to node
+
                                     ( id, doc1 ) =
                                         mint doc
                                 in
-                                Ok (commit [ op id (frontierOf doc1) (DeleteElem { container = target, elem = elemId }) ] doc1)
+                                Ok (commit [ op id (frontierOf doc1) (MoveElem { container = target, elem = valueId, after = after }) ] doc1)
 
                             Nothing ->
-                                Err (PathNotFound ("list index " ++ String.fromInt i))
+                                Err (PathNotFound ("list index " ++ String.fromInt from))
 
-                    _ ->
-                        Err (WrongNodeType "expected list node for listRemove")
+                    Nothing ->
+                        Err (WrongNodeType "expected movable list for listMove")
             )
 
 
@@ -977,6 +1128,21 @@ walk segs node acc =
 
                         Node.Txt rga ->
                             intoElem i rest rga node acc
+
+                        Node.Mov ml ->
+                            -- descend into the value at visible index `i` by its
+                            -- valueId, so nested edits address it stably across moves
+                            case elemIdAt i node of
+                                Just valueId ->
+                                    case MoveList.get valueId ml of
+                                        Just content ->
+                                            walk rest content (IntoElem valueId :: acc)
+
+                                        Nothing ->
+                                            Err (PathNotFound ("index " ++ String.fromInt i))
+
+                                Nothing ->
+                                    Err (PathNotFound ("index " ++ String.fromInt i))
 
                         _ ->
                             Err (WrongNodeType ("expected sequence at index " ++ String.fromInt i))

@@ -1,7 +1,7 @@
 module Crdt.Schema exposing
     ( Crdt, Error(..), Seed
     , int, float, string, bool, text, counter, lww
-    , list, dict
+    , list, movableList, dict
     , record, field, build
     , with, decodeNode, emptyNode, errorToString
     )
@@ -23,7 +23,7 @@ state — that is the hard diff problem. All in-place mutation goes through
 
 @docs Crdt, Error, Seed
 @docs int, float, string, bool, text, counter, lww
-@docs list, dict
+@docs list, movableList, dict
 @docs record, field, build
 @docs with, decodeNode, emptyNode, errorToString
 
@@ -31,6 +31,7 @@ state — that is the hard diff problem. All in-place mutation goes through
 
 import Crdt.Id as Id exposing (Ctx)
 import Crdt.Internal as I
+import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
 import Crdt.Text as Text
@@ -323,6 +324,46 @@ list (Crdt elem) =
                             |> (\( acc, c, _ ) -> ( acc, c ))
                 in
                 ( Node.seq rga, ctx1 )
+        }
+
+
+{-| A **reorderable** list of `a` — like `list`, but items can be moved with
+`Crdt.OpDoc.listMove` and keep their identity (nested edits and cursors follow a
+moved item). Backed by `Crdt.MoveList`. Reads as a plain `List a` in order.
+-}
+movableList : Crdt a -> Crdt (List a)
+movableList (Crdt elem) =
+    Crdt
+        { decode =
+            \node ->
+                case Node.asMov node of
+                    Just ml ->
+                        MoveList.toList ml
+                            |> List.map elem.decode
+                            |> combine
+
+                    Nothing ->
+                        Err (TypeMismatch "expected movable list")
+        , empty = \ctx -> ( Node.mov MoveList.empty, ctx )
+        , seed =
+            \values ctx ->
+                let
+                    ( ml, ctx1, _ ) =
+                        List.foldl
+                            (\value ( acc, c, afterCell ) ->
+                                let
+                                    ( childNode, c1 ) =
+                                        elem.seed value c
+
+                                    ( vid, c2 ) =
+                                        Id.nextId c1
+                                in
+                                ( MoveList.insert vid afterCell childNode acc, c2, Just vid )
+                            )
+                            ( MoveList.empty, ctx, Nothing )
+                            values
+                in
+                ( Node.mov ml, ctx1 )
         }
 
 

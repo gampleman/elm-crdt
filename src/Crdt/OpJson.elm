@@ -85,6 +85,21 @@ encodeAction action =
                 , ( "e", Json.encodeOpId elem )
                 ]
 
+        MoveElem { container, elem, after } ->
+            JE.object
+                [ ( "k", JE.string "mov" )
+                , ( "t", encodeTarget container )
+                , ( "e", Json.encodeOpId elem )
+                , ( "o"
+                  , case after of
+                        Just o ->
+                            Json.encodeOpId o
+
+                        Nothing ->
+                            JE.null
+                  )
+                ]
+
         Increment { target, delta } ->
             JE.object
                 [ ( "k", JE.string "inc" )
@@ -153,6 +168,12 @@ actionDecoder =
                         JD.map2 (\t e -> DeleteElem { container = t, elem = e })
                             (JD.field "t" targetDecoder)
                             (JD.field "e" Json.opIdDecoder)
+
+                    "mov" ->
+                        JD.map3 (\t e o -> MoveElem { container = t, elem = e, after = o })
+                            (JD.field "t" targetDecoder)
+                            (JD.field "e" Json.opIdDecoder)
+                            (JD.field "o" (JD.nullable Json.opIdDecoder))
 
                     "inc" ->
                         JD.map2 (\t delta -> Increment { target = t, delta = delta })

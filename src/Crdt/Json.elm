@@ -23,10 +23,12 @@ and floats survive the roundtrip distinctly.
 -}
 
 import Crdt.Id as Id exposing (OpId)
+import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Element, Entry, Node, Prim(..))
 import Crdt.Rga as Rga
 import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
+import Set
 
 
 
@@ -66,6 +68,32 @@ encodeNode node =
                 [ ( "t", JE.string "cnt" )
                 , ( "c", JE.dict identity encodeIncrement contributions )
                 ]
+
+        Node.Mov ml ->
+            JE.object
+                [ ( "t", JE.string "mov" )
+                , ( "cells", JE.list encodeCell (Rga.elements (MoveList.cells ml)) )
+                , ( "vals", JE.dict identity encodeNode (MoveList.values ml) )
+                , ( "del", JE.list JE.string (Set.toList (MoveList.deletedIds ml)) )
+                ]
+
+
+{-| A position cell of a movable list: its id, anchor, and the valueId it carries.
+-}
+encodeCell : Rga.Element OpId -> JE.Value
+encodeCell cell =
+    JE.object
+        [ ( "id", encodeOpId cell.id )
+        , ( "o"
+          , case cell.origin of
+                Just o ->
+                    encodeOpId o
+
+                Nothing ->
+                    JE.null
+          )
+        , ( "v", encodeOpId cell.content )
+        ]
 
 
 encodeIncrement : Node.Increment -> JE.Value
@@ -160,9 +188,26 @@ nodeDecoder =
                         JD.field "c" (JD.dict incrementDecoder)
                             |> JD.map Node.counter
 
+                    "mov" ->
+                        JD.map3
+                            (\cs vs del ->
+                                Node.mov (MoveList.fromParts (Rga.fromElements cs) vs (Set.fromList del))
+                            )
+                            (JD.field "cells" (JD.list cellDecoder))
+                            (JD.field "vals" (JD.dict (JD.lazy (\_ -> nodeDecoder))))
+                            (JD.field "del" (JD.list JD.string))
+
                     other ->
                         JD.fail ("unknown node tag: " ++ other)
             )
+
+
+cellDecoder : Decoder (Rga.Element OpId)
+cellDecoder =
+    JD.map3 (\id origin valueId -> Rga.element id origin valueId False)
+        (JD.field "id" opIdDecoder)
+        (JD.field "o" (JD.nullable opIdDecoder))
+        (JD.field "v" opIdDecoder)
 
 
 entryDecoder : Decoder Entry

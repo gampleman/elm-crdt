@@ -31,6 +31,7 @@ materialize + checkout. It is not yet wired into the public `Crdt` module.
 -}
 
 import Crdt.Id as Id exposing (OpId)
+import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node(..), Prim)
 import Crdt.Rga as Rga
 import Dict exposing (Dict)
@@ -62,6 +63,7 @@ type Action
     | SetPresence { target : Target, present : Bool, seed : Node }
     | InsertElem { container : Target, elemId : OpId, after : Maybe OpId, seed : Node }
     | DeleteElem { container : Target, elem : OpId }
+    | MoveElem { container : Target, elem : OpId, after : Maybe OpId }
     | Increment { target : Target, delta : Int }
 
 
@@ -382,6 +384,9 @@ applyOp { id, action } root =
         DeleteElem { container, elem } ->
             updateAt container id (deleteElem elem) root
 
+        MoveElem { container, elem, after } ->
+            updateAt container id (moveElem id elem after) root
+
         Increment { target, delta } ->
             updateAt target id (incrementBy id delta) root
 
@@ -433,6 +438,10 @@ updateAt steps stamp f node =
 
                 Txt rga ->
                     Txt (Rga.updateElement x (updateAt rest stamp f) rga)
+
+                Mov ml ->
+                    -- descend into the value `x` (by valueId) and edit its content
+                    Mov (MoveList.updateValue x (updateAt rest stamp f) ml)
 
                 _ ->
                     node
@@ -495,27 +504,19 @@ setRegLww stamp prim current =
 
 insertElem : OpId -> Maybe OpId -> Node -> Node -> Node
 insertElem elemId after seed current =
-    let
-        wrap =
-            case current of
-                Txt _ ->
-                    Txt
+    case current of
+        Txt rga ->
+            Txt (Rga.put (Rga.element elemId after seed False) rga)
 
-                _ ->
-                    Seq
+        Mov ml ->
+            -- movable list: elemId is the valueId, `after` the cell to follow
+            Mov (MoveList.insert elemId after seed ml)
 
-        rga =
-            case current of
-                Seq r ->
-                    r
+        Seq rga ->
+            Seq (Rga.put (Rga.element elemId after seed False) rga)
 
-                Txt r ->
-                    r
-
-                _ ->
-                    Rga.empty
-    in
-    wrap (Rga.put (Rga.element elemId after seed False) rga)
+        _ ->
+            Seq (Rga.put (Rga.element elemId after seed False) Rga.empty)
 
 
 deleteElem : OpId -> Node -> Node
@@ -526,6 +527,22 @@ deleteElem elem current =
 
         Txt rga ->
             Txt (Rga.delete elem rga)
+
+        Mov ml ->
+            Mov (MoveList.delete elem ml)
+
+        _ ->
+            current
+
+
+{-| Move value `elem` after cell `after` in a movable list (no-op on other nodes).
+The move op's id (`moveOp`) becomes the new cell id, so it wins by max-id LWW.
+-}
+moveElem : OpId -> OpId -> Maybe OpId -> Node -> Node
+moveElem moveOp elem after current =
+    case current of
+        Mov ml ->
+            Mov (MoveList.move moveOp elem after ml)
 
         _ ->
             current

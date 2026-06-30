@@ -123,6 +123,19 @@
         gap: 0.5rem;
         margin-top: 0.5rem;
       }
+      .drag-handle {
+        cursor: grab;
+        user-select: none;
+        color: #aaa;
+        padding: 0 0.15rem;
+        line-height: 1;
+      }
+      .drag-handle:active {
+        cursor: grabbing;
+      }
+      .todo.dragging {
+        opacity: 0.45;
+      }
       .peer {
         display: flex;
         align-items: center;

@@ -1,7 +1,7 @@
 module Crdt.Node exposing
-    ( Node(..), Register, Prim(..), Entry, Increment
-    , reg, mapFromEntries, entry, seq, txt, counter, increment
-    , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter
+    ( Node(..), Register, Prim(..), Entry, Increment, MovNode
+    , reg, mapFromEntries, entry, seq, txt, counter, increment, mov
+    , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov
     , merge, maxCounter
     , restore
     , Element, RgaNode
@@ -25,9 +25,9 @@ its structural `merge`.
 `merge` is monomorphic over `Node` and never touches the typed schema layer —
 convergence correctness lives here and nowhere else.
 
-@docs Node, Register, Prim, Entry, Increment
-@docs reg, mapFromEntries, entry, seq, txt, counter, increment
-@docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter
+@docs Node, Register, Prim, Entry, Increment, MovNode
+@docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov
+@docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov
 @docs merge, maxCounter
 @docs restore
 @docs Element, RgaNode
@@ -35,6 +35,7 @@ convergence correctness lives here and nowhere else.
 -}
 
 import Crdt.Id as Id exposing (OpId)
+import Crdt.MoveList as MoveList exposing (MoveList)
 import Crdt.Rga as Rga exposing (Rga)
 import Dict exposing (Dict)
 
@@ -47,6 +48,13 @@ type Node
     | Seq RgaNode
     | Txt RgaNode
     | Cnt (Dict String Increment)
+    | Mov MovNode
+
+
+{-| A movable list (reorderable sequence) of `Node` content.
+-}
+type alias MovNode =
+    MoveList Node
 
 
 {-| One contribution to a counter: a signed `delta` tagged with the `OpId` of the
@@ -155,6 +163,13 @@ increment stamp delta =
     { stamp = stamp, delta = delta }
 
 
+{-| A movable-list node.
+-}
+mov : MovNode -> Node
+mov =
+    Mov
+
+
 
 -- ACCESSORS ------------------------------------------------------------------
 
@@ -221,6 +236,18 @@ asTxt node =
             Nothing
 
 
+{-| Extract the movable list, if this is one.
+-}
+asMov : Node -> Maybe MovNode
+asMov node =
+    case node of
+        Mov ml ->
+            Just ml
+
+        _ ->
+            Nothing
+
+
 {-| The counter's current value: the sum of all its contributions. `Nothing` if
 this node isn't a counter.
 -}
@@ -270,6 +297,9 @@ merge a b =
                     cb
                     Dict.empty
                 )
+
+        ( Mov ma, Mov mb ) ->
+            Mov (MoveList.merge merge ma mb)
 
         _ ->
             -- constructor mismatch: deterministic, order-independent tiebreak.
@@ -524,6 +554,27 @@ reStamp ctx node =
             in
             ( Cnt newCnt, ctx1 )
 
+        Mov ml ->
+            -- rebuild a fresh movable list from the old visible order, minting a
+            -- new valueId + cell per item (content deep-restamped too).
+            let
+                ( rebuilt, ctx1, _ ) =
+                    MoveList.toList ml
+                        |> List.foldl
+                            (\childOld ( acc, c, afterCell ) ->
+                                let
+                                    ( child, c1 ) =
+                                        reStamp c childOld
+
+                                    ( vid, c2 ) =
+                                        Id.nextId c1
+                                in
+                                ( MoveList.insert vid afterCell child acc, c2, Just vid )
+                            )
+                            ( MoveList.empty, ctx, Nothing )
+            in
+            ( Mov rebuilt, ctx1 )
+
 
 reStampRga : Id.Ctx -> (RgaNode -> Node) -> RgaNode -> ( Node, Id.Ctx )
 reStampRga ctx wrap rga =
@@ -630,6 +681,9 @@ rank node =
         Cnt _ ->
             4
 
+        Mov _ ->
+            5
+
 
 
 -- PRIM ORDER -----------------------------------------------------------------
@@ -715,6 +769,9 @@ maxCounter node =
 
         Cnt d ->
             Dict.foldl (\_ inc acc -> max acc (Id.opIdCounter inc.stamp)) 0 d
+
+        Mov ml ->
+            MoveList.maxCounter maxCounter ml
 
 
 rgaMaxCounter : RgaNode -> Int
