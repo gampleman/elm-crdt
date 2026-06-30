@@ -7,3 +7,8 @@ demo/elm.js
 
 # editor / OS
 .DS_Store
+
+# benchmark build artifacts
+benchmarks/headless.js
+benchmarks/benchmark.js
+benchmarks/elm-stuff/

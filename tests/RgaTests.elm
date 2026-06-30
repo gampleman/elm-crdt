@@ -117,4 +117,31 @@ suite =
                             ]
                 in
                 Expect.equal rga (merge rga rga)
+        , test "long origin-chain orders without stack overflow (regression)" <|
+            \_ ->
+                -- A list built by appending forms a linear origin-chain of depth
+                -- N. The ordering walk must be iterative, not N-deep recursion —
+                -- this used to overflow the stack around a few thousand elements.
+                let
+                    n =
+                        20000
+
+                    chain =
+                        List.range 1 n
+                            |> List.map
+                                (\i ->
+                                    charEl (alice "" i)
+                                        (if i == 1 then
+                                            Nothing
+
+                                         else
+                                            Just (alice "" (i - 1))
+                                        )
+                                        'x'
+                                )
+                in
+                Rga.fromElements chain
+                    |> Rga.toList
+                    |> List.length
+                    |> Expect.equal n
         ]

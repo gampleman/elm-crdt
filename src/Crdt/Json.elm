@@ -1,4 +1,11 @@
-module Crdt.Json exposing (encodeNode, nodeDecoder)
+module Crdt.Json exposing
+    ( encodeNode
+    , encodeOpId
+    , encodePrim
+    , nodeDecoder
+    , opIdDecoder
+    , primDecoder
+    )
 
 {-| Lossless JSON serialization of the `Node` tree, including every `OpId`,
 presence cell and tombstone. This is what the demo ships over the WebSocket;
@@ -53,6 +60,20 @@ encodeNode node =
                 [ ( "t", JE.string "txt" )
                 , ( "el", JE.list encodeElement (Rga.elements rga) )
                 ]
+
+        Node.Cnt contributions ->
+            JE.object
+                [ ( "t", JE.string "cnt" )
+                , ( "c", JE.dict identity encodeIncrement contributions )
+                ]
+
+
+encodeIncrement : Node.Increment -> JE.Value
+encodeIncrement inc =
+    JE.object
+        [ ( "s", encodeOpId inc.stamp )
+        , ( "d", JE.int inc.delta )
+        ]
 
 
 encodeEntry : Entry -> JE.Value
@@ -135,6 +156,10 @@ nodeDecoder =
                         JD.field "el" (JD.list elementDecoder)
                             |> JD.map (Rga.fromElements >> Node.txt)
 
+                    "cnt" ->
+                        JD.field "c" (JD.dict incrementDecoder)
+                            |> JD.map Node.counter
+
                     other ->
                         JD.fail ("unknown node tag: " ++ other)
             )
@@ -146,6 +171,13 @@ entryDecoder =
         (JD.field "v" (JD.lazy (\_ -> nodeDecoder)))
         (JD.field "p" JD.bool)
         (JD.field "s" opIdDecoder)
+
+
+incrementDecoder : Decoder Node.Increment
+incrementDecoder =
+    JD.map2 Node.increment
+        (JD.field "s" opIdDecoder)
+        (JD.field "d" JD.int)
 
 
 elementDecoder : Decoder Element

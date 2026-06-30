@@ -4,6 +4,7 @@
   "private": true,
   "description": "Tooling for the gampleman/elm-crdt Elm package and its demo",
   "scripts": {
+    "start": "cd demo && npm i && npm run start",
     "test": "npm-run-all test:make test:format test:review test:unit",
     "test:make": "elm make --docs=docs.json",
     "test:format": "elm-format --validate src/ tests/ review/src/",

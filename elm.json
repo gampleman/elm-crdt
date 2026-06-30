@@ -12,7 +12,8 @@
         "Crdt.Id",
         "Crdt.Text",
         "Crdt.Presence",
-        "Crdt.History"
+        "Crdt.History",
+        "Crdt.OpDoc"
     ],
     "elm-version": "0.19.0 <= v < 0.20.0",
     "dependencies": {

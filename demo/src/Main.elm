@@ -1,25 +1,24 @@
 module Main exposing (main)
 
-{-| Collaborative todo + notes demo for `jhampl/elm-crdt`.
+{-| Collaborative todo + notes demo for `gampleman/elm-crdt`.
 
-This file is written FIRST, as the executable specification of the library's
-public API. Every `Crdt.*` call below is a requirement the library must satisfy.
+Runs on the **op-log** core (`Crdt.OpDoc`): the document is an operation log,
+edits emit ops, sync ships ops over a WebSocket, and history is collaborative
+time-travel over the op DAG (`OpDoc.version` / `OpDoc.readAt`).
 
-It exercises the full JSON-like schema (record + list + dict + text + LWW),
-real WebSocket networking over ports, live **presence** (who's here, their
-cursor), and **history / version control** (named checkpoints + checkout +
-undo/redo).
+It exercises the full JSON-like schema (record + list + dict + text + LWW), real
+WebSocket networking, live **presence** (who's here, their cursor), and
+**collaborative history** (named checkpoints + time-travel preview).
 
 -}
 
 import Browser
-import Crdt exposing (Doc)
-import Crdt.Edit as Edit
-import Crdt.History as History exposing (Checkpoint, Version)
 import Crdt.Id exposing (ReplicaId)
+import Crdt.OpDoc as OpDoc exposing (Checkpoint, OpDoc, Version)
 import Crdt.Path as Path exposing (Path)
 import Crdt.Presence as Presence exposing (Presence)
 import Crdt.Schema as S exposing (Crdt)
+import Dict exposing (Dict)
 import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
 import Html.Attributes as A exposing (class, placeholder, value)
 import Html.Events exposing (on, onBlur, onClick, onFocus, onInput)
@@ -116,6 +115,11 @@ notePath k =
     Path.root |> Path.field "notes" |> Path.key k
 
 
+notesPath : Path
+notesPath =
+    Path.root |> Path.field "notes"
+
+
 
 -- FIELD IDS ------------------------------------------------------------------
 -- Stable identifiers for editable fields, shared between focus reporting (what
@@ -145,7 +149,7 @@ noteField k =
 
 type alias Model =
     { me : ReplicaId
-    , doc : Doc
+    , doc : OpDoc Board
     , presence : Presence Cursor
     , peers : Presence Cursor -- merged view of everyone (incl. self)
 
@@ -153,10 +157,14 @@ type alias Model =
     , newTodo : String
     , newNoteKey : String
 
-    -- history / version control
+    -- history / version control (checkpoints now live in the doc itself)
     , checkpointMsg : String
-    , viewing : Maybe Version -- Just v => previewing an old version (read-only)
+    , viewing : Maybe Version -- Just v => time-travel preview (read-only)
     , connected : Bool
+
+    -- delta sync: the version up to which peers already have our ops, so each
+    -- broadcast ships only `encodeSince lastSent` instead of the whole log.
+    , lastSent : Version
     }
 
 
@@ -177,9 +185,12 @@ init flags =
             Presence.init me cursorCodec
                 |> Presence.setLocal
                     { name = flags.name, color = flags.color, editing = Nothing }
+
+        doc =
+            OpDoc.init me schema
     in
     ( { me = me
-      , doc = Crdt.init me schema
+      , doc = doc
       , presence = presence
       , peers = presence
       , newTodo = ""
@@ -187,6 +198,7 @@ init flags =
       , checkpointMsg = ""
       , viewing = Nothing
       , connected = False
+      , lastSent = OpDoc.version doc
       }
     , broadcastPresence presence
     )
@@ -217,10 +229,7 @@ type Msg
     | CheckpointMsgChanged String
     | SaveCheckpoint
     | PreviewVersion Version
-    | RestoreVersion Version
     | LeavePreview
-    | Undo
-    | Redo
       -- networking
     | GotMessage JD.Value
     | ConnectionChanged Bool
@@ -244,7 +253,7 @@ update msg model =
                     -- append a fresh todo subtree at the end of the list
                     doc1 =
                         model.doc
-                            |> Edit.listAppend todosPath
+                            |> OpDoc.listAppend todosPath
                                 (todoSchema |> S.with (Todo model.newTodo False))
                             |> orKeep model.doc
                 in
@@ -256,7 +265,7 @@ update msg model =
         ToggleTodo i ->
             let
                 current =
-                    Crdt.read schema model.doc
+                    OpDoc.read model.doc
                         |> Result.toMaybe
                         |> Maybe.andThen (\b -> List.drop i b.todos |> List.head)
                         |> Maybe.map .done
@@ -264,7 +273,7 @@ update msg model =
 
                 doc1 =
                     model.doc
-                        |> Edit.setBool (todoDonePath i) (not current)
+                        |> OpDoc.setBool (todoDonePath i) (not current)
                         |> orKeep model.doc
             in
             pushDoc { model | doc = doc1 }
@@ -272,7 +281,7 @@ update msg model =
         RemoveTodo i ->
             let
                 doc1 =
-                    model.doc |> Edit.listRemove todosPath i |> orKeep model.doc
+                    model.doc |> OpDoc.listRemove todosPath i |> orKeep model.doc
             in
             pushDoc { model | doc = doc1 }
 
@@ -287,9 +296,7 @@ update msg model =
                 let
                     doc1 =
                         model.doc
-                            |> Edit.setKey (Path.root |> Path.field "notes")
-                                model.newNoteKey
-                                (S.text |> S.with "")
+                            |> OpDoc.setKey notesPath model.newNoteKey (S.text |> S.with "")
                             |> orKeep model.doc
                 in
                 pushDoc { model | doc = doc1, newNoteKey = "" }
@@ -300,9 +307,7 @@ update msg model =
         RemoveNote k ->
             let
                 doc1 =
-                    model.doc
-                        |> Edit.removeKey (Path.root |> Path.field "notes") k
-                        |> orKeep model.doc
+                    model.doc |> OpDoc.removeKey notesPath k |> orKeep model.doc
             in
             pushDoc { model | doc = doc1 }
 
@@ -316,11 +321,18 @@ update msg model =
             ( { model | checkpointMsg = s }, Cmd.none )
 
         SaveCheckpoint ->
+            -- capturing a version doesn't change the document, so no broadcast
             let
-                doc1 =
-                    History.commit model.checkpointMsg model.doc
+                label =
+                    if String.isEmpty (String.trim model.checkpointMsg) then
+                        "checkpoint"
+
+                    else
+                        model.checkpointMsg
             in
-            pushDoc { model | doc = doc1, checkpointMsg = "" }
+            ( { model | doc = OpDoc.checkpoint label model.doc, checkpointMsg = "" }
+            , Cmd.none
+            )
 
         PreviewVersion v ->
             ( { model | viewing = Just v }, Cmd.none )
@@ -328,32 +340,15 @@ update msg model =
         LeavePreview ->
             ( { model | viewing = Nothing }, Cmd.none )
 
-        RestoreVersion v ->
-            -- restoring is itself a new edit (a revert), so it merges/syncs normally
-            case History.checkout v model.doc of
-                Just old ->
-                    let
-                        doc1 =
-                            History.restore old model.doc
-                    in
-                    pushDoc { model | doc = doc1, viewing = Nothing }
-
-                Nothing ->
-                    ( model, Cmd.none )
-
-        Undo ->
-            pushDoc { model | doc = History.undo model.doc }
-
-        Redo ->
-            pushDoc { model | doc = History.redo model.doc }
-
         GotMessage raw ->
             case decodeEnvelope raw of
                 Ok (DocMsg incomingJson) ->
-                    case Crdt.decode model.me incomingJson of
-                        Ok incomingDoc ->
-                            -- the whole point: merge is commutative & convergent
-                            ( { model | doc = Crdt.merge model.doc incomingDoc }
+                    -- decodeInto merges the peer's ops into our log (idempotent).
+                    -- These ops were broadcast to everyone, so advance `lastSent`
+                    -- to avoid echoing them back on our next delta.
+                    case OpDoc.decodeInto incomingJson model.doc of
+                        Ok doc1 ->
+                            ( { model | doc = doc1, lastSent = OpDoc.version doc1 }
                             , Cmd.none
                             )
 
@@ -370,14 +365,24 @@ update msg model =
                         Err _ ->
                             ( model, Cmd.none )
 
+                Ok HelloMsg ->
+                    -- a peer just joined: send our full op set so they catch up
+                    ( model, broadcastFull model.doc )
+
                 Err _ ->
                     ( model, Cmd.none )
 
         ConnectionChanged isUp ->
-            -- on (re)connect, push our full state so a fresh peer catches up
-            ( { model | connected = isUp }
+            -- On (re)connect, exchange full state both ways: push our entire op
+            -- set (so peers get anything we did offline) and `hello` (so they
+            -- push theirs). After this, steady-state edits are deltas again.
+            ( { model | connected = isUp, lastSent = OpDoc.version model.doc }
             , if isUp then
-                Cmd.batch [ broadcastDoc model.doc, broadcastPresence model.presence ]
+                Cmd.batch
+                    [ broadcastFull model.doc
+                    , sayHello
+                    , broadcastPresence model.presence
+                    ]
 
               else
                 Cmd.none
@@ -388,36 +393,55 @@ update msg model =
 -- EDIT / SYNC HELPERS --------------------------------------------------------
 
 
-{-| Text fields use the Text CRDT: rather than overwriting, we diff old→new and
-apply the minimal insert/delete so concurrent typing merges character-wise.
+{-| Text fields use the Text CRDT: `setText` diffs old→new and emits the minimal
+insert/delete ops so concurrent typing merges character-wise.
 -}
 editText : Path -> String -> Model -> ( Model, Cmd Msg )
 editText path newValue model =
     let
         doc1 =
             model.doc
-                |> Edit.setText path newValue
+                |> OpDoc.setText path newValue
                 |> orKeep model.doc
     in
     pushDoc { model | doc = doc1 }
 
 
-orKeep : Doc -> Result Edit.Error Doc -> Doc
+orKeep : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
 orKeep fallback result =
     Result.withDefault fallback result
 
 
-{-| After any local change, broadcast the new full document state. (Phase-later
-optimization: send deltas via `Crdt.encodeSince`.)
+{-| After any local change, broadcast only the **delta** since our last
+broadcast, then advance `lastSent`. While connected every peer sees every
+broadcast, so this keeps everyone in sync at edit-size bandwidth; fresh peers are
+caught up by the full-state exchange on connect (see `ConnectionChanged` /
+`hello`).
 -}
 pushDoc : Model -> ( Model, Cmd Msg )
 pushDoc model =
-    ( model, broadcastDoc model.doc )
+    let
+        now =
+            OpDoc.version model.doc
+    in
+    ( { model | lastSent = now }
+    , Ports.outgoing (envelope "doc" (OpDoc.encodeSince model.lastSent model.doc))
+    )
 
 
-broadcastDoc : Doc -> Cmd Msg
-broadcastDoc doc =
-    Ports.outgoing (envelope "doc" (Crdt.encode doc))
+{-| Broadcast our entire op set — used for catch-up (connect / answering a
+`hello`), the one place full state is needed.
+-}
+broadcastFull : OpDoc Board -> Cmd Msg
+broadcastFull doc =
+    Ports.outgoing (envelope "doc" (OpDoc.encode doc))
+
+
+{-| Announce ourselves so already-present peers send us their full state.
+-}
+sayHello : Cmd Msg
+sayHello =
+    Ports.outgoing (envelope "hello" (JE.object []))
 
 
 broadcastPresence : Presence Cursor -> Cmd Msg
@@ -444,8 +468,9 @@ setEditing field model =
 
 
 type Envelope
-    = DocMsg JD.Value
+    = DocMsg JD.Value -- a batch of ops (delta or full)
     | PresenceMsg JD.Value
+    | HelloMsg -- "I just joined — send me your full state"
 
 
 envelope : String -> JE.Value -> JE.Value
@@ -465,6 +490,9 @@ decodeEnvelope =
 
                         "presence" ->
                             JD.map PresenceMsg (JD.field "payload" JD.value)
+
+                        "hello" ->
+                            JD.succeed HelloMsg
 
                         _ ->
                             JD.fail ("unknown envelope kind: " ++ kind)
@@ -528,22 +556,25 @@ fieldAttrs model fieldId =
         :: highlight
 
 
+{-| Read the board to render: the live document, or a past version when previewing.
+-}
+readShown : Model -> Result S.Error Board
+readShown model =
+    case model.viewing of
+        Just v ->
+            OpDoc.readAt v model.doc
+
+        Nothing ->
+            OpDoc.read model.doc
+
+
 view : Model -> Html Msg
 view model =
     let
-        -- when previewing an old version, render that read-only snapshot
-        shownDoc =
-            case model.viewing of
-                Just v ->
-                    History.checkout v model.doc |> Maybe.withDefault model.doc
-
-                Nothing ->
-                    model.doc
-
         readOnly =
             model.viewing /= Nothing
     in
-    case Crdt.read schema shownDoc of
+    case readShown model of
         Ok board ->
             div [ class "app" ]
                 [ viewHeader model
@@ -557,7 +588,7 @@ view model =
                 ]
 
         Err err ->
-            div [ class "error" ] [ text ("schema read error: " ++ Crdt.errorToString err) ]
+            div [ class "error" ] [ text ("schema read error: " ++ S.errorToString err) ]
 
 
 viewHeader : Model -> Html Msg
@@ -649,7 +680,7 @@ viewNotes : Bool -> Model -> Dict String String -> Html Msg
 viewNotes readOnly model notes =
     div []
         [ ul [ class "notes" ]
-            (Crdt.dictToList notes
+            (Dict.toList notes
                 |> List.map
                     (\( k, v ) ->
                         li []
@@ -725,22 +756,17 @@ viewHistory model =
                 [ value model.checkpointMsg
                 , placeholder "checkpoint message…"
                 , onInput CheckpointMsgChanged
+                , onEnter SaveCheckpoint
                 ]
                 []
             , button [ onClick SaveCheckpoint ] [ text "save checkpoint" ]
             ]
-        , div [ class "undo-redo" ]
-            [ button [ onClick Undo ] [ text "↶ undo" ]
-            , button [ onClick Redo ] [ text "↷ redo" ]
-            ]
         , ul [ class "checkpoints" ]
-            (History.checkpoints model.doc
-                |> List.map (viewCheckpoint model.viewing)
-            )
+            (List.map (viewCheckpoint model.viewing) (OpDoc.checkpoints model.doc))
         , case model.viewing of
             Just _ ->
                 div [ class "preview-banner" ]
-                    [ text "previewing an old version — "
+                    [ text "time-travelling to an old version — "
                     , button [ onClick LeavePreview ] [ text "back to latest" ]
                     ]
 
@@ -752,11 +778,11 @@ viewHistory model =
 viewCheckpoint : Maybe Version -> Checkpoint -> Html Msg
 viewCheckpoint viewing cp =
     let
-        v =
-            History.checkpointVersion cp
+        cpVersion =
+            OpDoc.checkpointVersion cp
 
         isViewing =
-            viewing == Just v
+            viewing == Just cpVersion
     in
     li
         [ class
@@ -767,21 +793,10 @@ viewCheckpoint viewing cp =
                 "checkpoint"
             )
         ]
-        [ span [ class "cp-msg" ] [ text (History.checkpointMessage cp) ]
-        , span [ class "cp-author" ] [ text (Crdt.Id.toString (History.checkpointAuthor cp)) ]
-        , button [ onClick (PreviewVersion v) ] [ text "preview" ]
-        , button [ onClick (RestoreVersion v) ] [ text "restore" ]
+        [ span [ class "cp-msg" ] [ text (OpDoc.checkpointMessage cp) ]
+        , span [ class "cp-author" ] [ text (Crdt.Id.toString (OpDoc.checkpointAuthor cp)) ]
+        , button [ onClick (PreviewVersion cpVersion) ] [ text "preview" ]
         ]
-
-
-
--- DICT ALIAS -----------------------------------------------------------------
--- The schema's `dict` reads back as a standard Elm Dict; we re-expose the
--- ordered listing helper from the library for stable rendering.
-
-
-type alias Dict k v =
-    Crdt.Dict k v
 
 
 

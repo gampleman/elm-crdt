@@ -3,11 +3,12 @@ module Crdt.Internal exposing
     , Doc(..)
     , DocData
     , History
-    , Seed
+    , Seed(..)
     , ctx
     , history
     , make
     , root
+    , runSeed
     , setHistory
     , withRoot
     , withRootNoHistory
@@ -15,7 +16,7 @@ module Crdt.Internal exposing
 
 {-| Package-internal plumbing shared across the public modules. Not exposed from
 the package. Holds the `Doc` representation (so `Crdt`, `Crdt.Edit` and
-`Crdt.History` can all see it without an import cycle) and the `Seed` alias used
+`Crdt.History` can all see it without an import cycle) and the `Seed` type used
 to construct fresh subtrees.
 -}
 
@@ -23,11 +24,20 @@ import Crdt.Id exposing (Ctx, ReplicaId)
 import Crdt.Node exposing (Node)
 
 
-{-| A function that builds a fresh `Node` subtree, minting ids from the context.
-Produced by `Crdt.Schema.with` and consumed by `Crdt.Edit`.
+{-| An **opaque** builder of a fresh `Node` subtree, minting ids from the context.
+Produced by `Crdt.Schema.with`, consumed by `Crdt.Edit` / `Crdt.OpDoc`. Opaque so
+that the edit APIs can accept it without leaking the internal `Node` type into the
+public package surface.
 -}
-type alias Seed =
-    Ctx -> ( Node, Ctx )
+type Seed
+    = Seed (Ctx -> ( Node, Ctx ))
+
+
+{-| Run a seed against a context.
+-}
+runSeed : Seed -> Ctx -> ( Node, Ctx )
+runSeed (Seed f) =
+    f
 
 
 {-| A replica's document: the replicated root, the local clock/replica context,

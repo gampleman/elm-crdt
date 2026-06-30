@@ -1,8 +1,9 @@
 module Crdt.Rga exposing
     ( Rga, Element
-    , empty, element, fromElements, elements
+    , empty, element, fromElements, elements, put
     , insertAfter, delete, merge
     , toList, toElementsInOrder, idAtVisibleIndex, originForVisibleIndex, lastVisibleId
+    , visibleIds
     , get, updateElement
     , maxCounter
     )
@@ -24,9 +25,10 @@ The store is keyed by a string form of the `OpId` so that Elm structural
 equality (`==`) is a sound convergence oracle.
 
 @docs Rga, Element
-@docs empty, element, fromElements, elements
+@docs empty, element, fromElements, elements, put
 @docs insertAfter, delete, merge
 @docs toList, toElementsInOrder, idAtVisibleIndex, originForVisibleIndex, lastVisibleId
+@docs visibleIds
 @docs get, updateElement
 @docs maxCounter
 
@@ -85,6 +87,16 @@ elements (Rga d) =
 insertElement : Element c -> Dict String (Element c) -> Dict String (Element c)
 insertElement el d =
     Dict.insert (Id.opIdToString el.id) el d
+
+
+{-| Insert a single element directly (O(log n)), without rebuilding the array.
+Used by the op-log fold so applying an insert op is not O(n). Order is still
+derived in `toList`, so where the element ends up is governed by its id/origin,
+not by insertion time.
+-}
+put : Element c -> Rga c -> Rga c
+put el (Rga d) =
+    Rga (insertElement el d)
 
 
 
@@ -239,33 +251,54 @@ toElementsInOrder (Rga d) =
                 |> Maybe.withDefault []
                 |> List.sortWith (\x y -> Id.compareOpId y.id x.id)
 
-        -- walk the insertion forest, guarding against origin cycles (which can
-        -- occur in adversarial/corrupt input) via a visited set. Returns the
-        -- ordered elements and the updated visited set.
-        walk : Element c -> Set String -> ( List (Element c), Set String )
-        walk el visited =
-            let
-                key =
-                    Id.opIdToString el.id
-            in
-            if Set.member key visited then
-                ( [], visited )
+        -- Pre-order DFS of the insertion forest via an explicit work-stack, so it
+        -- is tail-recursive (stack-safe for long origin-chains — a list built by
+        -- appending is a chain of depth N) and O(N) overall. The visited set
+        -- guards against origin cycles in adversarial/corrupt input. Children are
+        -- prepended to the stack so they are emitted before later siblings, in
+        -- `sortedChildren` order; `acc` is built reversed and flipped once.
+        loop : List (Element c) -> Set String -> List (Element c) -> ( List (Element c), Set String )
+        loop stack visited acc =
+            case stack of
+                [] ->
+                    ( acc, visited )
 
-            else
-                walkForest (sortedChildren key) (Set.insert key visited)
-                    |> Tuple.mapFirst (\children -> el :: children)
+                el :: rest ->
+                    let
+                        key =
+                            Id.opIdToString el.id
+                    in
+                    if Set.member key visited then
+                        loop rest visited acc
 
-        walkForest : List (Element c) -> Set String -> ( List (Element c), Set String )
-        walkForest els visited =
-            List.foldl
-                (\el ( acc, vis ) ->
-                    walk el vis |> Tuple.mapFirst (\out -> acc ++ out)
-                )
-                ( [], visited )
-                els
+                    else
+                        loop (sortedChildren key ++ rest) (Set.insert key visited) (el :: acc)
+
+        ( ordered, seen ) =
+            loop (sortedChildren headKey) Set.empty []
+
+        -- Concurrent moves can form an origin *cycle* (A after B, B after A), whose
+        -- members are unreachable from the head. Never drop them: take the
+        -- lowest-id unvisited element as an extra root and keep walking, until all
+        -- elements appear. Deterministic (id order) so it still converges.
+        sweep : List (Element c) -> Set String -> List (Element c)
+        sweep acc visited =
+            case
+                all
+                    |> List.filter (\el -> not (Set.member (Id.opIdToString el.id) visited))
+                    |> List.sortWith (\x y -> Id.compareOpId x.id y.id)
+            of
+                [] ->
+                    acc
+
+                root :: _ ->
+                    let
+                        ( acc1, visited1 ) =
+                            loop [ root ] visited acc
+                    in
+                    sweep acc1 visited1
     in
-    walkForest (sortedChildren headKey) Set.empty
-        |> Tuple.first
+    List.reverse (sweep ordered seen)
 
 
 headKey : String
@@ -319,6 +352,18 @@ lastVisibleId rga =
         |> List.reverse
         |> List.head
         |> Maybe.map .id
+
+
+{-| The ids of all visible (non-tombstoned) elements, in order. Computes the
+ordering **once** — callers that need several visible indices (e.g. a text-diff
+delete range) should use this instead of repeated `idAtVisibleIndex`, which
+re-orders the whole array each call (turning an edit O(D·N)).
+-}
+visibleIds : Rga c -> List OpId
+visibleIds rga =
+    toElementsInOrder rga
+        |> List.filter (not << .deleted)
+        |> List.map .id
 
 
 {-| Look up an element by id.

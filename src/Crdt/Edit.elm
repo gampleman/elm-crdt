@@ -1,6 +1,6 @@
 module Crdt.Edit exposing
     ( Error(..), errorToString
-    , setText, setString, setInt, setFloat, setBool
+    , setText, setString, setInt, setFloat, setBool, increment
     , listAppend, listInsert, listRemove
     , setKey, removeKey
     )
@@ -15,7 +15,7 @@ _visible_ indices (tombstones already skipped) and return a `Result` so callers
 can surface bad paths.
 
 @docs Error, errorToString
-@docs setText, setString, setInt, setFloat, setBool
+@docs setText, setString, setInt, setFloat, setBool, increment
 @docs listAppend, listInsert, listRemove
 @docs setKey, removeKey
 
@@ -96,6 +96,30 @@ setBool path value =
     setPrim path (PBool value)
 
 
+{-| Add `delta` to a counter node (negative to decrement). Concurrent increments
+from different replicas sum, rather than clobbering each other.
+-}
+increment : Path -> Int -> Doc -> Result Error Doc
+increment path delta doc =
+    transform path
+        (\node ctx ->
+            case node of
+                Node.Cnt contributions ->
+                    let
+                        ( stamp, ctx1 ) =
+                            Id.nextId ctx
+                    in
+                    Ok
+                        ( Node.counter (Dict.insert (Id.opIdToString stamp) (Node.increment stamp delta) contributions)
+                        , ctx1
+                        )
+
+                _ ->
+                    Err (WrongNodeType "expected counter node for increment")
+        )
+        doc
+
+
 {-| Edit a text node so it reads as the given string, applying the minimal RGA
 insert/delete diff (so concurrent edits in other regions survive the merge).
 -}
@@ -132,7 +156,7 @@ listAppend path seed doc =
                 Node.Seq rga ->
                     let
                         ( childNode, ctx1 ) =
-                            seed ctx
+                            I.runSeed seed ctx
 
                         origin =
                             Rga.lastVisibleId rga
@@ -158,7 +182,7 @@ listInsert path i seed doc =
                 Node.Seq rga ->
                     let
                         ( childNode, ctx1 ) =
-                            seed ctx
+                            I.runSeed seed ctx
 
                         origin =
                             Rga.originForVisibleIndex i rga
@@ -209,7 +233,7 @@ setKey path k seed doc =
                 Node.Map entries ->
                     let
                         ( childNode, ctx1 ) =
-                            seed ctx
+                            I.runSeed seed ctx
 
                         ( stamp, ctx2 ) =
                             Id.nextId ctx1

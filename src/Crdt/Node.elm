@@ -1,7 +1,7 @@
 module Crdt.Node exposing
-    ( Node(..), Register, Prim(..), Entry
-    , reg, mapFromEntries, entry, seq, txt
-    , asPrim, asMap, presentEntries, asSeq, asTxt
+    ( Node(..), Register, Prim(..), Entry, Increment
+    , reg, mapFromEntries, entry, seq, txt, counter, increment
+    , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter
     , merge, maxCounter
     , restore
     , Element, RgaNode
@@ -19,14 +19,15 @@ its structural `merge`.
     This is what makes dictionary key removal a well-behaved CRDT instead of an
     ambiguous set-vs-remove race;
   - `Seq` — a sequence, backed by `Crdt.Rga` at `Rga Node`;
-  - `Txt` — collaborative text, also an `Rga Node` (of single-char registers).
+  - `Txt` — collaborative text, also an `Rga Node` (of single-char registers);
+  - `Cnt` — a PN-counter: a map of per-op signed contributions, summed to a value.
 
 `merge` is monomorphic over `Node` and never touches the typed schema layer —
 convergence correctness lives here and nowhere else.
 
-@docs Node, Register, Prim, Entry
-@docs reg, mapFromEntries, entry, seq, txt
-@docs asPrim, asMap, presentEntries, asSeq, asTxt
+@docs Node, Register, Prim, Entry, Increment
+@docs reg, mapFromEntries, entry, seq, txt, counter, increment
+@docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter
 @docs merge, maxCounter
 @docs restore
 @docs Element, RgaNode
@@ -45,6 +46,19 @@ type Node
     | Map (Dict String Entry)
     | Seq RgaNode
     | Txt RgaNode
+    | Cnt (Dict String Increment)
+
+
+{-| One contribution to a counter: a signed `delta` tagged with the `OpId` of the
+increment op that produced it. The counter's value is the sum of all deltas;
+keying by `OpId` makes merge a `Dict.union` (each op is unique, so a shared key
+carries an identical contribution) — idempotent, commutative, and a proper
+PN-counter (concurrent `+1`/`+1` sum to 2, not LWW-collapse to 1).
+-}
+type alias Increment =
+    { stamp : OpId
+    , delta : Int
+    }
 
 
 {-| A map entry: a value plus an LWW presence cell. `present = False` is a key
@@ -127,6 +141,20 @@ txt =
     Txt
 
 
+{-| A counter node from its per-op contributions.
+-}
+counter : Dict String Increment -> Node
+counter =
+    Cnt
+
+
+{-| A single counter contribution.
+-}
+increment : OpId -> Int -> Increment
+increment stamp delta =
+    { stamp = stamp, delta = delta }
+
+
 
 -- ACCESSORS ------------------------------------------------------------------
 
@@ -193,6 +221,19 @@ asTxt node =
             Nothing
 
 
+{-| The counter's current value: the sum of all its contributions. `Nothing` if
+this node isn't a counter.
+-}
+asCounter : Node -> Maybe Int
+asCounter node =
+    case node of
+        Cnt d ->
+            Just (Dict.foldl (\_ inc acc -> acc + inc.delta) 0 d)
+
+        _ ->
+            Nothing
+
+
 
 -- MERGE ----------------------------------------------------------------------
 
@@ -213,6 +254,22 @@ merge a b =
 
         ( Txt ta, Txt tb ) ->
             Txt (Rga.merge merge ta tb)
+
+        ( Cnt ca, Cnt cb ) ->
+            -- union of per-op contributions. In real use a shared key carries an
+            -- identical contribution (one op mints one delta), so this just sums
+            -- distinct contributions. On a key collision with differing deltas
+            -- (only possible from corrupt/adversarial input) pick the larger delta
+            -- deterministically, so merge stays commutative on ANY input.
+            Cnt
+                (Dict.merge
+                    Dict.insert
+                    (\k x y -> Dict.insert k (mergeIncrement x y))
+                    Dict.insert
+                    ca
+                    cb
+                    Dict.empty
+                )
 
         _ ->
             -- constructor mismatch: deterministic, order-independent tiebreak.
@@ -264,10 +321,32 @@ restore ctx old current =
         ( Txt _, Txt _ ) ->
             restoreSequence ctx Txt old current
 
+        ( Cnt co, Cnt cc ) ->
+            -- revert a counter by adding one fresh contribution that cancels the
+            -- difference, so it reads the old sum but stays a valid PN-counter.
+            let
+                diff =
+                    sumIncrements co - sumIncrements cc
+            in
+            if diff == 0 then
+                ( current, ctx )
+
+            else
+                let
+                    ( stamp, ctx1 ) =
+                        Id.nextId ctx
+                in
+                ( Cnt (Dict.insert (Id.opIdToString stamp) (increment stamp diff) cc), ctx1 )
+
         _ ->
             -- shape changed between versions (shouldn't happen under one schema):
             -- re-assert the old node wholesale with fresh stamps.
             reStamp ctx old
+
+
+sumIncrements : Dict String Increment -> Int
+sumIncrements =
+    Dict.foldl (\_ inc acc -> acc + inc.delta) 0
 
 
 restoreMap : Id.Ctx -> Dict String Entry -> Dict String Entry -> ( Node, Id.Ctx )
@@ -428,6 +507,23 @@ reStamp ctx node =
         Txt r ->
             reStampRga ctx Txt r
 
+        Cnt d ->
+            -- re-stamp each contribution with a fresh id; the sum is preserved.
+            let
+                ( newCnt, ctx1 ) =
+                    Dict.foldl
+                        (\_ inc ( acc, c ) ->
+                            let
+                                ( s, c1 ) =
+                                    Id.nextId c
+                            in
+                            ( Dict.insert (Id.opIdToString s) (increment s inc.delta) acc, c1 )
+                        )
+                        ( Dict.empty, ctx )
+                        d
+            in
+            ( Cnt newCnt, ctx1 )
+
 
 reStampRga : Id.Ctx -> (RgaNode -> Node) -> RgaNode -> ( Node, Id.Ctx )
 reStampRga ctx wrap rga =
@@ -504,6 +600,18 @@ mergeRegister a b =
                 a
 
 
+{-| Two contributions for the same op id should be identical; if they disagree
+(corrupt input), pick the larger delta so merge is commutative.
+-}
+mergeIncrement : Increment -> Increment -> Increment
+mergeIncrement a b =
+    if a.delta >= b.delta then
+        a
+
+    else
+        b
+
+
 rank : Node -> Int
 rank node =
     case node of
@@ -518,6 +626,9 @@ rank node =
 
         Txt _ ->
             3
+
+        Cnt _ ->
+            4
 
 
 
@@ -601,6 +712,9 @@ maxCounter node =
 
         Txt rga ->
             rgaMaxCounter rga
+
+        Cnt d ->
+            Dict.foldl (\_ inc acc -> max acc (Id.opIdCounter inc.stamp)) 0 d
 
 
 rgaMaxCounter : RgaNode -> Int

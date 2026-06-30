@@ -1,6 +1,6 @@
 module Crdt.Schema exposing
-    ( Crdt, Error(..)
-    , int, float, string, bool, text, lww
+    ( Crdt, Error(..), Seed
+    , int, float, string, bool, text, counter, lww
     , list, dict
     , record, field, build
     , with, decodeNode, emptyNode, errorToString
@@ -21,8 +21,8 @@ There is deliberately no `encode : a -> Node` that reconciles with existing
 state — that is the hard diff problem. All in-place mutation goes through
 `Crdt.Edit`, which is decoupled from this layer.
 
-@docs Crdt, Error
-@docs int, float, string, bool, text, lww
+@docs Crdt, Error, Seed
+@docs int, float, string, bool, text, counter, lww
 @docs list, dict
 @docs record, field, build
 @docs with, decodeNode, emptyNode, errorToString
@@ -30,10 +30,19 @@ state — that is the hard diff problem. All in-place mutation goes through
 -}
 
 import Crdt.Id as Id exposing (Ctx)
+import Crdt.Internal as I
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
 import Crdt.Text as Text
 import Dict exposing (Dict)
+
+
+{-| An opaque builder of a fresh subtree from a value, produced by `with` and
+consumed by the edit APIs. Re-exported from `Crdt.Internal` so the edit APIs can
+name it without leaking the internal `Node` type.
+-}
+type alias Seed =
+    I.Seed
 
 
 {-| A schema tying a typed value `a` to CRDT `Node` state.
@@ -87,16 +96,15 @@ emptyNode (Crdt c) =
     c.empty
 
 
-{-| Seed a node from a value, producing a `Seed` (the thunk `Crdt.Edit` and the
-demo pass to `listAppend` / `setKey`). Minting fresh ids requires a context, so
-the result is a function of `Ctx`.
+{-| Seed a node from a value, producing an opaque `Seed` that `Crdt.Edit` /
+`Crdt.OpDoc` pass to `listAppend` / `setKey`.
 
     todoSchema |> S.with (Todo "pack" False)
 
 -}
-with : a -> Crdt a -> (Ctx -> ( Node, Ctx ))
+with : a -> Crdt a -> Seed
 with value (Crdt c) =
-    c.seed value
+    I.Seed (c.seed value)
 
 
 
@@ -205,6 +213,41 @@ the identity — provided for readable schemas.
 lww : Crdt a -> Crdt a
 lww =
     identity
+
+
+
+-- COUNTER --------------------------------------------------------------------
+
+
+{-| A PN-counter, read as its integer total. Unlike an `int` register (which is
+last-write-wins, so concurrent `+1`/`+1` collapses to 1), concurrent increments
+from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.Edit.increment`
+/ `Crdt.OpDoc.increment` to change it.
+-}
+counter : Crdt Int
+counter =
+    Crdt
+        { decode =
+            \node ->
+                case Node.asCounter node of
+                    Just n ->
+                        Ok n
+
+                    Nothing ->
+                        Err (TypeMismatch "expected counter")
+        , empty = \ctx -> ( Node.counter Dict.empty, ctx )
+        , seed =
+            \value ctx ->
+                if value == 0 then
+                    ( Node.counter Dict.empty, ctx )
+
+                else
+                    let
+                        ( stamp, ctx1 ) =
+                            Id.nextId ctx
+                    in
+                    ( Node.counter (Dict.singleton (Id.opIdToString stamp) (Node.increment stamp value)), ctx1 )
+        }
 
 
 

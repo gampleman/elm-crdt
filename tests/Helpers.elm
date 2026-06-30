@@ -79,7 +79,18 @@ fuzzNodeDepth depth =
             [ fuzzReg
             , fuzzMap (depth - 1)
             , fuzzSeq (depth - 1)
+            , fuzzCnt
             ]
+
+
+fuzzCnt : Fuzzer Node
+fuzzCnt =
+    Fuzz.listOfLengthBetween 0 4 (Fuzz.pair fuzzOpId (Fuzz.intRange -50 50))
+        |> Fuzz.map
+            (List.map (\( stamp, delta ) -> ( Id.opIdToString stamp, Node.increment stamp delta ))
+                >> Dict.fromList
+                >> Node.counter
+            )
 
 
 fuzzReg : Fuzzer Node

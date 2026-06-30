@@ -189,6 +189,9 @@ collectOpIds node =
         Node.Txt rga ->
             collectRgaOpIds rga
 
+        Node.Cnt contributions ->
+            Dict.foldl (\_ inc acc -> inc.stamp :: acc) [] contributions
+
 
 collectRgaOpIds : Node.RgaNode -> List OpId
 collectRgaOpIds rga =

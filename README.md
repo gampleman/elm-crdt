@@ -57,18 +57,34 @@ go through path-addressed operations in `Crdt.Edit`, so convergence correctness
 never depends on the codec. Sequences and text are backed by an RGA; map keys
 carry last-write-wins presence cells so concurrent set-vs-remove is well-defined.
 
+## Two document flavors
+
+The library ships **two interchangeable document types over the same schema and
+merge semantics**, so you can pick the trade-off you want:
+
+- **`Crdt` (state-based)** — the document *is* the `Node` tree; `merge` is a
+  structural join. Simplest model; full-state sync.
+- **`Crdt.OpDoc` (op-log)** — the document is an operation log; state is a
+  materialized read model. Adds **delta sync** (`encodeSince`), **collaborative
+  time-travel** (`version` / `readAt`), and **named checkpoints**. This is what
+  the demo runs on.
+
+Both expose the same combinator schema (`Crdt.Schema`), path-addressed edits, a
+`counter` PN-counter, and JSON transport.
+
 ## What's included
 
 | Module | Purpose |
 | --- | --- |
-| `Crdt` | Document lifecycle: `init`, `read`, `merge`, `encode`/`decode` |
-| `Crdt.Schema` | The `Crdt a` combinators: `record`/`field`, `list`, `dict`, `text`, primitives |
-| `Crdt.Edit` | Path-addressed edits: set values, insert/remove list & text, set/remove keys |
+| `Crdt` | State-based document: `init`, `read`, `merge`, `encode`/`decode` |
+| `Crdt.OpDoc` | Op-log document: edits + `merge`, delta sync (`encodeSince`), time-travel (`version`/`readAt`), checkpoints |
+| `Crdt.Schema` | The `Crdt a` combinators: `record`/`field`, `list`, `dict`, `text`, `counter`, primitives |
+| `Crdt.Edit` | Path-addressed edits for the state-based doc |
 | `Crdt.Path` | Build paths into a document |
 | `Crdt.Id` | Replica identifiers |
 | `Crdt.Text` | Collaborative-text helpers over the RGA |
 | `Crdt.Presence` | Ephemeral awareness (who's online, cursors) — a separate channel |
-| `Crdt.History` | Local checkpoints, checkout/restore, undo/redo |
+| `Crdt.History` | Local checkpoints, checkout/restore, undo/redo (state-based) |
 
 ## Demo
 
