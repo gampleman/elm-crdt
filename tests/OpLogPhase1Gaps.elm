@@ -85,14 +85,35 @@ suite =
         -- Elements in List CRDTs"); needs a dedicated position scheme, not origin
         -- re-pointing. Deferred deliberately rather than ship a broken reorder.
         , todo "MoveElem action: reordering a list item preserves its identity (needs a real move scheme, not origin LWW; see note)"
-        , todo "stable cursors: a position survives concurrent edits (fixes presence-by-index in the demo; roadmap #2)"
 
+        -- Stable cursors (DONE): Crdt.Cursor (Anchor=Start|After OpId, Cursor =
+        --   id-based Target + anchor; Range = pair of cursors). OpDoc.cursorAt /
+        --   cursorOffset / cursorRange; Rga.liveCountThrough resolves robustly
+        --   across concurrent inserts AND deletion of the anchor (tombstones
+        --   retained). Tested (CursorTests): round-trip, track-on-insert-before,
+        --   stable-on-insert-after, survive-anchor-delete, convergence, nested
+        --   stability, range, JSON. Demo: live remote title caret (ch-approx) via
+        --   Presence.custom carrying a Cursor. Crdt.Cursor is public.
         -- Counter (DONE): `Cnt` node = per-op signed contributions, value = sum,
         --   merge = union (Dict.merge with larger-delta tiebreak for robustness).
         --   `S.counter` combinator, `OpDoc.increment` / `Edit.increment` ops,
         --   JSON via Crdt.Json + OpJson. Tested: accumulate, decrement, concurrent
         --   +1/+1 => 2 (not LWW 1), order-independent, wire round-trip, fuzz laws.
-        , todo "GC / shallow snapshot: replace ops below a frontier everyone has with one snapshot op, dropping their tombstones safely (roadmap #6)"
+        -- GC / shallow snapshot (DONE, phases 0–3): OpLog.compact (Node->Frontier
+        --   ->OpStore->(Node,OpStore)) with a fuzzed read-equivalence proof;
+        --   OpDoc.gc folds ops <= a cut into `base`, advances `baseFrontier`,
+        --   drops them (read unchanged, time-travel below the cut lost — by
+        --   design). Snapshot-transfer wire: encode/encodeSince send a snapshot
+        --   (base+frontier+tail) when a peer is behind baseFrontier, decodeInto
+        --   adopts it. Tested (GcTests): read-equiv, lagging-peer merge w/o
+        --   resurrection, clock-safe, cursor-below-cut resolves, snapshot catch-up.
+        --   SOUNDNESS is the caller's: dropping ops is only safe across merges if
+        --   the cut is stable (single-replica/persist always safe). See docs/04-gc.md.
+        -- Remaining GC tail (deferred): physically drop settled tombstones from
+        -- `base`'s RGA (phase 4); server-mediated stable frontier (regime 2);
+        -- decentralized agreement on a GC frontier (regime 3).
+        , todo "tombstone compaction: physically drop settled (<=cut, unreferenced) tombstones from base's RGA"
+        , todo "stable-frontier policy: relay-tracked or decentralized agreement on a safe GC cut across peers"
 
         -- Cross-cutting design note surfaced by the spike (still open)
         , todo "text op granularity: one op per character bloats the DAG — evaluate run-length insert ops"

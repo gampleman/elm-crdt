@@ -1,9 +1,9 @@
 module Crdt.Presence exposing
     ( Presence, Codec
-    , init, setLocal, updateLocal, local, peers, merge
+    , init, setLocal, updateLocal, local, peers, merge, remove
     , encode, decode
     , codec, field, optional, buildCodec
-    , string, bool, int
+    , string, bool, int, custom
     , FieldCodec
     )
 
@@ -20,10 +20,10 @@ State is described by a small `Codec` (a cut-down record codec) so it can be
 serialized to JSON for the wire.
 
 @docs Presence, Codec
-@docs init, setLocal, updateLocal, local, peers, merge
+@docs init, setLocal, updateLocal, local, peers, merge, remove
 @docs encode, decode
 @docs codec, field, optional, buildCodec
-@docs string, bool, int
+@docs string, bool, int, custom
 @docs FieldCodec
 
 -}
@@ -127,6 +127,15 @@ merge (Presence a) (Presence b) =
                     b.slots
                     Dict.empty
         }
+
+
+{-| Drop a peer from the table (e.g. on disconnect). Presence is ephemeral, so
+unlike document state there's no tombstone — a removed peer simply disappears,
+and reappears if it broadcasts again.
+-}
+remove : ReplicaId -> Presence a -> Presence a
+remove rid (Presence p) =
+    Presence { p | slots = Dict.remove (Id.toString rid) p.slots }
 
 
 
@@ -277,3 +286,11 @@ bool =
 int : FieldCodec Int
 int =
     FieldCodec { encode = JE.int, decode = JD.int }
+
+
+{-| A field with a custom JSON encoder/decoder — for richer per-peer state such
+as a serialized `Crdt.Cursor`.
+-}
+custom : (a -> JE.Value) -> Decoder a -> FieldCodec a
+custom enc dec =
+    FieldCodec { encode = enc, decode = dec }

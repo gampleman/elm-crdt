@@ -13,6 +13,7 @@ WebSocket networking, live **presence** (who's here, their cursor), and
 -}
 
 import Browser
+import Crdt.Cursor as Cursor exposing (Cursor)
 import Crdt.Id exposing (ReplicaId)
 import Crdt.OpDoc as OpDoc exposing (Checkpoint, OpDoc, Version)
 import Crdt.Path as Path exposing (Path)
@@ -70,19 +71,21 @@ todoSchema =
 {-| Per-peer ephemeral state. Never merged into the document — it lives on the
 separate presence channel and expires when a peer goes quiet.
 -}
-type alias Cursor =
+type alias Peer =
     { name : String
     , color : String
     , editing : Maybe String -- which field this peer is focused on
+    , caret : Maybe Cursor -- stable text caret, if editing a text field
     }
 
 
-cursorCodec : Presence.Codec Cursor
-cursorCodec =
-    Presence.codec Cursor
+peerCodec : Presence.Codec Peer
+peerCodec =
+    Presence.codec Peer
         |> Presence.field "name" .name Presence.string
         |> Presence.field "color" .color Presence.string
         |> Presence.optional "editing" .editing Presence.string
+        |> Presence.optional "caret" .caret (Presence.custom Cursor.encode Cursor.decoder)
         |> Presence.buildCodec
 
 
@@ -150,8 +153,8 @@ noteField k =
 type alias Model =
     { me : ReplicaId
     , doc : OpDoc Board
-    , presence : Presence Cursor
-    , peers : Presence Cursor -- merged view of everyone (incl. self)
+    , presence : Presence Peer
+    , peers : Presence Peer -- merged view of everyone (incl. self)
 
     -- transient form state
     , newTodo : String
@@ -182,9 +185,9 @@ init flags =
             Crdt.Id.replica flags.replicaId
 
         presence =
-            Presence.init me cursorCodec
+            Presence.init me peerCodec
                 |> Presence.setLocal
-                    { name = flags.name, color = flags.color, editing = Nothing }
+                    { name = flags.name, color = flags.color, editing = Nothing, caret = Nothing }
 
         doc =
             OpDoc.init me schema
@@ -209,18 +212,18 @@ init flags =
 
 
 type Msg
-    = -- title
-      TitleChanged String
+    = -- any collaborative text field: carries its path + the new value + the real
+      -- DOM caret offset, so the broadcast caret is exact for that field
+      TextEdited Path String Int
+    | CaretMoved Path Int
       -- todos
     | NewTodoChanged String
     | AddTodo
-    | TodoTextChanged Int String
     | ToggleTodo Int
     | RemoveTodo Int
       -- notes (dict)
     | NewNoteKeyChanged String
     | AddNote
-    | NoteChanged String String
     | RemoveNote String
       -- presence
     | FocusField String
@@ -238,8 +241,13 @@ type Msg
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        TitleChanged s ->
-            model |> editText titlePath s
+        TextEdited path s caretOffset ->
+            editText path s caretOffset model
+
+        CaretMoved path caretOffset ->
+            -- caret moved without editing (arrow keys / click): re-publish our
+            -- caret at the new offset within that field
+            publishCaret path caretOffset model
 
         NewTodoChanged s ->
             ( { model | newTodo = s }, Cmd.none )
@@ -258,9 +266,6 @@ update msg model =
                             |> orKeep model.doc
                 in
                 pushDoc { model | doc = doc1, newTodo = "" }
-
-        TodoTextChanged i s ->
-            model |> editText (todoTextPath i) s
 
         ToggleTodo i ->
             let
@@ -300,9 +305,6 @@ update msg model =
                             |> orKeep model.doc
                 in
                 pushDoc { model | doc = doc1, newNoteKey = "" }
-
-        NoteChanged k s ->
-            model |> editText (notePath k) s
 
         RemoveNote k ->
             let
@@ -356,7 +358,7 @@ update msg model =
                             ( model, Cmd.none )
 
                 Ok (PresenceMsg incomingJson) ->
-                    case Presence.decode cursorCodec incomingJson of
+                    case Presence.decode peerCodec incomingJson of
                         Ok incoming ->
                             ( { model | peers = Presence.merge model.peers incoming }
                             , Cmd.none
@@ -366,8 +368,16 @@ update msg model =
                             ( model, Cmd.none )
 
                 Ok HelloMsg ->
-                    -- a peer just joined: send our full op set so they catch up
-                    ( model, broadcastFull model.doc )
+                    -- a peer just joined: send our full op set AND our presence so
+                    -- they catch up on both the document and who's here / cursors.
+                    ( model
+                    , Cmd.batch [ broadcastFull model.doc, broadcastPresence model.presence ]
+                    )
+
+                Ok (LeftMsg rid) ->
+                    -- the relay says this peer's socket closed: drop it from the
+                    -- presence view (and its caret with it).
+                    ( { model | peers = Presence.remove rid model.peers }, Cmd.none )
 
                 Err _ ->
                     ( model, Cmd.none )
@@ -393,18 +403,51 @@ update msg model =
 -- EDIT / SYNC HELPERS --------------------------------------------------------
 
 
-{-| Text fields use the Text CRDT: `setText` diffs old→new and emits the minimal
-insert/delete ops so concurrent typing merges character-wise.
+{-| Edit any collaborative text field + publish the caret in one step: apply the
+text change (the Text CRDT diffs old→new into minimal insert/delete ops so
+concurrent typing merges character-wise), then publish a **stable caret** at the
+real DOM offset within `path`. Because the caret is a `Crdt.Cursor`, it tracks the
+right character on every viewer even as they make their own concurrent edits.
 -}
-editText : Path -> String -> Model -> ( Model, Cmd Msg )
-editText path newValue model =
+editText : Path -> String -> Int -> Model -> ( Model, Cmd Msg )
+editText path newValue caretOffset model =
     let
         doc1 =
             model.doc
                 |> OpDoc.setText path newValue
                 |> orKeep model.doc
+
+        caret =
+            OpDoc.cursorAt path caretOffset doc1 |> Result.toMaybe
+
+        presence1 =
+            Presence.updateLocal (\c -> { c | caret = caret }) model.presence
+
+        ( model1, docCmd ) =
+            pushDoc
+                { model
+                    | doc = doc1
+                    , presence = presence1
+                    , peers = Presence.merge model.peers presence1
+                }
     in
-    pushDoc { model | doc = doc1 }
+    ( model1, Cmd.batch [ docCmd, broadcastPresence presence1 ] )
+
+
+{-| Re-publish our caret at a new offset within `path` (caret moved, no edit).
+-}
+publishCaret : Path -> Int -> Model -> ( Model, Cmd Msg )
+publishCaret path caretOffset model =
+    let
+        caret =
+            OpDoc.cursorAt path caretOffset model.doc |> Result.toMaybe
+
+        presence1 =
+            Presence.updateLocal (\c -> { c | caret = caret }) model.presence
+    in
+    ( { model | presence = presence1, peers = Presence.merge model.peers presence1 }
+    , broadcastPresence presence1
+    )
 
 
 orKeep : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
@@ -444,7 +487,7 @@ sayHello =
     Ports.outgoing (envelope "hello" (JE.object []))
 
 
-broadcastPresence : Presence Cursor -> Cmd Msg
+broadcastPresence : Presence Peer -> Cmd Msg
 broadcastPresence p =
     Ports.outgoing (envelope "presence" (Presence.encode p))
 
@@ -455,8 +498,22 @@ merged `peers` view so our own row stays current, and broadcast it to others.
 setEditing : Maybe String -> Model -> ( Model, Cmd Msg )
 setEditing field model =
     let
+        -- the input's own mouseup/keyup publishes the caret at the real offset;
+        -- here we just track focus and clear the caret on blur.
         presence1 =
-            Presence.updateLocal (\c -> { c | editing = field }) model.presence
+            Presence.updateLocal
+                (\c ->
+                    { c
+                        | editing = field
+                        , caret =
+                            if field == Nothing then
+                                Nothing
+
+                            else
+                                c.caret
+                    }
+                )
+                model.presence
     in
     ( { model | presence = presence1, peers = Presence.merge model.peers presence1 }
     , broadcastPresence presence1
@@ -471,6 +528,7 @@ type Envelope
     = DocMsg JD.Value -- a batch of ops (delta or full)
     | PresenceMsg JD.Value
     | HelloMsg -- "I just joined — send me your full state"
+    | LeftMsg ReplicaId -- the relay says this peer's socket closed
 
 
 envelope : String -> JE.Value -> JE.Value
@@ -493,6 +551,10 @@ decodeEnvelope =
 
                         "hello" ->
                             JD.succeed HelloMsg
+
+                        "left" ->
+                            JD.map (Crdt.Id.replica >> LeftMsg)
+                                (JD.at [ "payload", "replica" ] JD.string)
 
                         _ ->
                             JD.fail ("unknown envelope kind: " ++ kind)
@@ -520,6 +582,80 @@ onEnter msg =
                         JD.fail "not Enter"
                 )
         )
+
+
+{-| The collaborative-text attributes for an input editing `path`: report edits
+(value + real caret offset) and caret moves (keyup/mouseup) so we broadcast an
+exact caret, plus the focus/blur presence handlers.
+-}
+textFieldAttrs : Path -> List (Html.Attribute Msg)
+textFieldAttrs path =
+    [ on "input"
+        (JD.map2 (TextEdited path)
+            (JD.at [ "target", "value" ] JD.string)
+            (JD.at [ "target", "selectionStart" ] JD.int)
+        )
+    , on "keyup" (JD.map (CaretMoved path) (JD.at [ "target", "selectionStart" ] JD.int))
+    , on "mouseup" (JD.map (CaretMoved path) (JD.at [ "target", "selectionStart" ] JD.int))
+    ]
+
+
+{-| Render each _remote_ peer's caret **for the field at `path`** as a thin
+colored bar, positioned by the caret's resolved offset. We resolve each peer's
+stable `Cursor` against **our own** document, so it lands at the right character
+even if our local edits shifted offsets — the point of stable cursors. A peer's
+caret only shows in the field it actually points into (compared by `Cursor`'s
+target path), so each text input shows only the carets that belong to it.
+
+Horizontal placement uses `ch` units; with the monospace input font 1ch is one
+glyph, so the bar lands exactly on the character.
+
+-}
+viewFieldCarets : Path -> Model -> List (Html Msg)
+viewFieldCarets path model =
+    let
+        pathTarget =
+            OpDoc.cursorAt path 0 model.doc
+                |> Result.toMaybe
+                |> Maybe.map Cursor.steps
+    in
+    Presence.peers model.peers
+        |> List.filterMap
+            (\( rid, peer ) ->
+                if rid == model.me then
+                    Nothing
+
+                else
+                    peer.caret
+                        |> Maybe.andThen
+                            (\c ->
+                                -- only this field's carets: the cursor's target
+                                -- path must match the field we're rendering
+                                if Just (Cursor.steps c) == pathTarget then
+                                    OpDoc.cursorOffset c model.doc
+                                        |> Maybe.map (\offset -> ( peer, offset ))
+
+                                else
+                                    Nothing
+                            )
+            )
+        |> List.map
+            (\( peer, offset ) ->
+                -- positioned over the input: 0.5rem left padding + 1px border,
+                -- then `offset` character-widths in. Vertical: just inside the
+                -- input's top/bottom padding. `ch`-approximation (see docs/03).
+                span
+                    [ class "remote-caret"
+                    , A.style "position" "absolute"
+                    , A.style "left" ("calc(0.5rem + 1px + " ++ String.fromInt offset ++ "ch)")
+                    , A.style "top" "0.3rem"
+                    , A.style "background" peer.color
+                    , A.style "width" "2px"
+                    , A.style "height" "1.2rem"
+                    , A.title (peer.name ++ "'s cursor")
+                    ]
+                    []
+            )
 
 
 {-| The color of a _remote_ peer currently editing `fieldId`, if any. Our own
@@ -616,19 +752,31 @@ viewHeader model =
         ]
 
 
+{-| A collaborative text input: the field's value, the edit/caret event handlers,
+the presence highlight + focus reporting, and any remote peers' carets overlaid
+on top — all keyed to this field's `path` and `fieldId`.
+-}
+viewTextInput : Bool -> Model -> Path -> String -> String -> String -> Html Msg
+viewTextInput readOnly model path fieldId currentValue placeholderText =
+    div [ class "field-wrap", A.style "position" "relative" ]
+        (input
+            ([ value currentValue
+             , placeholder placeholderText
+             , A.disabled readOnly
+             ]
+                ++ textFieldAttrs path
+                ++ fieldAttrs model fieldId
+            )
+            []
+            :: viewFieldCarets path model
+        )
+
+
 viewBoard : Bool -> Model -> Board -> Html Msg
 viewBoard readOnly model board =
     div []
         [ h2 [] [ text "Title" ]
-        , input
-            ([ value board.title
-             , placeholder "Untitled board"
-             , onInput TitleChanged
-             , A.disabled readOnly
-             ]
-                ++ fieldAttrs model titleField
-            )
-            []
+        , viewTextInput readOnly model titlePath titleField board.title "Untitled board"
         , h2 [] [ text "Todos" ]
         , ul [ class "todos" ] (List.indexedMap (viewTodo readOnly model) board.todos)
         , if readOnly then
@@ -660,14 +808,7 @@ viewTodo readOnly model i todo =
             , A.disabled readOnly
             ]
             []
-        , input
-            ([ value todo.text
-             , onInput (TodoTextChanged i)
-             , A.disabled readOnly
-             ]
-                ++ fieldAttrs model (todoField i)
-            )
-            []
+        , viewTextInput readOnly model (todoTextPath i) (todoField i) todo.text ""
         , if readOnly then
             text ""
 
@@ -685,11 +826,7 @@ viewNotes readOnly model notes =
                     (\( k, v ) ->
                         li []
                             [ span [ class "note-key" ] [ text k ]
-                            , input
-                                ([ value v, onInput (NoteChanged k), A.disabled readOnly ]
-                                    ++ fieldAttrs model (noteField k)
-                                )
-                                []
+                            , viewTextInput readOnly model (notePath k) (noteField k) v ""
                             , if readOnly then
                                 text ""
 

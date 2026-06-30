@@ -3,7 +3,7 @@ module Crdt.Rga exposing
     , empty, element, fromElements, elements, put
     , insertAfter, delete, merge
     , toList, toElementsInOrder, idAtVisibleIndex, originForVisibleIndex, lastVisibleId
-    , visibleIds
+    , visibleIds, liveCountThrough
     , get, updateElement
     , maxCounter
     )
@@ -28,7 +28,7 @@ equality (`==`) is a sound convergence oracle.
 @docs empty, element, fromElements, elements, put
 @docs insertAfter, delete, merge
 @docs toList, toElementsInOrder, idAtVisibleIndex, originForVisibleIndex, lastVisibleId
-@docs visibleIds
+@docs visibleIds, liveCountThrough
 @docs get, updateElement
 @docs maxCounter
 
@@ -364,6 +364,56 @@ visibleIds rga =
     toElementsInOrder rga
         |> List.filter (not << .deleted)
         |> List.map .id
+
+
+{-| The count of **live** (non-tombstoned) elements at or before `anchor` in RGA
+order. This is the basis for stable cursors: a caret anchored _after_ element
+`anchor` sits at this visible offset, and it stays correct as other replicas
+insert/delete elsewhere.
+
+Robust across deletion of the anchor itself: ordering uses `toElementsInOrder`,
+which retains tombstones, so a deleted anchor still has an order position and we
+count the live elements up to it — the caret lands at the nearest surviving spot.
+If `anchor` isn't present at all (e.g. its op hasn't arrived yet), returns the
+count of all live elements (caret at the end), which converges once it arrives.
+
+-}
+liveCountThrough : OpId -> Rga c -> Int
+liveCountThrough anchor rga =
+    let
+        anchorKey =
+            Id.opIdToString anchor
+
+        step el ( count, stop ) =
+            if stop then
+                ( count, stop )
+
+            else if Id.opIdToString el.id == anchorKey then
+                -- include the anchor itself if it's live, then stop
+                ( count
+                    + (if el.deleted then
+                        0
+
+                       else
+                        1
+                      )
+                , True
+                )
+
+            else
+                ( count
+                    + (if el.deleted then
+                        0
+
+                       else
+                        1
+                      )
+                , False
+                )
+    in
+    toElementsInOrder rga
+        |> List.foldl step ( 0, False )
+        |> Tuple.first
 
 
 {-| Look up an element by id.

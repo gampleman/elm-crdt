@@ -5,8 +5,10 @@ module Crdt.OpDoc exposing
     , listAppend, listRemove
     , setKey, removeKey
     , opCount, cacheConsistent
+    , cursorAt, cursorOffset, cursorRange
     , Version, version, readAt
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
+    , gc
     , encode, encodeSince, decodeInto
     )
 
@@ -29,24 +31,29 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs listAppend, listRemove
 @docs setKey, removeKey
 @docs opCount, cacheConsistent
+@docs cursorAt, cursorOffset, cursorRange
 @docs Version, version, readAt
 @docs Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
+@docs gc
 @docs encode, encodeSince, decodeInto
 
 -}
 
 import Array
+import Crdt.Cursor as Cursor exposing (Cursor)
 import Crdt.Id as Id exposing (Ctx, OpId, ReplicaId)
 import Crdt.Internal as I exposing (Seed)
+import Crdt.Json as Json
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.OpJson as OpJson
-import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, TargetStep(..))
+import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, Target, TargetStep(..))
 import Crdt.Path as Path exposing (Path, Seg(..))
 import Crdt.Rga as Rga
 import Crdt.Schema as Schema exposing (Crdt)
 import Dict
-import Json.Decode as JD
+import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
+import Set
 
 
 {-| An op-log document for a schema `a`: the op store, the local clock, the
@@ -69,6 +76,12 @@ type OpDoc a
         , store : OpStore
         , ctx : Ctx
         , cached : Node
+
+        -- The causal cut that `base` already incorporates. Starts empty (base =
+        -- the schema's empty tree). `gc` folds ops at-or-below a frontier into
+        -- `base` and advances this; it's the boundary below which history (and
+        -- time-travel) has been compacted away.
+        , baseFrontier : OpLog.Frontier
 
         -- Single-slot append fast-path: the (list target, id of the element we
         -- last appended there). Lets consecutive appends to the same list skip
@@ -123,6 +136,7 @@ init replica schema =
         , cached = base
         , lastAppend = Nothing
         , checkpoints = []
+        , baseFrontier = []
         }
 
 
@@ -191,49 +205,153 @@ cacheConsistent (OpDoc d) =
 -- WIRE -----------------------------------------------------------------------
 
 
-{-| Serialize the document's full op set to JSON for transport. Use for first
-contact / catch-up; for steady-state sync prefer `encodeSince`.
+{-| Serialize the document for transport as a **full sync**: if the document has
+been GC'd (`base` holds compacted history), this is a _snapshot_ — the
+materialized base, its frontier, and the live tail ops — so a fresh peer can
+catch up even though the early ops are gone. Otherwise it's just the op set.
 -}
 encode : OpDoc a -> JE.Value
 encode (OpDoc d) =
-    OpJson.encodeOps (OpLog.ops d.store)
+    if List.isEmpty d.baseFrontier then
+        opsPayload (OpLog.ops d.store)
+
+    else
+        snapshotPayload d.base d.baseFrontier (OpLog.ops d.store)
 
 
-{-| Serialize only the ops a peer at `Version` is missing — the delta. The peer
-advertises its `version`; we send back everything not causally behind it. Far
-smaller than `encode` once a document has history, and correct regardless of
-delivery order (the delta is defined by the causal DAG, not counter comparison).
+{-| Serialize only what a peer at `Version` is missing — a **delta**. If that peer
+is at or ahead of our compacted `baseFrontier`, the delta is just the ops they
+lack (`opsAfter`). If they are _behind_ our `baseFrontier`, the ops they need are
+gone — so we send a snapshot (base + frontier + tail) instead.
 -}
 encodeSince : Version -> OpDoc a -> JE.Value
 encodeSince (Version known) (OpDoc d) =
-    OpJson.encodeOps (OpLog.opsAfter known d.store)
+    if frontierCovers known d.baseFrontier then
+        -- peer already has everything our base subsumes: a plain op delta
+        opsPayload (OpLog.opsAfter known d.store)
+
+    else
+        -- peer is behind the compaction boundary: only a snapshot can catch them up
+        snapshotPayload d.base d.baseFrontier (OpLog.ops d.store)
 
 
-{-| Decode ops received from a peer and merge them into this document. Unknown or
-already-held ops are harmless (op-store union is idempotent); the cache is
-re-materialized and the clock advanced past everything seen.
+{-| Whether `have` (a peer's frontier) already includes every op of `needed`
+(our base frontier) — i.e. the peer is not behind our compaction boundary. Each
+base-frontier id must appear in the peer's frontier; since frontiers are causal
+tips and our base ids are minted-once, set membership is the right check.
+-}
+frontierCovers : OpLog.Frontier -> OpLog.Frontier -> Bool
+frontierCovers have needed =
+    let
+        haveKeys =
+            List.map Id.opIdToString have |> Set.fromList
+    in
+    List.all (\id -> Set.member (Id.opIdToString id) haveKeys) needed
+
+
+opsPayload : List Op -> JE.Value
+opsPayload ops =
+    JE.object
+        [ ( "kind", JE.string "ops" )
+        , ( "ops", OpJson.encodeOps ops )
+        ]
+
+
+snapshotPayload : Node -> OpLog.Frontier -> List Op -> JE.Value
+snapshotPayload base frontier tail =
+    JE.object
+        [ ( "kind", JE.string "snapshot" )
+        , ( "base", Json.encodeNode base )
+        , ( "frontier", JE.list Json.encodeOpId frontier )
+        , ( "ops", OpJson.encodeOps tail )
+        ]
+
+
+{-| Decode a peer's payload and merge it in. Two shapes:
+
+  - **ops** — union the ops into our store (idempotent), re-materialize.
+  - **snapshot** — the peer compacted history we may lack. We union the tail ops
+    as usual; and if the snapshot's base is **ahead of ours** (its frontier
+    covers our `baseFrontier`, and we're not already past it), we adopt the
+    snapshot's base + frontier, dropping our now-redundant ops below it. A peer
+    that is _not_ behind the snapshot ignores the base and just takes the ops.
+
+The cache is re-materialized and the clock advanced past everything seen.
+
 -}
 decodeInto : JE.Value -> OpDoc a -> Result String (OpDoc a)
 decodeInto value (OpDoc d) =
-    JD.decodeValue OpJson.opsDecoder value
+    JD.decodeValue payloadDecoder value
         |> Result.mapError JD.errorToString
-        |> Result.map
-            (\incomingOps ->
-                let
-                    store =
-                        List.foldl OpLog.insert d.store incomingOps
+        |> Result.map (\payload -> applyPayload payload (OpDoc d))
 
-                    cached =
-                        OpLog.materialize d.base store
-                in
-                OpDoc
-                    { d
-                        | store = store
-                        , ctx = Id.observe (Node.maxCounter cached) d.ctx
-                        , cached = cached
-                        , lastAppend = Nothing
-                    }
+
+type Payload
+    = OpsPayload (List Op)
+    | SnapshotPayload Node OpLog.Frontier (List Op)
+
+
+payloadDecoder : Decoder Payload
+payloadDecoder =
+    JD.field "kind" JD.string
+        |> JD.andThen
+            (\kind ->
+                case kind of
+                    "ops" ->
+                        JD.map OpsPayload (JD.field "ops" OpJson.opsDecoder)
+
+                    "snapshot" ->
+                        JD.map3 SnapshotPayload
+                            (JD.field "base" Json.nodeDecoder)
+                            (JD.field "frontier" (JD.list Json.opIdDecoder))
+                            (JD.field "ops" OpJson.opsDecoder)
+
+                    other ->
+                        JD.fail ("unknown payload kind: " ++ other)
             )
+
+
+applyPayload : Payload -> OpDoc a -> OpDoc a
+applyPayload payload (OpDoc d) =
+    case payload of
+        OpsPayload incomingOps ->
+            rebuild (List.foldl OpLog.insert d.store incomingOps) d.base d.baseFrontier (OpDoc d)
+
+        SnapshotPayload snapBase snapFrontier tailOps ->
+            if frontierCovers snapFrontier d.baseFrontier && not (frontierCovers d.baseFrontier snapFrontier) then
+                -- the snapshot is strictly ahead of our base: adopt it, keep only
+                -- our ops the snapshot doesn't already subsume, plus the tail.
+                let
+                    keptOps =
+                        OpLog.opsAfter snapFrontier d.store
+
+                    store1 =
+                        List.foldl OpLog.insert OpLog.empty (keptOps ++ tailOps)
+                in
+                rebuild store1 snapBase snapFrontier (OpDoc d)
+
+            else
+                -- we're at/ahead of the snapshot's base: ignore it, take the tail
+                rebuild (List.foldl OpLog.insert d.store tailOps) d.base d.baseFrontier (OpDoc d)
+
+
+{-| Re-materialize from a (possibly new) base + store and advance the clock.
+-}
+rebuild : OpStore -> Node -> OpLog.Frontier -> OpDoc a -> OpDoc a
+rebuild store base baseFrontier (OpDoc d) =
+    let
+        cached =
+            OpLog.materialize base store
+    in
+    OpDoc
+        { d
+            | store = store
+            , base = base
+            , baseFrontier = baseFrontier
+            , cached = cached
+            , ctx = Id.observe (Node.maxCounter cached) d.ctx
+            , lastAppend = Nothing
+        }
 
 
 
@@ -259,7 +377,47 @@ to return to "the state as of now" later.
 -}
 version : OpDoc a -> Version
 version (OpDoc d) =
-    Version (OpLog.frontier d.store)
+    case OpLog.frontier d.store of
+        [] ->
+            -- store empty (fresh, or fully compacted): the version is whatever
+            -- `base` already incorporates.
+            Version d.baseFrontier
+
+        f ->
+            Version f
+
+
+{-| Garbage-collect history at a causal cut: fold every op at-or-below `cut`
+into `base` and drop those ops from the store, advancing `baseFrontier`. The
+**read model is unchanged** (`compact` is equivalence-preserving), so this is
+purely a representation shrink — but it is irreversible: you can no longer
+`readAt` a version below `cut` (the ops to replay are gone).
+
+**Soundness is the caller's responsibility.** `compact` never loses information
+`materialize` would use, but because `merge` is op-union, dropping ops is only
+safe across replicas if every replica you will merge with has already
+incorporated everything below `cut`. Passing your own `version` is always safe
+for a _local_ store (single replica / before persistence); passing a frontier a
+future merge partner hasn't reached can drop their not-yet-merged concurrent work
+below `cut`. See `docs/04-gc.md`.
+
+-}
+gc : Version -> OpDoc a -> OpDoc a
+gc (Version cut) (OpDoc d) =
+    let
+        ( base1, store1 ) =
+            OpLog.compact d.base cut d.store
+    in
+    OpDoc
+        { d
+            | base = base1
+            , store = store1
+            , baseFrontier = cut
+
+            -- `cached`/`ctx` are unchanged: read model is identical and every
+            -- stamp folded into `base1` still contributes to `Node.maxCounter`.
+            , lastAppend = Nothing
+        }
 
 
 {-| The materialized `Node` as of a `Version` — only ops causally at or before
@@ -276,6 +434,116 @@ The live document is unchanged; this is a read-only view of the past.
 readAt : Version -> OpDoc a -> Result Schema.Error a
 readAt v ((OpDoc d) as doc) =
     Schema.decodeNode d.schema (stateAt v doc)
+
+
+
+-- STABLE CURSORS -------------------------------------------------------------
+
+
+{-| Make a stable `Cursor` for a visible `offset` within the text/list addressed
+by `path`. The cursor anchors to element identity, so it stays meaningful as
+other replicas edit around it — resolve it back with `cursorOffset`.
+
+`offset` 0 anchors before the first element; otherwise it anchors _after_ the
+element currently at visible index `offset - 1`. Fails if `path` doesn't resolve
+to a sequence/text container.
+
+-}
+cursorAt : Path -> Int -> OpDoc a -> Result Error Cursor
+cursorAt path offset doc =
+    resolve path doc
+        |> Result.andThen
+            (\( tgt, node ) ->
+                case seqRga node of
+                    Just rga ->
+                        let
+                            anchor =
+                                if offset <= 0 then
+                                    Cursor.Start
+
+                                else
+                                    case Rga.idAtVisibleIndex (offset - 1) rga of
+                                        Just id ->
+                                            Cursor.After id
+
+                                        Nothing ->
+                                            -- offset past the end: anchor to the last element
+                                            case Rga.lastVisibleId rga of
+                                                Just id ->
+                                                    Cursor.After id
+
+                                                Nothing ->
+                                                    Cursor.Start
+                        in
+                        Ok (Cursor.fromParts tgt anchor)
+
+                    Nothing ->
+                        Err (WrongNodeType "expected a text or list at the cursor path")
+            )
+
+
+{-| Resolve a `Cursor` to its current visible offset in this document. `Nothing`
+if the cursor's container no longer exists here. Robust across concurrent edits
+(and deletion of the anchored element) — see `Crdt.Rga.liveCountThrough`.
+-}
+cursorOffset : Cursor -> OpDoc a -> Maybe Int
+cursorOffset cursor doc =
+    navigateTarget (Cursor.steps cursor) (state doc)
+        |> Maybe.andThen seqRga
+        |> Maybe.map
+            (\rga ->
+                case Cursor.anchor cursor of
+                    Cursor.Start ->
+                        0
+
+                    Cursor.After id ->
+                        Rga.liveCountThrough id rga
+            )
+
+
+{-| Resolve a selection `Range` to a `(start, end)` pair of visible offsets in
+this document, normalized so `start <= end`. `Nothing` if either endpoint's
+container is gone.
+-}
+cursorRange : Cursor.Range -> OpDoc a -> Maybe ( Int, Int )
+cursorRange r doc =
+    Maybe.map2
+        (\a f -> ( min a f, max a f ))
+        (cursorOffset (Cursor.rangeAnchor r) doc)
+        (cursorOffset (Cursor.rangeFocus r) doc)
+
+
+{-| The RGA inside a `Seq` or `Txt` node.
+-}
+seqRga : Node -> Maybe Node.RgaNode
+seqRga node =
+    case Node.asSeq node of
+        Just rga ->
+            Just rga
+
+        Nothing ->
+            Node.asTxt node
+
+
+{-| Navigate an **id-based** `Target` into a node, returning the addressed node.
+Mirrors `walk` but keyed by element id rather than visible index, so it is the
+read-only inverse used to resolve a stable cursor.
+-}
+navigateTarget : Target -> Node -> Maybe Node
+navigateTarget tgt node =
+    case tgt of
+        [] ->
+            Just node
+
+        (IntoKey k) :: rest ->
+            Node.asMap node
+                |> Maybe.andThen (Dict.get k)
+                |> Maybe.andThen (\entry -> navigateTarget rest entry.value)
+
+        (IntoElem id) :: rest ->
+            seqRga node
+                |> Maybe.andThen (Rga.get id)
+                |> Maybe.andThen (\el -> navigateTarget rest el.content)
 
 
 {-| Save a named checkpoint pinning the current version. Records the label and

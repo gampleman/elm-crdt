@@ -18,20 +18,41 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
+function broadcastExcept(sender, payload) {
+  for (const client of wss.clients) {
+    if (client !== sender && client.readyState === client.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
 wss.on("connection", (socket) => {
   console.log(`peer connected (${wss.clients.size} total)`);
 
   socket.on("message", (data, isBinary) => {
-    // Broadcast verbatim to everyone except the sender.
-    for (const client of wss.clients) {
-      if (client !== socket && client.readyState === client.OPEN) {
-        client.send(data, { binary: isBinary });
+    // Remember which replica this socket belongs to, so we can announce its
+    // departure on close. The client stamps every envelope with `from`.
+    if (!isBinary) {
+      try {
+        const env = JSON.parse(data);
+        if (env && typeof env.from === "string") socket.replicaId = env.from;
+      } catch (_) {
+        /* opaque to us; just forward */
       }
     }
+    broadcastExcept(socket, data);
   });
 
   socket.on("close", () => {
     console.log(`peer disconnected (${wss.clients.size} total)`);
+    // Tell everyone this peer is gone so they can drop it from presence. (A
+    // closed tab can't send this itself, but the relay sees the socket close.)
+    if (socket.replicaId) {
+      broadcastExcept(
+        socket,
+        JSON.stringify({ kind: "left", from: socket.replicaId, payload: { replica: socket.replicaId } })
+      );
+    }
   });
 });
 

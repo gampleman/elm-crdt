@@ -64,9 +64,36 @@
       }
       input {
         font: inherit;
+        /* monospace so the remote caret's `ch`-based offset lands exactly on the
+           right character (1ch == one glyph in a fixed-width font) */
+        font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
         padding: 0.35rem 0.5rem;
         border: 1px solid #d6d6e7;
         border-radius: 6px;
+      }
+      /* the caret overlay needs a positioned box; the wrap fills its slot so the
+         input keeps its previous full-width sizing (block for the title, a
+         flex-grow item inside todo/note rows) */
+      .field-wrap {
+        position: relative;
+        display: block;
+      }
+      .todo .field-wrap,
+      .notes li .field-wrap {
+        flex: 1;
+      }
+      .field-wrap input {
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .remote-caret {
+        pointer-events: none;
+        animation: caret-blink 1s step-end infinite;
+      }
+      @keyframes caret-blink {
+        50% {
+          opacity: 0.3;
+        }
       }
       input[type="checkbox"] {
         width: auto;

@@ -29,9 +29,11 @@ function tabIdentity() {
   };
 }
 
+const identity = tabIdentity();
+
 const app = Elm.Main.init({
   node: document.getElementById("root"),
-  flags: tabIdentity(),
+  flags: identity,
 });
 
 let socket = null;
@@ -65,7 +67,9 @@ function connect() {
 // peers always converge.
 app.ports.outgoing.subscribe((envelope) => {
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(envelope));
+    // stamp every message with our replica id so the relay can announce our
+    // departure (a `left` message) when this socket closes
+    socket.send(JSON.stringify({ ...envelope, from: identity.replicaId }));
   }
 });
 

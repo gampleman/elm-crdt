@@ -2,7 +2,7 @@ module Crdt.OpLog exposing
     ( Op, Action(..), Target, TargetStep(..), Frontier
     , OpStore, empty, insert, ops, member, merge
     , causalOrder, applyOps, materialize, checkout
-    , frontier, opsAfter
+    , frontier, opsAfter, compact
     )
 
 {-| The operation log: the source of truth for an op-log-based document.
@@ -26,7 +26,7 @@ materialize + checkout. It is not yet wired into the public `Crdt` module.
 @docs Op, Action, Target, TargetStep, Frontier
 @docs OpStore, empty, insert, ops, member, merge
 @docs causalOrder, applyOps, materialize, checkout
-@docs frontier, opsAfter
+@docs frontier, opsAfter, compact
 
 -}
 
@@ -315,6 +315,47 @@ opsAfter known store =
     in
     ops store
         |> List.filter (\op -> not (Set.member (Id.opIdToString op.id) seen))
+
+
+{-| Compact the store at a causal `cut`: fold every op at-or-below `cut` into
+`base` (producing a new base that already incorporates them), and return that new
+base together with the store of the ops **not** below `cut`.
+
+The defining guarantee (the read model is unchanged):
+
+    materialize base store
+        ==  let ( base', store' ) = compact base cut store
+            in materialize base' store'
+
+for **any** `cut`. This holds because folding is associative over a causal order
+and `cut` is a causal cut: the ≤cut ops fold into `base'` exactly as they would
+during a full materialize, and the remaining ops — whose `deps` may now point
+into `base'` — still linearize correctly (`causalOrder` already treats deps
+absent from the store as satisfied, and `base'` contains their effect).
+
+`compact` is a pure, equivalence-preserving rewrite of `(base, store)`. It is
+**not** a soundness decision: whether a given `cut` is safe to _discard_ across
+merges is the caller's policy (see `docs/04-gc.md`) — `compact` itself never
+loses information that `materialize` would have used.
+
+-}
+compact : Node -> Frontier -> OpStore -> ( Node, OpStore )
+compact base cut store =
+    let
+        belowCut =
+            ancestorKeys cut store
+
+        ( below, above ) =
+            ops store
+                |> List.partition (\op -> Set.member (Id.opIdToString op.id) belowCut)
+
+        base1 =
+            applyOps base (causalOrder (List.foldl insert empty below))
+
+        store1 =
+            List.foldl insert empty above
+    in
+    ( base1, store1 )
 
 
 lookup : OpId -> OpStore -> Maybe Op
