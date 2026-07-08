@@ -13,7 +13,7 @@ the index-addressed public API and is resolved to position-independent ops.
 import Crdt.Id as Id
 import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
-import Crdt.Schema as S exposing (Crdt)
+import Crdt.Schema.Internal as S exposing (Crdt)
 import Dict
 import Expect
 import Test exposing (Test, describe, test)
@@ -39,7 +39,7 @@ type alias Todo =
     }
 
 
-schema : Crdt Board
+schema : Crdt S.Nested Board
 schema =
     S.record Board
         |> S.field "title" .title S.text
@@ -56,7 +56,7 @@ votesPath =
     Path.root |> Path.field "votes"
 
 
-todoSchema : Crdt Todo
+todoSchema : Crdt S.Nested Todo
 todoSchema =
     S.record Todo
         |> S.field "text" .text S.text

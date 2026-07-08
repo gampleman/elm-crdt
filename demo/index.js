@@ -54,10 +54,19 @@ function connect() {
   });
 
   socket.addEventListener("message", (event) => {
-    try {
-      app.ports.incoming.send(JSON.parse(event.data));
-    } catch (e) {
-      console.warn("bad message", e);
+    // The relay sends text frames, but be robust to a Blob (binary frame) too,
+    // which some setups produce — resolve it to text before parsing.
+    const handle = (text) => {
+      try {
+        app.ports.incoming.send(JSON.parse(text));
+      } catch (e) {
+        console.warn("bad message", e);
+      }
+    };
+    if (event.data instanceof Blob) {
+      event.data.text().then(handle);
+    } else {
+      handle(event.data);
     }
   });
 }

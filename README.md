@@ -11,10 +11,9 @@ completely transport-agnostic — bring your own WebSocket, `localStorage`,
 HTTP, or anything else.
 
 ```elm
-import Crdt exposing (Doc)
-import Crdt.Schema as S exposing (Crdt)
-import Crdt.Edit as E
-import Crdt.Path as Path
+import Crdt.OpDoc as OpDoc exposing (OpDoc)
+import Crdt.Schema as S
+import Crdt.Ref as Ref exposing (Ref)
 import Crdt.Id
 
 
@@ -24,67 +23,85 @@ type alias Board =
     }
 
 
--- Describe the document once, combinator-style (like elm/json decoders).
-schema : Crdt Board
-schema =
-    S.record Board
-        |> S.field "title" .title S.text
-        |> S.field "todos" .todos (S.list S.string)
-        |> S.build
+type alias BoardRefs =
+    { title : Ref Board S.Settable String
+    , todos : Ref Board (S.ListK S.Fixed S.Settable String) (List String)
+    }
 
 
--- Two independent replicas edit concurrently…
-alice : Doc
+-- Describe the document once, combinator-style (like elm/json decoders). The
+-- builder hands back a typed `Ref` per field alongside the schema.
+board : Ref.RecordRefs Board BoardRefs
+board =
+    Ref.record Board BoardRefs
+        |> Ref.field "title" .title S.text
+        |> Ref.field "todos" .todos (S.list S.text)
+        |> Ref.build
+
+
+-- Two independent replicas edit concurrently, through compile-checked refs…
+alice : OpDoc Board
 alice =
-    Crdt.init (Crdt.Id.replica "alice") schema
-        |> E.setText (Path.root |> Path.field "title") "Trip"
-        |> Result.withDefault (Crdt.init (Crdt.Id.replica "alice") schema)
+    OpDoc.init (Crdt.Id.replica "alice") board.schema
+        |> Ref.set board.refs.title "Trip"
+        |> Result.withDefault (OpDoc.init (Crdt.Id.replica "alice") board.schema)
 
 
--- …then exchange state and merge. merge is commutative, associative, idempotent,
--- so the order states arrive in does not matter.
-converged : Result Crdt.Error Board
+-- …then exchange ops and merge. merge is commutative, associative, idempotent,
+-- so the order they arrive in does not matter.
+converged : Result S.Error Board
 converged =
-    Crdt.read schema (Crdt.merge alice bob)
+    OpDoc.read (OpDoc.merge alice bob)
 ```
 
 ## Design in one paragraph
 
-All replicated state lives in one uniform recursive type (`Crdt.Node`) with a
-single monomorphic `merge`. A separate typed combinator layer (`Crdt.Schema`)
-ties that state to your own Elm records — schemas only *read*, while all edits
-go through path-addressed operations in `Crdt.Edit`, so convergence correctness
-never depends on the codec. Sequences and text are backed by an RGA; map keys
-carry last-write-wins presence cells so concurrent set-vs-remove is well-defined.
+All replicated state lives in one uniform recursive type (internal `Crdt.Node`)
+derived from an operation log, with a single monomorphic `merge`. A separate typed
+combinator layer (`Crdt.Schema`) ties that state to your own Elm records and hands
+back typed `Crdt.Ref`s — schemas describe *reads*, refs drive *writes*, so
+convergence correctness never depends on the codec and edits are compile-checked.
+Sequences and text are backed by an RGA; map keys carry last-write-wins presence
+cells so concurrent set-vs-remove is well-defined.
 
-## Two document flavors
+## The document, and type-safe writes
 
-The library ships **two interchangeable document types over the same schema and
-merge semantics**, so you can pick the trade-off you want:
+A document is a `Crdt.OpDoc` — an operation log with a materialized read model. It
+gives you **delta sync** (`encodeSince`), **collaborative time-travel** (`version` /
+`readAt` / `versionAt`), **restore** to a past version (`restoreTo`, which syncs
+rather than rewinds locally), **local undo/redo** (`undo` / `redo`, op-inverting so
+it converges), **garbage collection** (`gc`), and **named checkpoints**.
 
-- **`Crdt` (state-based)** — the document *is* the `Node` tree; `merge` is a
-  structural join. Simplest model; full-state sync.
-- **`Crdt.OpDoc` (op-log)** — the document is an operation log; state is a
-  materialized read model. Adds **delta sync** (`encodeSince`), **collaborative
-  time-travel** (`version` / `readAt`), and **named checkpoints**. This is what
-  the demo runs on.
+You describe the document once with `Crdt.Ref`'s `record` / `custom` builders (over
+the `Crdt.Schema` leaves — text, a `counter` PN-counter, a **movable list**
+`movableList`, lists, dicts) — and the builder hands back typed **`Crdt.Ref`s**
+alongside the schema. All edits go through refs, so they are **compile-checked**:
+`increment` on a non-counter, `move` on a non-movable list, or `set` with the wrong
+value type are *type errors*, not runtime failures, and a field name is written once
+(in the schema) so a typo can't happen. There is no stringly-typed path API.
 
-Both expose the same combinator schema (`Crdt.Schema`), path-addressed edits, a
-`counter` PN-counter, and JSON transport.
+```elm
+board =
+    Ref.record Board BoardRefs
+        |> Ref.field "title" .title S.text
+        |> Ref.field "votes" .votes S.counter
+        |> Ref.build
+
+doc |> Ref.set board.refs.title "Trip"      -- ✓
+doc |> Ref.increment board.refs.title 1     -- ✗ compile error: title isn't a counter
+```
 
 ## What's included
 
 | Module | Purpose |
 | --- | --- |
-| `Crdt` | State-based document: `init`, `read`, `merge`, `encode`/`decode` |
-| `Crdt.OpDoc` | Op-log document: edits + `merge`, delta sync (`encodeSince`), time-travel (`version`/`readAt`), checkpoints |
-| `Crdt.Schema` | The `Crdt a` combinators: `record`/`field`, `list`, `dict`, `text`, `counter`, primitives |
-| `Crdt.Edit` | Path-addressed edits for the state-based doc |
-| `Crdt.Path` | Build paths into a document |
+| `Crdt.OpDoc` | The document: `init`/`read`/`merge`, delta sync (`encodeSince`), time-travel (`version`/`readAt`/`versionAt`), `restoreTo`, local `undo`/`redo`, `gc`, checkpoints, JSON |
+| `Crdt.Schema` | Leaf & container combinators: `text`, `counter`, `int`/`bool`/…, `list`, `movableList`, `dict` — the pieces fields and elements are made of |
+| `Crdt.Ref` | Schema-with-refs builders (`record`/`field`/`build`, `custom`/`variant0..3`/`buildCustom`) **and** the type-safe writes they enable (`set`/`over`/`increment`/`switch`/`append`/`move`/…) |
 | `Crdt.Id` | Replica identifiers |
 | `Crdt.Text` | Collaborative-text helpers over the RGA |
+| `Crdt.Cursor` | Stable positions anchored to element identity (survive concurrent reorder/delete) |
 | `Crdt.Presence` | Ephemeral awareness (who's online, cursors) — a separate channel |
-| `Crdt.History` | Local checkpoints, checkout/restore, undo/redo (state-based) |
 
 ## Demo
 

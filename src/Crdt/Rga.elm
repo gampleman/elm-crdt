@@ -2,7 +2,7 @@ module Crdt.Rga exposing
     ( Rga, Element
     , empty, element, fromElements, elements, put
     , insertAfter, delete, merge
-    , toList, toElementsInOrder, idAtVisibleIndex, originForVisibleIndex, lastVisibleId
+    , toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId
     , visibleIds, liveCountThrough
     , get, updateElement
     , maxCounter
@@ -27,7 +27,7 @@ equality (`==`) is a sound convergence oracle.
 @docs Rga, Element
 @docs empty, element, fromElements, elements, put
 @docs insertAfter, delete, merge
-@docs toList, toElementsInOrder, idAtVisibleIndex, originForVisibleIndex, lastVisibleId
+@docs toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId
 @docs visibleIds, liveCountThrough
 @docs get, updateElement
 @docs maxCounter
@@ -329,18 +329,6 @@ idAtVisibleIndex i rga =
         |> List.drop i
         |> List.head
         |> Maybe.map .id
-
-
-{-| The origin to use when inserting _at_ a given visible index — i.e. the id of
-the visible element just before it (`Nothing` for index 0 / the head).
--}
-originForVisibleIndex : Int -> Rga c -> Maybe OpId
-originForVisibleIndex i rga =
-    if i <= 0 then
-        Nothing
-
-    else
-        idAtVisibleIndex (i - 1) rga
 
 
 {-| The id of the last visible element, for appends.

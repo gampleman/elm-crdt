@@ -1,7 +1,7 @@
 module Crdt.Edit exposing
-    ( Error(..), errorToString
-    , setText, setString, setInt, setFloat, setBool, increment
-    , listAppend, listInsert, listRemove
+    ( Error(..)
+    , setText, setBool
+    , listAppend
     , setKey, removeKey
     )
 
@@ -14,9 +14,9 @@ representation, so CRDT correctness never depends on the typed codec. They take
 _visible_ indices (tombstones already skipped) and return a `Result` so callers
 can surface bad paths.
 
-@docs Error, errorToString
-@docs setText, setString, setInt, setFloat, setBool, increment
-@docs listAppend, listInsert, listRemove
+@docs Error
+@docs setText, setBool
+@docs listAppend
 @docs setKey, removeKey
 
 -}
@@ -33,20 +33,8 @@ import Dict
 {-| Why an edit failed.
 -}
 type Error
-    = PathNotFound String
-    | WrongNodeType String
-
-
-{-| Render an edit error.
--}
-errorToString : Error -> String
-errorToString err =
-    case err of
-        PathNotFound s ->
-            "path not found: " ++ s
-
-        WrongNodeType s ->
-            "wrong node type: " ++ s
+    = PathNotFound
+    | WrongNodeType
 
 
 
@@ -68,56 +56,11 @@ setPrim path prim doc =
         doc
 
 
-{-| Set a string register (overwrite). For collaborative text use `setText`.
--}
-setString : Path -> String -> Doc -> Result Error Doc
-setString path value =
-    setPrim path (PString value)
-
-
-{-| Set an integer register.
--}
-setInt : Path -> Int -> Doc -> Result Error Doc
-setInt path value =
-    setPrim path (PInt value)
-
-
-{-| Set a float register.
--}
-setFloat : Path -> Float -> Doc -> Result Error Doc
-setFloat path value =
-    setPrim path (PFloat value)
-
-
 {-| Set a boolean register.
 -}
 setBool : Path -> Bool -> Doc -> Result Error Doc
 setBool path value =
     setPrim path (PBool value)
-
-
-{-| Add `delta` to a counter node (negative to decrement). Concurrent increments
-from different replicas sum, rather than clobbering each other.
--}
-increment : Path -> Int -> Doc -> Result Error Doc
-increment path delta doc =
-    transform path
-        (\node ctx ->
-            case node of
-                Node.Cnt contributions ->
-                    let
-                        ( stamp, ctx1 ) =
-                            Id.nextId ctx
-                    in
-                    Ok
-                        ( Node.counter (Dict.insert (Id.opIdToString stamp) (Node.increment stamp delta) contributions)
-                        , ctx1
-                        )
-
-                _ ->
-                    Err (WrongNodeType "expected counter node for increment")
-        )
-        doc
 
 
 {-| Edit a text node so it reads as the given string, applying the minimal RGA
@@ -136,7 +79,7 @@ setText path value doc =
                     Ok ( Node.txt rga1, ctx1 )
 
                 _ ->
-                    Err (WrongNodeType "expected text node for setText")
+                    Err WrongNodeType
         )
         doc
 
@@ -167,54 +110,7 @@ listAppend path seed doc =
                     Ok ( Node.seq rga1, ctx2 )
 
                 _ ->
-                    Err (WrongNodeType "expected list node for listAppend")
-        )
-        doc
-
-
-{-| Insert a fresh subtree at a visible index in a sequence.
--}
-listInsert : Path -> Int -> Seed -> Doc -> Result Error Doc
-listInsert path i seed doc =
-    transform path
-        (\node ctx ->
-            case node of
-                Node.Seq rga ->
-                    let
-                        ( childNode, ctx1 ) =
-                            I.runSeed seed ctx
-
-                        origin =
-                            Rga.originForVisibleIndex i rga
-
-                        ( rga1, ctx2 ) =
-                            Rga.insertAfter ctx1 origin childNode rga
-                    in
-                    Ok ( Node.seq rga1, ctx2 )
-
-                _ ->
-                    Err (WrongNodeType "expected list node for listInsert")
-        )
-        doc
-
-
-{-| Tombstone the element at a visible index in a sequence.
--}
-listRemove : Path -> Int -> Doc -> Result Error Doc
-listRemove path i doc =
-    transform path
-        (\node ctx ->
-            case node of
-                Node.Seq rga ->
-                    case Rga.idAtVisibleIndex i rga of
-                        Just id ->
-                            Ok ( Node.seq (Rga.delete id rga), ctx )
-
-                        Nothing ->
-                            Err (PathNotFound ("list index " ++ String.fromInt i))
-
-                _ ->
-                    Err (WrongNodeType "expected list node for listRemove")
+                    Err WrongNodeType
         )
         doc
 
@@ -241,7 +137,7 @@ setKey path k seed doc =
                     Ok ( Node.mapFromEntries (Dict.insert k (Node.entry stamp True childNode) entries), ctx2 )
 
                 _ ->
-                    Err (WrongNodeType "expected dict node for setKey")
+                    Err WrongNodeType
         )
         doc
 
@@ -271,7 +167,7 @@ removeKey path k doc =
                             Ok ( node, ctx )
 
                 _ ->
-                    Err (WrongNodeType "expected dict node for removeKey")
+                    Err WrongNodeType
         )
         doc
 
@@ -331,10 +227,10 @@ descendMap name rest f node ctx =
                             )
 
                 Nothing ->
-                    Err (PathNotFound ("key/field " ++ name))
+                    Err PathNotFound
 
         _ ->
-            Err (WrongNodeType ("expected map at " ++ name))
+            Err WrongNodeType
 
 
 descendSeq : Int -> List Seg -> (Node -> Ctx -> Result Error ( Node, Ctx )) -> Node -> Ctx -> Result Error ( Node, Ctx )
@@ -352,10 +248,10 @@ descendSeq i rest f node ctx =
                                     )
 
                         Nothing ->
-                            Err (PathNotFound ("index " ++ String.fromInt i))
+                            Err PathNotFound
 
                 Nothing ->
-                    Err (PathNotFound ("index " ++ String.fromInt i))
+                    Err PathNotFound
 
         _ ->
-            Err (WrongNodeType ("expected list at index " ++ String.fromInt i))
+            Err WrongNodeType

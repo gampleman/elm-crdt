@@ -1,527 +1,208 @@
 module Crdt.Schema exposing
-    ( Crdt, Error(..), Seed
+    ( Crdt, Error, Seed
+    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK
     , int, float, string, bool, text, counter, lww
     , list, movableList, dict
-    , record, field, build
     , with, decodeNode, emptyNode, errorToString
     )
 
-{-| The combinator layer: a `Crdt a` describes a CRDT's shape and ties it to a
+{-| The combinator layer: a `Crdt kind a` describes a CRDT's shape and ties it to a
 typed Elm value `a`, the way an `elm/json` decoder ties JSON to a value. Compose
-them to build records, lists, dicts and text out of the primitives.
+the **leaves** here (`int`/`text`/`counter`/…) and **containers** (`list`/
+`movableList`/`dict`) to build up field and element schemas.
 
-A `Crdt a` carries three capabilities, all keyed off the uniform `Node`:
+**Records and sum types are built in `Crdt.Ref`** (`Ref.record` / `Ref.custom`),
+because their builders hand back typed `Ref`s alongside the schema — and refs are
+the only way to edit a document, so there is never a reason to build an aggregate
+schema without them. This module is the leaf/container vocabulary those builders
+consume; it deliberately does not expose a record/variant builder of its own.
 
-  - **decode** a `Node` into a typed `a` (the read path the demo renders from);
-  - construct an **empty** `Node` for a fresh document;
-  - **seed** a `Node` from a concrete value (used by `with`, so edits like
-    "append this todo" can mint a whole subtree).
-
-There is deliberately no `encode : a -> Node` that reconciles with existing
-state — that is the hard diff problem. All in-place mutation goes through
-`Crdt.Edit`, which is decoupled from this layer.
+A `Crdt kind a` carries three capabilities, all keyed off the uniform internal
+`Node`: decode a node into `a`, construct an empty node, and seed a node from a
+value. The `kind` phantom (`Settable`/`Counter`/`Nested`/`Variants`/`ListK`/`DictK`)
+records how the value may be edited, so `Crdt.Ref` can reject nonsensical edits at
+compile time; it never affects reads or merge.
 
 @docs Crdt, Error, Seed
+@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK
 @docs int, float, string, bool, text, counter, lww
 @docs list, movableList, dict
-@docs record, field, build
 @docs with, decodeNode, emptyNode, errorToString
 
 -}
 
-import Crdt.Id as Id exposing (Ctx)
-import Crdt.Internal as I
-import Crdt.MoveList as MoveList
-import Crdt.Node as Node exposing (Node, Prim(..))
-import Crdt.Rga as Rga
-import Crdt.Text as Text
+import Crdt.Id exposing (Ctx)
+import Crdt.Node exposing (Node)
+import Crdt.Schema.Internal as I
 import Dict exposing (Dict)
 
 
-{-| An opaque builder of a fresh subtree from a value, produced by `with` and
-consumed by the edit APIs. Re-exported from `Crdt.Internal` so the edit APIs can
-name it without leaking the internal `Node` type.
+{-| A schema tying a typed value `a` to CRDT state, tagged with a phantom `kind`
+describing how it may be edited (used by `Crdt.Ref`). Opaque.
+-}
+type alias Crdt kind a =
+    I.Crdt kind a
+
+
+{-| What can go wrong reading a value through a schema. Opaque; render with
+`errorToString`.
+-}
+type alias Error =
+    I.Error
+
+
+{-| An opaque builder of a fresh subtree from a value, produced by `with`.
 -}
 type alias Seed =
     I.Seed
 
 
-{-| A schema tying a typed value `a` to CRDT `Node` state.
+{-| Kind marker: an LWW register leaf; supports `set`.
 -}
-type Crdt a
-    = Crdt
-        { decode : Node -> Result Error a
-        , empty : Ctx -> ( Node, Ctx )
-        , seed : a -> Ctx -> ( Node, Ctx )
-        }
+type alias Settable =
+    I.Settable
 
 
-{-| What can go wrong reading a `Node` through a schema.
+{-| Kind marker: a PN-counter; supports `increment`.
 -}
-type Error
-    = TypeMismatch String
-    | MissingField String
-    | BadValue String
+type alias Counter =
+    I.Counter
 
 
-{-| Render an error for display.
+{-| Kind marker: a record or map; edited by descending into fields/keys.
 -}
-errorToString : Error -> String
-errorToString err =
-    case err of
-        TypeMismatch s ->
-            "type mismatch: " ++ s
-
-        MissingField s ->
-            "missing field: " ++ s
-
-        BadValue s ->
-            "bad value: " ++ s
+type alias Nested =
+    I.Nested
 
 
-
--- DRIVERS (used by Crdt.elm / Crdt.Edit) -------------------------------------
-
-
-{-| Decode a node through a schema.
+{-| Kind marker: a sum type over `a`; supports variant switching + payload refs.
 -}
-decodeNode : Crdt a -> Node -> Result Error a
-decodeNode (Crdt c) =
-    c.decode
+type alias Variants a =
+    I.Variants a
 
 
-{-| The empty node for a schema.
+{-| Kind marker: a list of `a` with element kind `ek` and movability `mv`.
 -}
-emptyNode : Crdt a -> Ctx -> ( Node, Ctx )
-emptyNode (Crdt c) =
-    c.empty
+type alias ListK mv ek a =
+    I.ListK mv ek a
 
 
-{-| Seed a node from a value, producing an opaque `Seed` that `Crdt.Edit` /
-`Crdt.OpDoc` pass to `listAppend` / `setKey`.
-
-    todoSchema |> S.with (Todo "pack" False)
-
+{-| Movability marker for a plain `list` (no reordering).
 -}
-with : a -> Crdt a -> Seed
-with value (Crdt c) =
-    I.Seed (c.seed value)
+type alias Fixed =
+    I.Fixed
 
 
+{-| Movability marker for a `movableList` (supports `move`).
+-}
+type alias Movable =
+    I.Movable
 
--- PRIMITIVES -----------------------------------------------------------------
 
-
-primReg : (Prim -> Result Error a) -> (a -> Prim) -> Prim -> Crdt a
-primReg fromPrim toPrim emptyPrim =
-    Crdt
-        { decode =
-            \node ->
-                case Node.asPrim node of
-                    Just p ->
-                        fromPrim p
-
-                    Nothing ->
-                        Err (TypeMismatch "expected a register")
-        , empty =
-            \ctx ->
-                let
-                    ( id, ctx1 ) =
-                        Id.nextId ctx
-                in
-                ( Node.reg emptyPrim id, ctx1 )
-        , seed =
-            \value ctx ->
-                let
-                    ( id, ctx1 ) =
-                        Id.nextId ctx
-                in
-                ( Node.reg (toPrim value) id, ctx1 )
-        }
+{-| Kind marker: a `dict` of `a` with value kind `vk`.
+-}
+type alias DictK vk a =
+    I.DictK vk a
 
 
 {-| An integer LWW register.
 -}
-int : Crdt Int
+int : Crdt Settable Int
 int =
-    primReg
-        (\p ->
-            case p of
-                PInt n ->
-                    Ok n
-
-                _ ->
-                    Err (BadValue "expected int")
-        )
-        PInt
-        (PInt 0)
+    I.int
 
 
 {-| A float LWW register.
 -}
-float : Crdt Float
+float : Crdt Settable Float
 float =
-    primReg
-        (\p ->
-            case p of
-                PFloat n ->
-                    Ok n
-
-                _ ->
-                    Err (BadValue "expected float")
-        )
-        PFloat
-        (PFloat 0)
+    I.float
 
 
-{-| A string LWW register. For collaborative editing use `text` instead.
+{-| A string LWW register. For collaborative editing use `text`.
 -}
-string : Crdt String
+string : Crdt Settable String
 string =
-    primReg
-        (\p ->
-            case p of
-                PString s ->
-                    Ok s
-
-                _ ->
-                    Err (BadValue "expected string")
-        )
-        PString
-        (PString "")
+    I.string
 
 
 {-| A boolean LWW register.
 -}
-bool : Crdt Bool
+bool : Crdt Settable Bool
 bool =
-    primReg
-        (\p ->
-            case p of
-                PBool b ->
-                    Ok b
-
-                _ ->
-                    Err (BadValue "expected bool")
-        )
-        PBool
-        (PBool False)
+    I.bool
 
 
-{-| An explicit LWW marker. Primitives are already last-write-wins, so this is
-the identity — provided for readable schemas.
+{-| Collaborative text, read as a `String`, backed by an RGA so concurrent edits
+merge character-wise.
 -}
-lww : Crdt a -> Crdt a
-lww =
-    identity
-
-
-
--- COUNTER --------------------------------------------------------------------
-
-
-{-| A PN-counter, read as its integer total. Unlike an `int` register (which is
-last-write-wins, so concurrent `+1`/`+1` collapses to 1), concurrent increments
-from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.Edit.increment`
-/ `Crdt.OpDoc.increment` to change it.
--}
-counter : Crdt Int
-counter =
-    Crdt
-        { decode =
-            \node ->
-                case Node.asCounter node of
-                    Just n ->
-                        Ok n
-
-                    Nothing ->
-                        Err (TypeMismatch "expected counter")
-        , empty = \ctx -> ( Node.counter Dict.empty, ctx )
-        , seed =
-            \value ctx ->
-                if value == 0 then
-                    ( Node.counter Dict.empty, ctx )
-
-                else
-                    let
-                        ( stamp, ctx1 ) =
-                            Id.nextId ctx
-                    in
-                    ( Node.counter (Dict.singleton (Id.opIdToString stamp) (Node.increment stamp value)), ctx1 )
-        }
-
-
-
--- TEXT -----------------------------------------------------------------------
-
-
-{-| Collaborative text, read as a `String`. Backed by an RGA of characters so
-concurrent edits merge character-wise.
--}
-text : Crdt String
+text : Crdt Settable String
 text =
-    Crdt
-        { decode =
-            \node ->
-                case Node.asTxt node of
-                    Just rga ->
-                        Ok (Text.toString rga)
-
-                    Nothing ->
-                        Err (TypeMismatch "expected text")
-        , empty = \ctx -> ( Node.txt Rga.empty, ctx )
-        , seed =
-            \value ctx ->
-                let
-                    ( rga, ctx1 ) =
-                        Text.fromString ctx value
-                in
-                ( Node.txt rga, ctx1 )
-        }
+    I.text
 
 
-
--- LIST -----------------------------------------------------------------------
-
-
-{-| An ordered list of `a`, backed by an RGA. Concurrent inserts from different
-replicas all survive and converge to a deterministic order.
+{-| A PN-counter, read as its integer total; concurrent increments sum.
 -}
-list : Crdt a -> Crdt (List a)
-list (Crdt elem) =
-    Crdt
-        { decode =
-            \node ->
-                case Node.asSeq node of
-                    Just rga ->
-                        Rga.toList rga
-                            |> List.map elem.decode
-                            |> combine
-
-                    Nothing ->
-                        Err (TypeMismatch "expected list")
-        , empty = \ctx -> ( Node.seq Rga.empty, ctx )
-        , seed =
-            \values ctx ->
-                let
-                    ( rga, ctx1 ) =
-                        List.foldl
-                            (\value ( acc, c, origin ) ->
-                                let
-                                    ( childNode, c1 ) =
-                                        elem.seed value c
-
-                                    ( acc1, c2 ) =
-                                        Rga.insertAfter c1 origin childNode acc
-
-                                    newId =
-                                        Rga.lastVisibleId acc1
-                                in
-                                ( acc1, c2, newId )
-                            )
-                            ( Rga.empty, ctx, Nothing )
-                            values
-                            |> (\( acc, c, _ ) -> ( acc, c ))
-                in
-                ( Node.seq rga, ctx1 )
-        }
+counter : Crdt Counter Int
+counter =
+    I.counter
 
 
-{-| A **reorderable** list of `a` — like `list`, but items can be moved with
-`Crdt.OpDoc.listMove` and keep their identity (nested edits and cursors follow a
-moved item). Backed by `Crdt.MoveList`. Reads as a plain `List a` in order.
+{-| An explicit LWW marker (the identity — provided for readable schemas).
 -}
-movableList : Crdt a -> Crdt (List a)
-movableList (Crdt elem) =
-    Crdt
-        { decode =
-            \node ->
-                case Node.asMov node of
-                    Just ml ->
-                        MoveList.toList ml
-                            |> List.map elem.decode
-                            |> combine
-
-                    Nothing ->
-                        Err (TypeMismatch "expected movable list")
-        , empty = \ctx -> ( Node.mov MoveList.empty, ctx )
-        , seed =
-            \values ctx ->
-                let
-                    ( ml, ctx1, _ ) =
-                        List.foldl
-                            (\value ( acc, c, afterCell ) ->
-                                let
-                                    ( childNode, c1 ) =
-                                        elem.seed value c
-
-                                    ( vid, c2 ) =
-                                        Id.nextId c1
-                                in
-                                ( MoveList.insert vid afterCell childNode acc, c2, Just vid )
-                            )
-                            ( MoveList.empty, ctx, Nothing )
-                            values
-                in
-                ( Node.mov ml, ctx1 )
-        }
+lww : Crdt kind a -> Crdt kind a
+lww =
+    I.lww
 
 
-
--- DICT -----------------------------------------------------------------------
-
-
-{-| A dictionary of string keys to `a`. Key presence is LWW, so concurrent
-set/remove resolves by stamp. Reads back as a standard `Dict`, omitting removed
-(tombstoned) keys.
+{-| An ordered list of `a`, backed by an RGA.
 -}
-dict : Crdt a -> Crdt (Dict String a)
-dict (Crdt val) =
-    Crdt
-        { decode =
-            \node ->
-                Node.presentEntries node
-                    |> List.map (\( k, v ) -> val.decode v |> Result.map (Tuple.pair k))
-                    |> combine
-                    |> Result.map Dict.fromList
-        , empty = \ctx -> ( Node.mapFromEntries Dict.empty, ctx )
-        , seed =
-            \values ctx ->
-                let
-                    ( entries, ctx1 ) =
-                        Dict.foldl
-                            (\k v ( acc, c ) ->
-                                let
-                                    ( childNode, c1 ) =
-                                        val.seed v c
-
-                                    ( stamp, c2 ) =
-                                        Id.nextId c1
-                                in
-                                ( Dict.insert k (Node.entry stamp True childNode) acc, c2 )
-                            )
-                            ( Dict.empty, ctx )
-                            values
-                in
-                ( Node.mapFromEntries entries, ctx1 )
-        }
+list : Crdt ek a -> Crdt (ListK Fixed ek a) (List a)
+list =
+    I.list
 
 
-
--- RECORD BUILDER -------------------------------------------------------------
-
-
-{-| In-progress record schema. Accumulates field decoders and seeders along with
-the constructor function being applied.
+{-| A reorderable list of `a` (elements can be moved with `Crdt.Ref.move`, keeping
+identity), backed by `Crdt.MoveList`.
 -}
-type RecordBuilder full a
-    = RecordBuilder
-        { decode : Node -> Result Error a
-        , empty : Ctx -> List ( String, Node ) -> ( List ( String, Node ), Ctx )
-        , seed : full -> Ctx -> List ( String, Node ) -> ( List ( String, Node ), Ctx )
-        }
+movableList : Crdt ek a -> Crdt (ListK Movable ek a) (List a)
+movableList =
+    I.movableList
 
 
-{-| Begin a record schema from its constructor.
+{-| A dictionary of string keys to `a`. Key presence is LWW.
+-}
+dict : Crdt vk a -> Crdt (DictK vk a) (Dict String a)
+dict =
+    I.dict
 
-    record Todo
-        |> field "text" .text text
-        |> field "done" .done bool
-        |> build
+
+{-| Seed a node from a value, producing an opaque `Seed` the edit APIs consume.
+
+    todoSchema |> Crdt.Schema.with (Todo "pack" False)
 
 -}
-record : (a -> b) -> RecordBuilder full (a -> b)
-record ctor =
-    RecordBuilder
-        { decode = \_ -> Ok ctor
-        , empty = \ctx acc -> ( acc, ctx )
-        , seed = \_ ctx acc -> ( acc, ctx )
-        }
+with : a -> Crdt kind a -> Seed
+with =
+    I.with
 
 
-{-| Add a field: its key, a getter from the full record (for seeding), and the
-field's own schema.
+{-| Decode a node through a schema (used internally by `Crdt.OpDoc.read`).
 -}
-field : String -> (full -> a) -> Crdt a -> RecordBuilder full (a -> b) -> RecordBuilder full b
-field name getter (Crdt fieldSchema) (RecordBuilder rb) =
-    RecordBuilder
-        { decode =
-            \node ->
-                case Node.asMap node of
-                    Just entries ->
-                        let
-                            fieldResult =
-                                case Dict.get name entries of
-                                    Just e ->
-                                        fieldSchema.decode e.value
-
-                                    Nothing ->
-                                        Err (MissingField name)
-                        in
-                        Result.map2 (\f a -> f a) (rb.decode node) fieldResult
-
-                    Nothing ->
-                        Err (TypeMismatch ("expected record for field " ++ name))
-        , empty =
-            \ctx acc ->
-                let
-                    ( accValues, ctx1 ) =
-                        rb.empty ctx acc
-
-                    ( fieldNode, ctx2 ) =
-                        fieldSchema.empty ctx1
-                in
-                ( ( name, fieldNode ) :: accValues, ctx2 )
-        , seed =
-            \full ctx acc ->
-                let
-                    ( accValues, ctx1 ) =
-                        rb.seed full ctx acc
-
-                    ( fieldNode, ctx2 ) =
-                        fieldSchema.seed (getter full) ctx1
-                in
-                ( ( name, fieldNode ) :: accValues, ctx2 )
-        }
+decodeNode : Crdt kind a -> Node -> Result Error a
+decodeNode =
+    I.decodeNode
 
 
-{-| Finish a record schema.
+{-| The empty node for a schema (used internally by `Crdt.OpDoc.init`).
 -}
-build : RecordBuilder a a -> Crdt a
-build (RecordBuilder rb) =
-    Crdt
-        { decode = rb.decode
-        , empty = \ctx -> rb.empty ctx [] |> stampEntries
-        , seed = \value ctx -> rb.seed value ctx [] |> stampEntries
-        }
+emptyNode : Crdt kind a -> Ctx -> ( Node, Ctx )
+emptyNode =
+    I.emptyNode
 
 
-{-| Turn a list of `(key, valueNode)` pairs into a present `Map`, minting a
-distinct presence stamp for each entry so the document never holds duplicate
-OpIds.
+{-| Render a read error for display.
 -}
-stampEntries : ( List ( String, Node ), Ctx ) -> ( Node, Ctx )
-stampEntries ( pairs, ctx ) =
-    let
-        ( entries, ctx1 ) =
-            List.foldl
-                (\( k, node ) ( acc, c ) ->
-                    let
-                        ( stamp, c1 ) =
-                            Id.nextId c
-                    in
-                    ( Dict.insert k (Node.entry stamp True node) acc, c1 )
-                )
-                ( Dict.empty, ctx )
-                pairs
-    in
-    ( Node.mapFromEntries entries, ctx1 )
-
-
-
--- HELPERS --------------------------------------------------------------------
-
-
-combine : List (Result e a) -> Result e (List a)
-combine =
-    List.foldr (Result.map2 (::)) (Ok [])
+errorToString : Error -> String
+errorToString =
+    I.errorToString

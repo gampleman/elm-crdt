@@ -16,8 +16,8 @@ import Browser
 import Crdt.Cursor as Cursor exposing (Cursor)
 import Crdt.Id exposing (ReplicaId)
 import Crdt.OpDoc as OpDoc exposing (Checkpoint, OpDoc, Version)
-import Crdt.Path as Path exposing (Path)
 import Crdt.Presence as Presence exposing (Presence)
+import Crdt.Ref as Ref exposing (Ref)
 import Crdt.Schema as S exposing (Crdt)
 import Dict exposing (Dict)
 import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
@@ -37,9 +37,20 @@ entirely described by `schema` below.
 -}
 type alias Board =
     { title : String
+    , status : Status
     , todos : List Todo
     , notes : Dict String String
     }
+
+
+{-| A board-level lifecycle status — a **sum type**, showcasing `S.custom`. The
+`Archived` variant carries a reason (collaborative text), so concurrent edits to
+the reason merge character-wise while the active variant itself is LWW.
+-}
+type Status
+    = Planning
+    | Active
+    | Archived String
 
 
 type alias Todo =
@@ -48,24 +59,92 @@ type alias Todo =
     }
 
 
-{-| The schema is the single source of truth tying typed Elm values to the
-underlying CRDT state. Built combinator-style, like an `elm/json` decoder.
+{-| The schema and its **typed refs**, built together with the ref-emitting
+builders. `boardDoc.schema` is the `Crdt` for `OpDoc.init`; `boardDoc.refs` holds a
+compile-checked `Ref` per field — every edit in `update` goes through these instead
+of a stringly-typed `Path`.
 -}
-schema : Crdt Board
+type alias BoardRefs =
+    { title : Ref Board S.Settable String
+    , status : Ref Board (S.Variants Status) Status
+    , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
+    , notes : Ref Board (S.DictK S.Settable String) (Dict String String)
+    }
+
+
+boardDoc : Ref.RecordRefs Board BoardRefs
+boardDoc =
+    Ref.record Board BoardRefs
+        |> Ref.field "title" .title S.text
+        |> Ref.field "status" .status statusDoc.schema
+        |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
+        |> Ref.field "notes" .notes (S.dict S.text)
+        |> Ref.build
+
+
+schema : Crdt S.Nested Board
 schema =
-    S.record Board
-        |> S.field "title" .title S.text
-        |> S.field "todos" .todos (S.movableList todoSchema)
-        |> S.field "notes" .notes (S.dict S.text)
-        |> S.build
+    boardDoc.schema
 
 
-todoSchema : Crdt Todo
-todoSchema =
-    S.record Todo
-        |> S.field "text" .text S.text
-        |> S.field "done" .done S.bool
-        |> S.build
+refs : BoardRefs
+refs =
+    boardDoc.refs
+
+
+type alias StatusRefs =
+    { archived : Ref Status S.Settable String }
+
+
+statusDoc : Ref.CustomRefs Status StatusRefs
+statusDoc =
+    Ref.custom
+        (\planning active archived value ->
+            case value of
+                Planning ->
+                    planning
+
+                Active ->
+                    active
+
+                Archived reason ->
+                    archived reason
+        )
+        StatusRefs
+        |> Ref.variant0 "planning" Planning
+        |> Ref.variant0 "active" Active
+        |> Ref.variant1 "archived" Archived S.text
+        |> Ref.buildCustom
+
+
+{-| The reason text inside the `Archived` variant. Editing it applies only while the
+board is actually `Archived` (silent no-op otherwise).
+-}
+archivedReasonRef : Ref Board S.Settable String
+archivedReasonRef =
+    refs.status |> Ref.at statusDoc.refs.archived
+
+
+type alias TodoRefs =
+    { text : Ref Todo S.Settable String
+    , done : Ref Todo S.Settable Bool
+    }
+
+
+todoDoc : Ref.RecordRefs Todo TodoRefs
+todoDoc =
+    Ref.record Todo TodoRefs
+        |> Ref.field "text" .text S.text
+        |> Ref.field "done" .done S.bool
+        |> Ref.build
+
+
+{-| A text ref into todo `i`'s `text` field — `todos[i].text`, composed from the
+list ref, an element ref, and the field ref. Drives that todo's text input + caret.
+-}
+todoTextRef : Int -> Ref Board S.Settable String
+todoTextRef i =
+    refs.todos |> Ref.index i todoDoc.schema |> Ref.at todoDoc.refs.text
 
 
 {-| Per-peer ephemeral state. Never merged into the document — it lives on the
@@ -90,37 +169,21 @@ peerCodec =
 
 
 
--- PATHS (typed accessors into the document) ----------------------------------
+-- REFS (typed accessors into the document) -----------------------------------
+-- Composed from the schema-emitted `refs`; every edit goes through these, so a
+-- wrong field name or wrong-kind op is a compile error, not a runtime one.
 
 
-titlePath : Path
-titlePath =
-    Path.root |> Path.field "title"
+todoDoneRef : Int -> Ref Board S.Settable Bool
+todoDoneRef i =
+    refs.todos |> Ref.index i todoDoc.schema |> Ref.at todoDoc.refs.done
 
 
-todosPath : Path
-todosPath =
-    Path.root |> Path.field "todos"
-
-
-todoTextPath : Int -> Path
-todoTextPath i =
-    Path.root |> Path.field "todos" |> Path.index i |> Path.field "text"
-
-
-todoDonePath : Int -> Path
-todoDonePath i =
-    Path.root |> Path.field "todos" |> Path.index i |> Path.field "done"
-
-
-notePath : String -> Path
-notePath k =
-    Path.root |> Path.field "notes" |> Path.key k
-
-
-notesPath : Path
-notesPath =
-    Path.root |> Path.field "notes"
+{-| A text ref into note `k`'s value.
+-}
+noteRef : String -> Ref Board S.Settable String
+noteRef k =
+    refs.notes |> Ref.key k S.text
 
 
 
@@ -227,15 +290,18 @@ init flags =
 
 
 type Msg
-    = -- any collaborative text field: carries its path + the new value + the real
-      -- DOM caret offset, so the broadcast caret is exact for that field
-      TextEdited Path String Int
-    | CaretMoved Path Int
+    = -- any collaborative text field: carries a typed text `Ref` + the new value +
+      -- the real DOM caret offset, so the broadcast caret is exact for that field
+      TextEdited (Ref Board S.Settable String) String Int
+    | CaretMoved (Ref Board S.Settable String) Int
       -- todos
     | NewTodoChanged String
     | AddTodo
     | ToggleTodo Int
     | RemoveTodo Int
+      -- board status (sum type)
+    | SetStatus Status
+    | ArchivedReasonEdited String Int
       -- drag-and-drop reorder
     | DragStart Int
     | DragOver Int
@@ -264,13 +330,13 @@ type Msg
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        TextEdited path s caretOffset ->
-            editText path s caretOffset model
+        TextEdited textRef s caretOffset ->
+            editText textRef s caretOffset model
 
-        CaretMoved path caretOffset ->
+        CaretMoved textRef caretOffset ->
             -- caret moved without editing (arrow keys / click): re-publish our
             -- caret at the new offset within that field
-            publishCaret path caretOffset model
+            publishCaret textRef caretOffset model
 
         NewTodoChanged s ->
             ( { model | newTodo = s }, Cmd.none )
@@ -284,11 +350,9 @@ update msg model =
                     before =
                         OpDoc.version model.doc
 
-                    -- append a fresh todo subtree at the end of the list
+                    -- append a fresh todo at the end of the list
                     doc1 =
-                        model.doc
-                            |> OpDoc.listAppend todosPath
-                                (todoSchema |> S.with (Todo model.newTodo False))
+                        Ref.append todoDoc.schema (Todo model.newTodo False) refs.todos model.doc
                             |> orKeep model.doc
                 in
                 recordPush before { model | doc = doc1, newTodo = "" }
@@ -306,9 +370,7 @@ update msg model =
                         |> Maybe.withDefault False
 
                 doc1 =
-                    model.doc
-                        |> OpDoc.setBool (todoDonePath i) (not current)
-                        |> orKeep model.doc
+                    Ref.set (todoDoneRef i) (not current) model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
 
@@ -318,9 +380,29 @@ update msg model =
                     OpDoc.version model.doc
 
                 doc1 =
-                    model.doc |> OpDoc.listRemove todosPath i |> orKeep model.doc
+                    Ref.remove i refs.todos model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
+
+        SetStatus newStatus ->
+            -- switch the board's status variant through the typed Ref API
+            let
+                before =
+                    OpDoc.version model.doc
+
+                doc1 =
+                    Ref.switch refs.status newStatus model.doc |> orKeep model.doc
+            in
+            recordPush before { model | doc = doc1 }
+
+        ArchivedReasonEdited s _ ->
+            -- edit the Archived reason text; applies only while status is Archived.
+            -- (Character-wise merge is preserved because it's a text leaf.)
+            let
+                doc1 =
+                    Ref.set archivedReasonRef s model.doc |> orKeep model.doc
+            in
+            pushDoc { model | doc = doc1 }
 
         DragStart i ->
             -- capture the version now so the whole drag undoes as one step
@@ -337,8 +419,7 @@ update msg model =
                         -- the move converges through the same op path as any edit
                         let
                             doc1 =
-                                model.doc
-                                    |> OpDoc.listMove todosPath from target
+                                Ref.move from target refs.todos model.doc
                                     |> orKeep model.doc
                         in
                         pushDoc { model | doc = doc1, dragging = Just target }
@@ -374,8 +455,7 @@ update msg model =
                         OpDoc.version model.doc
 
                     doc1 =
-                        model.doc
-                            |> OpDoc.setKey notesPath model.newNoteKey (S.text |> S.with "")
+                        Ref.setKey S.text model.newNoteKey "" refs.notes model.doc
                             |> orKeep model.doc
                 in
                 recordPush before { model | doc = doc1, newNoteKey = "" }
@@ -386,7 +466,7 @@ update msg model =
                     OpDoc.version model.doc
 
                 doc1 =
-                    model.doc |> OpDoc.removeKey notesPath k |> orKeep model.doc
+                    Ref.removeKey k refs.notes model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
 
@@ -526,21 +606,20 @@ update msg model =
 
 
 {-| Edit any collaborative text field + publish the caret in one step: apply the
-text change (the Text CRDT diffs old→new into minimal insert/delete ops so
+text change (`Ref.set` on a text ref diffs old→new into minimal insert/delete ops so
 concurrent typing merges character-wise), then publish a **stable caret** at the
-real DOM offset within `path`. Because the caret is a `Crdt.Cursor`, it tracks the
+real DOM offset within that ref. Because the caret is a `Crdt.Cursor`, it tracks the
 right character on every viewer even as they make their own concurrent edits.
 -}
-editText : Path -> String -> Int -> Model -> ( Model, Cmd Msg )
-editText path newValue caretOffset model =
+editText : Ref Board S.Settable String -> String -> Int -> Model -> ( Model, Cmd Msg )
+editText textRef newValue caretOffset model =
     let
         doc1 =
-            model.doc
-                |> OpDoc.setText path newValue
+            Ref.set textRef newValue model.doc
                 |> orKeep model.doc
 
         caret =
-            OpDoc.cursorAt path caretOffset doc1 |> Result.toMaybe
+            Ref.cursorAt textRef caretOffset doc1 |> Result.toMaybe
 
         presence1 =
             Presence.updateLocal (\c -> { c | caret = caret }) model.presence
@@ -556,13 +635,13 @@ editText path newValue caretOffset model =
     ( model1, Cmd.batch [ docCmd, broadcastPresence presence1 ] )
 
 
-{-| Re-publish our caret at a new offset within `path` (caret moved, no edit).
+{-| Re-publish our caret at a new offset within a text ref (caret moved, no edit).
 -}
-publishCaret : Path -> Int -> Model -> ( Model, Cmd Msg )
-publishCaret path caretOffset model =
+publishCaret : Ref Board S.Settable String -> Int -> Model -> ( Model, Cmd Msg )
+publishCaret textRef caretOffset model =
     let
         caret =
-            OpDoc.cursorAt path caretOffset model.doc |> Result.toMaybe
+            Ref.cursorAt textRef caretOffset model.doc |> Result.toMaybe
 
         presence1 =
             Presence.updateLocal (\c -> { c | caret = caret }) model.presence
@@ -716,19 +795,19 @@ onEnter msg =
         )
 
 
-{-| The collaborative-text attributes for an input editing `path`: report edits
-(value + real caret offset) and caret moves (keyup/mouseup) so we broadcast an
+{-| The collaborative-text attributes for an input editing a text `Ref`: report
+edits (value + real caret offset) and caret moves (keyup/mouseup) so we broadcast an
 exact caret, plus the focus/blur presence handlers.
 -}
-textFieldAttrs : Path -> List (Html.Attribute Msg)
-textFieldAttrs path =
+textFieldAttrs : Ref Board S.Settable String -> List (Html.Attribute Msg)
+textFieldAttrs textRef =
     [ on "input"
-        (JD.map2 (TextEdited path)
+        (JD.map2 (TextEdited textRef)
             (JD.at [ "target", "value" ] JD.string)
             (JD.at [ "target", "selectionStart" ] JD.int)
         )
-    , on "keyup" (JD.map (CaretMoved path) (JD.at [ "target", "selectionStart" ] JD.int))
-    , on "mouseup" (JD.map (CaretMoved path) (JD.at [ "target", "selectionStart" ] JD.int))
+    , on "keyup" (JD.map (CaretMoved textRef) (JD.at [ "target", "selectionStart" ] JD.int))
+    , on "mouseup" (JD.map (CaretMoved textRef) (JD.at [ "target", "selectionStart" ] JD.int))
     ]
 
 
@@ -743,11 +822,11 @@ Horizontal placement uses `ch` units; with the monospace input font 1ch is one
 glyph, so the bar lands exactly on the character.
 
 -}
-viewFieldCarets : Path -> Model -> List (Html Msg)
-viewFieldCarets path model =
+viewFieldCarets : Ref Board S.Settable String -> Model -> List (Html Msg)
+viewFieldCarets textRef model =
     let
         pathTarget =
-            OpDoc.cursorAt path 0 model.doc
+            Ref.cursorAt textRef 0 model.doc
                 |> Result.toMaybe
                 |> Maybe.map Cursor.steps
     in
@@ -886,21 +965,21 @@ viewHeader model =
 
 {-| A collaborative text input: the field's value, the edit/caret event handlers,
 the presence highlight + focus reporting, and any remote peers' carets overlaid
-on top — all keyed to this field's `path` and `fieldId`.
+on top — all keyed to this field's text `Ref` and `fieldId`.
 -}
-viewTextInput : Bool -> Model -> Path -> String -> String -> String -> Html Msg
-viewTextInput readOnly model path fieldId currentValue placeholderText =
+viewTextInput : Bool -> Model -> Ref Board S.Settable String -> String -> String -> String -> Html Msg
+viewTextInput readOnly model textRef fieldId currentValue placeholderText =
     div [ class "field-wrap", A.style "position" "relative" ]
         (input
             ([ value currentValue
              , placeholder placeholderText
              , A.disabled readOnly
              ]
-                ++ textFieldAttrs path
+                ++ textFieldAttrs textRef
                 ++ fieldAttrs model fieldId
             )
             []
-            :: viewFieldCarets path model
+            :: viewFieldCarets textRef model
         )
 
 
@@ -908,7 +987,9 @@ viewBoard : Bool -> Model -> Board -> Html Msg
 viewBoard readOnly model board =
     div []
         [ h2 [] [ text "Title" ]
-        , viewTextInput readOnly model titlePath titleField board.title "Untitled board"
+        , viewTextInput readOnly model refs.title titleField board.title "Untitled board"
+        , h2 [] [ text "Status" ]
+        , viewStatus readOnly model board.status
         , h2 [] [ text "Todos" ]
         , ul [ class "todos" ] (List.indexedMap (viewTodo readOnly model) board.todos)
         , if readOnly then
@@ -928,6 +1009,82 @@ viewBoard readOnly model board =
         , h2 [] [ text "Notes" ]
         , viewNotes readOnly model board.notes
         ]
+
+
+{-| The board status: a sum type rendered as three mutually-exclusive buttons
+(switching the active variant), plus a reason input shown only for `Archived`.
+Demonstrates `S.custom` + the typed `Crdt.Ref` write API end to end.
+-}
+viewStatus : Bool -> Model -> Status -> Html Msg
+viewStatus readOnly model status =
+    let
+        pill : String -> Status -> Html Msg
+        pill label variant =
+            button
+                [ class
+                    (if sameVariant status variant then
+                        "status-pill active"
+
+                     else
+                        "status-pill"
+                    )
+                , A.disabled readOnly
+                , onClick (SetStatus variant)
+                ]
+                [ text label ]
+    in
+    div []
+        [ div [ class "status-pills" ]
+            [ pill "Planning" Planning
+            , pill "Active" Active
+            , pill "Archived" (Archived "")
+            ]
+        , case status of
+            Archived reason ->
+                div [ class "field-wrap", A.style "position" "relative", A.style "margin-top" "0.5rem" ]
+                    (input
+                        ([ value reason
+                         , placeholder "why archived?"
+                         , A.disabled readOnly
+                         , on "input"
+                            (JD.map2 ArchivedReasonEdited
+                                (JD.at [ "target", "value" ] JD.string)
+                                (JD.at [ "target", "selectionStart" ] JD.int)
+                            )
+                         ]
+                            ++ fieldAttrs model archivedField
+                        )
+                        []
+                        :: []
+                    )
+
+            _ ->
+                text ""
+        ]
+
+
+{-| Whether two `Status` values are the same _variant_ (ignoring payload), so the
+"Archived" pill highlights regardless of the current reason text.
+-}
+sameVariant : Status -> Status -> Bool
+sameVariant a b =
+    case ( a, b ) of
+        ( Planning, Planning ) ->
+            True
+
+        ( Active, Active ) ->
+            True
+
+        ( Archived _, Archived _ ) ->
+            True
+
+        _ ->
+            False
+
+
+archivedField : String
+archivedField =
+    "status:archived"
 
 
 viewTodo : Bool -> Model -> Int -> Todo -> Html Msg
@@ -967,7 +1124,7 @@ viewTodo readOnly model i todo =
             , A.disabled readOnly
             ]
             []
-        , viewTextInput readOnly model (todoTextPath i) (todoField i) todo.text ""
+        , viewTextInput readOnly model (todoTextRef i) (todoField i) todo.text ""
         , if readOnly then
             text ""
 
@@ -985,7 +1142,7 @@ viewNotes readOnly model notes =
                     (\( k, v ) ->
                         li []
                             [ span [ class "note-key" ] [ text k ]
-                            , viewTextInput readOnly model (notePath k) (noteField k) v ""
+                            , viewTextInput readOnly model (noteRef k) (noteField k) v ""
                             , if readOnly then
                                 text ""
 

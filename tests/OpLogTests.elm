@@ -17,7 +17,7 @@ The central properties:
 import Crdt.Id as Id exposing (OpId)
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, TargetStep(..))
-import Crdt.Schema as S exposing (Crdt)
+import Crdt.Schema.Internal as S exposing (Crdt)
 import Dict
 import Expect
 import Fuzz exposing (Fuzzer)
@@ -41,7 +41,7 @@ type alias Item =
     }
 
 
-schema : Crdt Doc
+schema : Crdt S.Nested Doc
 schema =
     S.record Doc
         |> S.field "title" .title S.text
@@ -50,7 +50,7 @@ schema =
         |> S.build
 
 
-itemSchema : Crdt Item
+itemSchema : Crdt S.Nested Item
 itemSchema =
     S.record Item
         |> S.field "label" .label S.text

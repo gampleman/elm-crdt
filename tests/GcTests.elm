@@ -13,7 +13,7 @@ cursors anchored below the cut still resolve.
 import Crdt.Id as Id
 import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
-import Crdt.Schema as S exposing (Crdt)
+import Crdt.Schema.Internal as S exposing (Crdt)
 import Expect
 import Fuzz
 import Test exposing (Test, describe, fuzz, test)
@@ -33,7 +33,7 @@ type alias Item =
     { label : String }
 
 
-schema : Crdt Doc
+schema : Crdt S.Nested Doc
 schema =
     S.record Doc
         |> S.field "title" .title S.text
@@ -41,7 +41,7 @@ schema =
         |> S.build
 
 
-itemSchema : Crdt Item
+itemSchema : Crdt S.Nested Item
 itemSchema =
     S.record Item |> S.field "label" .label S.text |> S.build
 

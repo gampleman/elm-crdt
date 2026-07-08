@@ -12,18 +12,23 @@ It exercises the full library surface:
 
 - **record** — the board (`title`, `todos`, `notes`)
 - **text** — collaborative title and per-todo/per-note text (character-wise merge)
-- **list** — the todo list (`S.list` of todo records)
+- **movable list** — the todo list (`S.movableList`); drag the `⠿` handle to
+  reorder. Moves keep each todo's identity, so nested edits and cursors follow it.
 - **dict** — free-form notes keyed by string (`S.dict`)
 - **lww** — todo `done` booleans
-- **presence** — live "who's here" + which field each peer is editing
+- **presence** — live "who's here" + which field each peer is editing, with
+  **stable cursors** (`Crdt.Cursor`) that track the right character across
+  concurrent edits.
 - **collaborative history** — named checkpoints capture a `Version` (a point in
   the shared op DAG); "preview" is true time-travel via `OpDoc.readAt`, and it
   stays meaningful across peers' concurrent edits.
-
-> Note: `restore`, `undo`, and `redo` from the earlier state-based demo are
-> temporarily gone — on the op-log they become syncing inverse-ops, which aren't
-> built yet (tracked in `docs/02-oplog.md`). Time-travel *preview* is the
-> collaborative replacement and is strictly more capable.
+- **history scrubber + restore** — a slider over the document's linear op history
+  (`OpDoc.versionAt`) previews any past step; "restore to here" rewinds the live
+  doc via `OpDoc.restoreTo`, which emits diff ops so the revert **syncs** to peers
+  rather than rewinding only locally.
+- **local undo/redo** — `OpDoc.undo` / `redo` invert *your own* edits as fresh
+  ops, so a peer's concurrent edit survives your undo and the undo itself syncs. A
+  typing session and a whole drag-reorder each collapse to one step.
 
 ## Run it
 

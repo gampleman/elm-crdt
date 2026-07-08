@@ -21,7 +21,12 @@ const wss = new WebSocketServer({ server });
 function broadcastExcept(sender, payload) {
   for (const client of wss.clients) {
     if (client !== sender && client.readyState === client.OPEN) {
-      client.send(payload);
+      // Force a TEXT frame. The `ws` library picks the frame type from the
+      // value: a Buffer (what the `message` event gives us) would go out as a
+      // BINARY frame, which the browser then delivers as a Blob — and our
+      // JSON-only protocol chokes on `JSON.parse("[object Blob]")`. Sending a
+      // string makes it a text frame, delivered to the browser as a string.
+      client.send(payload, { binary: false });
     }
   }
 }

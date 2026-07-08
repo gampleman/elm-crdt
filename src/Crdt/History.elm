@@ -1,6 +1,6 @@
 module Crdt.History exposing
     ( Checkpoint, Version
-    , commit, checkpoints, checkpointVersion, checkpointMessage, checkpointAuthor
+    , commit, checkpoints, checkpointVersion, checkpointMessage
     , checkout, restore
     , undo, redo
     )
@@ -18,13 +18,13 @@ propagates to peers, while still converging — a peer's genuinely concurrent ed
 to an untouched field survives, and the usual CRDT merge reconciles the rest.
 
 @docs Checkpoint, Version
-@docs commit, checkpoints, checkpointVersion, checkpointMessage, checkpointAuthor
+@docs commit, checkpoints, checkpointVersion, checkpointMessage
 @docs checkout, restore
 @docs undo, redo
 
 -}
 
-import Crdt.Id as Id exposing (ReplicaId)
+import Crdt.Id as Id
 import Crdt.Internal as I exposing (Doc)
 import Crdt.Node as Node
 
@@ -85,13 +85,6 @@ checkpointVersion cp =
 checkpointMessage : Checkpoint -> String
 checkpointMessage cp =
     cp.message
-
-
-{-| The author of a checkpoint.
--}
-checkpointAuthor : Checkpoint -> ReplicaId
-checkpointAuthor cp =
-    cp.author
 
 
 

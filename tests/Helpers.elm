@@ -13,7 +13,7 @@ demo so tests and demo stay in lockstep.
 import Crdt.Id as Id exposing (OpId, ReplicaId)
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
-import Crdt.Schema as S exposing (Crdt)
+import Crdt.Schema.Internal as S exposing (Crdt)
 import Dict
 import Fuzz exposing (Fuzzer)
 
@@ -35,7 +35,7 @@ type alias Todo =
     }
 
 
-boardSchema : Crdt Board
+boardSchema : Crdt S.Nested Board
 boardSchema =
     S.record Board
         |> S.field "title" .title S.text
@@ -44,7 +44,7 @@ boardSchema =
         |> S.build
 
 
-todoSchema : Crdt Todo
+todoSchema : Crdt S.Nested Todo
 todoSchema =
     S.record Todo
         |> S.field "text" .text S.text

@@ -5,16 +5,13 @@
     "license": "BSD-3-Clause",
     "version": "1.0.0",
     "exposed-modules": [
-        "Crdt",
         "Crdt.Schema",
-        "Crdt.Edit",
-        "Crdt.Path",
         "Crdt.Id",
         "Crdt.Text",
         "Crdt.Presence",
-        "Crdt.History",
         "Crdt.OpDoc",
-        "Crdt.Cursor"
+        "Crdt.Cursor",
+        "Crdt.Ref"
     ],
     "elm-version": "0.19.0 <= v < 0.20.0",
     "dependencies": {

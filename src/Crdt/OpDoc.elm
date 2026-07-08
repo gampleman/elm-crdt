@@ -12,6 +12,7 @@ module Crdt.OpDoc exposing
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
     , gc
     , encode, encodeSince, decodeInto
+    , seedNodeAt, subValue
     )
 
 {-| An op-log-backed document: the public surface over `Crdt.OpLog`.
@@ -40,6 +41,7 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
 @docs gc
 @docs encode, encodeSince, decodeInto
+@docs seedNodeAt, subValue
 
 -}
 
@@ -76,7 +78,11 @@ keystroke frequency, so this keeps the hot path O(1).
 -}
 type OpDoc a
     = OpDoc
-        { schema : Crdt a
+        { -- the schema's decoder, kept kind-erased so `OpDoc a` needs no kind
+          -- param (the root schema's edit-kind is irrelevant once stored — an
+          -- `OpDoc` is only ever *read* through it, and edited via `Ref`s the
+          -- caller holds separately).
+          decode : Node -> Result Schema.Error a
         , base : Node
         , store : OpStore
         , ctx : Ctx
@@ -154,14 +160,14 @@ type Error
 
 {-| A fresh, empty op-document for a replica and schema.
 -}
-init : ReplicaId -> Crdt a -> OpDoc a
+init : ReplicaId -> Crdt kind a -> OpDoc a
 init replica schema =
     let
         ( base, ctx ) =
             Schema.emptyNode schema (Id.ctx replica)
     in
     OpDoc
-        { schema = schema
+        { decode = Schema.decodeNode schema
         , base = base
         , store = OpLog.empty
         , ctx = ctx
@@ -185,7 +191,7 @@ state (OpDoc d) =
 -}
 read : OpDoc a -> Result Schema.Error a
 read ((OpDoc d) as doc) =
-    Schema.decodeNode d.schema (state doc)
+    d.decode (state doc)
 
 
 {-| Merge another op-document into this one: op-store union, with the clock
@@ -467,7 +473,7 @@ The live document is unchanged; this is a read-only view of the past.
 -}
 readAt : Version -> OpDoc a -> Result Schema.Error a
 readAt v ((OpDoc d) as doc) =
-    Schema.decodeNode d.schema (stateAt v doc)
+    d.decode (stateAt v doc)
 
 
 {-| How many ops the live history holds — the number of distinct edit steps you
@@ -1722,6 +1728,79 @@ become element `OpId`s, so the emitted op is position-independent.
 resolve : Path -> OpDoc a -> Result Error ( List TargetStep, Node )
 resolve path doc =
     walk (Path.segments path) (state doc) []
+
+
+
+-- REF PRIMITIVES -------------------------------------------------------------
+-- Node-free entry points that `Crdt.Ref` builds its typed `set`/`over` on.
+-- They keep the `Node` type internal: callers pass a `Seed` (opaque) or a
+-- sub-schema, never a `Node`.
+
+
+{-| Overwrite whatever is at `path` so it reads as the value the `Seed` builds,
+emitting the **minimal** ops to get there (so concurrent edits elsewhere survive).
+The seed's node is compared against the current node with the same diff engine
+`restoreTo` uses; a text target additionally gets a character-level diff so
+collaborative text still merges by character. Used by `Crdt.Ref`'s `set`.
+-}
+seedNodeAt : Path -> Seed -> OpDoc a -> Result Error (OpDoc a)
+seedNodeAt path seed doc =
+    resolve path doc
+        |> Result.map
+            (\( target, current ) ->
+                let
+                    ( seeded, ctx1 ) =
+                        I.runSeed seed (ctxOf doc)
+
+                    doc1 =
+                        withCtx ctx1 doc
+                in
+                case ( current, seeded ) of
+                    ( Node.Txt rga, Node.Txt _ ) ->
+                        -- preserve character-wise merge for text leaves
+                        applyTextDiff target rga (textOfNode seeded) doc1
+
+                    _ ->
+                        -- general case: emit the diff ops (registers, counters,
+                        -- maps/records, sum-type $tag switches, sequences)
+                        restoreNode target seeded current doc1
+            )
+
+
+{-| Read the typed value at `path` through a sub-schema. `Crdt.Ref`'s `over` uses
+this to fetch the current value, apply a function, and write it back with
+`seedNodeAt`. Keeps `Node` internal (the sub-schema decodes it).
+-}
+subValue : Crdt kind sub -> Path -> OpDoc a -> Result Error sub
+subValue schema path doc =
+    resolve path doc
+        |> Result.andThen
+            (\( _, node ) ->
+                Schema.decodeNode schema node
+                    |> Result.mapError (\e -> WrongNodeType (Schema.errorToString e))
+            )
+
+
+{-| The visible string of a `Txt` node (its char registers concatenated).
+-}
+textOfNode : Node -> String
+textOfNode node =
+    case Node.asTxt node of
+        Just rga ->
+            Rga.toList rga
+                |> List.filterMap
+                    (\n ->
+                        case Node.asPrim n of
+                            Just (PString s) ->
+                                Just s
+
+                            _ ->
+                                Nothing
+                    )
+                |> String.concat
+
+        Nothing ->
+            ""
 
 
 walk : List Seg -> Node -> List TargetStep -> Result Error ( List TargetStep, Node )

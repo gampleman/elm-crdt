@@ -1,7 +1,7 @@
 module Crdt.Path exposing
     ( Path, Seg(..)
     , root, field, key, index
-    , segments, isRoot
+    , segments
     )
 
 {-| A path addresses a location inside a document's `Node` tree. Edits navigate
@@ -18,7 +18,7 @@ descends into a `Seq` by _visible_ position.
 
 @docs Path, Seg
 @docs root, field, key, index
-@docs segments, isRoot
+@docs segments
 
 -}
 
@@ -70,10 +70,3 @@ index i (Path segs) =
 segments : Path -> List Seg
 segments (Path segs) =
     segs
-
-
-{-| Whether this path addresses the root.
--}
-isRoot : Path -> Bool
-isRoot (Path segs) =
-    List.isEmpty segs

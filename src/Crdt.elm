@@ -2,7 +2,7 @@ module Crdt exposing
     ( Doc, Dict, Error
     , init, read, merge
     , encode, decode
-    , errorToString, dictToList
+    , errorToString
     , opIds, maxCounter
     )
 
@@ -30,7 +30,7 @@ wiring.
 @docs Doc, Dict, Error
 @docs init, read, merge
 @docs encode, decode
-@docs errorToString, dictToList
+@docs errorToString
 @docs opIds, maxCounter
 
 -}
@@ -74,13 +74,6 @@ errorToString =
     Schema.errorToString
 
 
-{-| Stable ordered listing of a dict's entries (re-exported for rendering).
--}
-dictToList : Dict k v -> List ( k, v )
-dictToList =
-    Dict.toList
-
-
 
 -- LIFECYCLE ------------------------------------------------------------------
 
@@ -88,7 +81,7 @@ dictToList =
 {-| Create an empty document for a replica, with the structure described by a
 schema.
 -}
-init : ReplicaId -> Crdt a -> Doc
+init : ReplicaId -> Crdt kind a -> Doc
 init replica schema =
     let
         ( root, ctx ) =
@@ -99,7 +92,7 @@ init replica schema =
 
 {-| Read the typed value out of a document through its schema.
 -}
-read : Crdt a -> Doc -> Result Error a
+read : Crdt kind a -> Doc -> Result Error a
 read schema doc =
     Schema.decodeNode schema (I.root doc)
 

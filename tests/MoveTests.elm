@@ -9,7 +9,7 @@ preservation, convergence, JSON, and that a plain `list` rejects moves.
 import Crdt.Id as Id
 import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
-import Crdt.Schema as S exposing (Crdt)
+import Crdt.Schema.Internal as S exposing (Crdt)
 import Expect
 import Test exposing (Test, describe, test)
 
@@ -22,14 +22,14 @@ type alias Todo =
     { text : String }
 
 
-schema : Crdt Doc
+schema : Crdt S.Nested Doc
 schema =
     S.record Doc
         |> S.field "todos" .todos (S.movableList todoSchema)
         |> S.build
 
 
-todoSchema : Crdt Todo
+todoSchema : Crdt S.Nested Todo
 todoSchema =
     S.record Todo |> S.field "text" .text S.text |> S.build
 

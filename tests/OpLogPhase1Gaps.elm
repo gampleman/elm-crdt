@@ -74,6 +74,7 @@ suite =
         --   now uses these instead of a local checkpoint list. Tested.
         -- Remaining history work:
         , todo "explicit fork/branch type from a Version + a way to diff/compare two branches"
+
         -- undo/redo DONE (Loro-style LOCAL, op-log): OpDoc.recordEdit/undo/redo/
         -- canUndo/canRedo. Inverts THIS replica's own ops as fresh ops (so it syncs
         -- and converges), NOT a whole-state diff — a peer's concurrent edit to the
