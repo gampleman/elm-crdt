@@ -145,8 +145,14 @@ fuzzSeq depth =
 
 fuzzElement : Int -> Fuzzer (Rga.Element Node)
 fuzzElement depth =
-    Fuzz.map4 Rga.element
+    Fuzz.map5 Rga.element
         fuzzOpId
         (Fuzz.maybe fuzzOpId)
+        fuzzSide
         (fuzzNodeDepth depth)
         Fuzz.bool
+
+
+fuzzSide : Fuzzer Rga.Side
+fuzzSide =
+    Fuzz.oneOfValues [ Rga.Left, Rga.Right ]

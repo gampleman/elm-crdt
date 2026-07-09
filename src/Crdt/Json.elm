@@ -2,9 +2,11 @@ module Crdt.Json exposing
     ( encodeNode
     , encodeOpId
     , encodePrim
+    , encodeSide
     , nodeDecoder
     , opIdDecoder
     , primDecoder
+    , sideDecoder
     )
 
 {-| Lossless JSON serialization of the `Node` tree, including every `OpId`,
@@ -112,10 +114,12 @@ encodeMove m =
 -}
 encodeCell : Rga.Element OpId -> JE.Value
 encodeCell cell =
+    -- A MoveList cell is always a right-child (structural ordering), so its `side`
+    -- is not serialized; the decoder reconstructs it as `Right`.
     JE.object
         [ ( "id", encodeOpId cell.id )
         , ( "o"
-          , case cell.origin of
+          , case cell.parent of
                 Just o ->
                     encodeOpId o
 
@@ -147,17 +151,45 @@ encodeElement : Element -> JE.Value
 encodeElement el =
     JE.object
         [ ( "id", encodeOpId el.id )
-        , ( "o"
-          , case el.origin of
-                Just o ->
-                    encodeOpId o
+        , ( "p"
+          , case el.parent of
+                Just p ->
+                    encodeOpId p
 
                 Nothing ->
                     JE.null
           )
+        , ( "s", encodeSide el.side )
         , ( "c", encodeNode el.content )
         , ( "d", JE.bool el.deleted )
         ]
+
+
+encodeSide : Rga.Side -> JE.Value
+encodeSide side =
+    case side of
+        Rga.Left ->
+            JE.string "L"
+
+        Rga.Right ->
+            JE.string "R"
+
+
+sideDecoder : Decoder Rga.Side
+sideDecoder =
+    JD.string
+        |> JD.andThen
+            (\s ->
+                case s of
+                    "L" ->
+                        JD.succeed Rga.Left
+
+                    "R" ->
+                        JD.succeed Rga.Right
+
+                    _ ->
+                        JD.fail ("unknown side: " ++ s)
+            )
 
 
 encodeOpId : OpId -> JE.Value
@@ -243,7 +275,8 @@ nodeDecoder =
 
 cellDecoder : Decoder (Rga.Element OpId)
 cellDecoder =
-    JD.map3 (\id origin valueId -> Rga.element id origin valueId False)
+    -- cells are always right-children (structural), so reconstruct `side = Right`.
+    JD.map3 (\id parent valueId -> Rga.element id parent Rga.Right valueId False)
         (JD.field "id" opIdDecoder)
         (JD.field "o" (JD.nullable opIdDecoder))
         (JD.field "v" opIdDecoder)
@@ -275,9 +308,10 @@ incrementDecoder =
 
 elementDecoder : Decoder Element
 elementDecoder =
-    JD.map4 Rga.element
+    JD.map5 Rga.element
         (JD.field "id" opIdDecoder)
-        (JD.field "o" (JD.nullable opIdDecoder))
+        (JD.field "p" (JD.nullable opIdDecoder))
+        (JD.field "s" sideDecoder)
         (JD.field "c" (JD.lazy (\_ -> nodeDecoder)))
         (JD.field "d" JD.bool)
 

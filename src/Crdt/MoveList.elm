@@ -104,7 +104,7 @@ insert : OpId -> Maybe OpId -> c -> MoveList c -> MoveList c
 insert valueId afterCell content (MoveList m) =
     MoveList
         { m
-            | cellRga = Rga.put (Rga.element valueId afterCell valueId False) m.cellRga
+            | cellRga = Rga.put (Rga.element valueId afterCell Rga.Right valueId False) m.cellRga
             , valueOf = Dict.insert (Id.opIdToString valueId) content m.valueOf
         }
 
@@ -115,7 +115,7 @@ value's home) carrying the same valueId. Content and identity are untouched.
 -}
 move : OpId -> OpId -> Maybe OpId -> MoveList c -> MoveList c
 move moveOp valueId afterCell (MoveList m) =
-    MoveList { m | cellRga = Rga.put (Rga.element moveOp afterCell valueId False) m.cellRga }
+    MoveList { m | cellRga = Rga.put (Rga.element moveOp afterCell Rga.Right valueId False) m.cellRga }
 
 
 {-| Delete a value by id (delete-wins; idempotent).

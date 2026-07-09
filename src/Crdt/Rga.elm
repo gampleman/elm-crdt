@@ -1,5 +1,5 @@
 module Crdt.Rga exposing
-    ( Rga, Element
+    ( Rga, Element, Side(..)
     , empty, element, fromElements, elements, put
     , insertAfter, delete, merge
     , toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId
@@ -8,23 +8,36 @@ module Crdt.Rga exposing
     , maxCounter
     )
 
-{-| A Replicated Growable Array — the sequence CRDT backing both lists and text.
+{-| A replicated growable sequence — the CRDT backing both lists and text.
 
-Each element carries a globally-unique `OpId`, the id of the element it was
-inserted _after_ (`origin`, `Nothing` = head), its `content` (an opaque payload
-— a `Node` in practice, kept polymorphic here as `c`), and a `deleted`
+Each element carries a globally-unique `OpId`, a **`parent` anchor** (the id of
+another element it hangs off, `Nothing` = a root at the head), a **`side`** saying
+whether it sits to the `Left` or `Right` of that parent, its `content` (an opaque
+payload — a `Node` in practice, kept polymorphic here as `c`), and a `deleted`
 tombstone flag.
 
-The crucial property: the visible order is a **pure function of the element set**
-(ids + origins), computed in `toList`, never mutated incrementally. That is what
-makes ordering independent of merge order. Tombstones are retained forever (in
-v1) so that state-based merge stays idempotent — dropping a tombstone would
-resurrect deleted elements on a later merge.
+Ordering is **Fugue** (Weidner et al., 2023), not classic RGA. The `parent`+`side`
+pair makes each element a node in a tree: left-children render before their parent,
+right-children after, and concurrent siblings on the same side are ordered by id
+(descending). The payoff over plain RGA (a single left anchor) is that two
+_concurrent runs_ inserted at the same spot stay **contiguous blocks** instead of
+interleaving character-by-character — each run is a right-spine subtree, so the
+whole subtree renders before the other. See `docs/09-fugue.md`.
+
+(`origin = Just L` in old RGA is exactly `parent = L, side = Right`; the new
+expressible case is `side = Left`, "immediately before parent", which is what keeps
+runs from interleaving. Roots always have `side = Right`.)
+
+The crucial invariant is unchanged: the visible order is a **pure function of the
+element set** (ids + parent + side), computed in `toElementsInOrder`, never mutated
+incrementally — that is what makes ordering independent of merge order. Tombstones
+are retained forever (in v1) so state-based merge stays idempotent — dropping a
+tombstone would resurrect deleted elements on a later merge.
 
 The store is keyed by a string form of the `OpId` so that Elm structural
 equality (`==`) is a sound convergence oracle.
 
-@docs Rga, Element
+@docs Rga, Element, Side
 @docs empty, element, fromElements, elements, put
 @docs insertAfter, delete, merge
 @docs toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId
@@ -39,18 +52,27 @@ import Dict exposing (Dict)
 import Set exposing (Set)
 
 
-{-| One element of the array.
+{-| Which side of its `parent` an element sits on. `Left` = renders immediately
+before the parent (and its earlier left-siblings); `Right` = immediately after.
+-}
+type Side
+    = Left
+    | Right
+
+
+{-| One element of the sequence: a Fugue tree node.
 -}
 type alias Element c =
     { id : OpId
-    , origin : Maybe OpId
+    , parent : Maybe OpId
+    , side : Side
     , content : c
     , deleted : Bool
     }
 
 
-{-| The array: a map from the string form of each element's id to the element.
-Order is not stored; it is derived in `toList`.
+{-| The sequence: a map from the string form of each element's id to the element.
+Order is not stored; it is derived in `toElementsInOrder`.
 -}
 type Rga c
     = Rga (Dict String (Element c))
@@ -58,9 +80,9 @@ type Rga c
 
 {-| Construct an element record.
 -}
-element : OpId -> Maybe OpId -> c -> Bool -> Element c
-element id origin content deleted =
-    { id = id, origin = origin, content = content, deleted = deleted }
+element : OpId -> Maybe OpId -> Side -> c -> Bool -> Element c
+element id parent side content deleted =
+    { id = id, parent = parent, side = side, content = content, deleted = deleted }
 
 
 {-| The empty array.
@@ -105,6 +127,13 @@ put el (Rga d) =
 
 {-| Insert `content` immediately after `origin` (or at the head when `Nothing`),
 using a freshly minted id. Returns the updated array and advanced context.
+
+"After `origin`" is expressed as a **right-child of `origin`** (`side = Right`); at
+the head it is a root (`parent = Nothing, side = Right`). This is the classic-RGA
+anchoring rule, kept for the state-based `Crdt.Edit`/`Crdt.Text` layers and
+`Node.reStamp`. The op-log text layer (`Crdt.OpDoc.applyTextDiff`) chooses
+`parent`/`side` itself to get Fugue's non-interleaving runs.
+
 -}
 insertAfter : Id.Ctx -> Maybe OpId -> c -> Rga c -> ( Rga c, Id.Ctx )
 insertAfter ctx origin content (Rga d) =
@@ -112,7 +141,7 @@ insertAfter ctx origin content (Rga d) =
         ( id, ctx1 ) =
             Id.nextId ctx
     in
-    ( Rga (insertElement (element id origin content False) d), ctx1 )
+    ( Rga (insertElement (element id origin Right content False) d), ctx1 )
 
 
 {-| Tombstone the element with the given id. Idempotent; unknown ids are no-ops.
@@ -134,9 +163,9 @@ associative and idempotent as long as `mergeContent` is.
 
 In normal use an id is minted exactly once, so the two copies of a shared id are
 identical. But decoded (possibly corrupt or adversarial) input could disagree on
-an element's `origin`; to keep `merge` commutative on _any_ input we resolve a
-conflicting origin deterministically rather than keeping whichever side happened
-to be the left argument.
+an element's `parent`/`side`; to keep `merge` commutative on _any_ input we resolve
+a conflicting anchor deterministically (see `mergeAnchor`) rather than keeping
+whichever side happened to be the left argument.
 
 -}
 merge : (c -> c -> c) -> Rga c -> Rga c -> Rga c
@@ -154,32 +183,60 @@ merge mergeContent (Rga a) (Rga b) =
 
 mergeElement : (c -> c -> c) -> Element c -> Element c -> Element c
 mergeElement mergeContent a b =
+    let
+        ( parent, side ) =
+            mergeAnchor ( a.parent, a.side ) ( b.parent, b.side )
+    in
     { id = a.id
-    , origin = mergeOrigin a.origin b.origin
+    , parent = parent
+    , side = side
     , deleted = a.deleted || b.deleted
     , content = mergeContent a.content b.content
     }
 
 
-{-| Deterministically combine two (possibly conflicting) origins so merge is
-order-independent: prefer the larger `OpId`, treating `Nothing` (head) as
-smallest. Identical origins — the normal case — pass through unchanged.
+{-| Deterministically combine two (possibly conflicting) `(parent, side)` anchors so
+merge is order-independent. In normal use an id is minted exactly once, so both
+copies of a shared id carry an identical anchor and this passes through unchanged;
+the resolver only matters for decoded (possibly corrupt/adversarial) input that
+disagrees. Fixed rule: prefer the larger parent `OpId` (treating `Nothing` = head as
+smallest); on an equal parent, prefer `Right` over `Left`.
 -}
-mergeOrigin : Maybe OpId -> Maybe OpId -> Maybe OpId
-mergeOrigin a b =
-    case ( a, b ) of
+mergeAnchor : ( Maybe OpId, Side ) -> ( Maybe OpId, Side ) -> ( Maybe OpId, Side )
+mergeAnchor ( pa, sa ) ( pb, sb ) =
+    case ( pa, pb ) of
         ( Just x, Just y ) ->
-            if Id.compareOpId x y == LT then
-                b
+            case Id.compareOpId x y of
+                LT ->
+                    ( pb, sb )
 
-            else
-                a
+                GT ->
+                    ( pa, sa )
+
+                EQ ->
+                    ( pa, mergeSide sa sb )
 
         ( Just _, Nothing ) ->
-            a
+            ( pa, sa )
 
-        ( Nothing, _ ) ->
-            b
+        ( Nothing, Just _ ) ->
+            ( pb, sb )
+
+        ( Nothing, Nothing ) ->
+            ( Nothing, mergeSide sa sb )
+
+
+mergeSide : Side -> Side -> Side
+mergeSide a b =
+    case ( a, b ) of
+        ( Right, _ ) ->
+            Right
+
+        ( _, Right ) ->
+            Right
+
+        _ ->
+            Left
 
 
 
@@ -195,14 +252,33 @@ toList rga =
         |> List.map .content
 
 
-{-| All elements (including tombstones) in the deterministic RGA order. This is
-the single source of truth for ordering.
+{-| One item of the explicit traversal stack: either **expand** an element's
+subtree (push its children + a self-emit) or **emit** the element itself. Making
+the emit a distinct item is what lets a single flat loop do an _in-order_ walk
+(left-subtree, node, right-subtree) without recursion, so it is stack-safe.
+-}
+type Work c
+    = Expand (Element c)
+    | Emit (Element c)
 
-The order is a stable walk of the insertion forest: starting from the head
-(elements with no origin), each element is followed by its children (elements
-whose origin is this element's id). Siblings sharing the same origin are ordered
-by `compareOpId` **descending**, so a later concurrent insert at the same anchor
-sorts before an earlier one — the standard RGA rule that guarantees convergence.
+
+{-| All elements (including tombstones) in the deterministic order. This is the
+single source of truth for ordering.
+
+The order is the **Fugue** in-order traversal of the `parent`/`side` tree. Every
+element is a child of its `parent` on its `side`; the virtual head (`headKey`) is
+the parent of all roots (elements with `parent = Nothing`, or a dangling `parent`
+pointing at a missing id — never dropped). For each node we emit its **left**
+children (and their subtrees), then the node, then its **right** children. Within a
+side, concurrent siblings are ordered by `compareOpId`: right-children **descending**
+(a later concurrent insert sorts nearest the parent — the classic RGA rule, so an
+all-right tree orders exactly as RGA did), left-children **ascending** (symmetric:
+the newest left insert sits nearest the parent, just before it).
+
+Because each typed run chains as a right-spine (char₂ is a right-child of char₁),
+an inserted run is one contiguous subtree, so a _concurrent_ run at the same anchor
+renders entirely before or after it — never interleaved. That is the whole point of
+Fugue over RGA. See `docs/09-fugue.md`.
 
 -}
 toElementsInOrder : Rga c -> List (Element c)
@@ -211,59 +287,79 @@ toElementsInOrder (Rga d) =
         all =
             Dict.values d
 
-        -- an element is a *root* if it has no origin, or if its origin points to
-        -- an id that isn't present (a dangling reference — never drop it). Such
-        -- elements hang off the head so they always appear in the output.
-        isRoot : Element c -> Bool
-        isRoot el =
-            case el.origin of
+        -- the key of an element's effective parent: the head for roots and for
+        -- dangling parents (a `parent` pointing at a missing id — kept as a root
+        -- so nothing ever silently vanishes).
+        childKey : Element c -> String
+        childKey el =
+            case el.parent of
                 Nothing ->
-                    True
+                    headKey
 
-                Just o ->
-                    not (Dict.member (Id.opIdToString o) d)
+                Just p ->
+                    if Dict.member (Id.opIdToString p) d then
+                        Id.opIdToString p
 
-        -- children grouped by their origin's string key; roots collected under
-        -- the head key regardless of where their (dangling) origin pointed.
-        childrenOf : Dict String (List (Element c))
-        childrenOf =
+                    else
+                        headKey
+
+        -- all children grouped by their effective parent key (unsorted; split by
+        -- side and sorted per-key at expand time, so each key sorts once).
+        grouped : Dict String (List (Element c))
+        grouped =
             List.foldl
                 (\el acc ->
-                    let
-                        key =
-                            if isRoot el then
-                                headKey
-
-                            else
-                                originKey el.origin
-                    in
-                    Dict.update key
+                    Dict.update (childKey el)
                         (\existing -> Just (el :: Maybe.withDefault [] existing))
                         acc
                 )
                 Dict.empty
                 all
 
-        -- siblings ordered by id descending (later concurrent insert first)
-        sortedChildren : String -> List (Element c)
-        sortedChildren key =
-            Dict.get key childrenOf
+        leftChildren : String -> List (Element c)
+        leftChildren k =
+            Dict.get k grouped
                 |> Maybe.withDefault []
+                |> List.filter (\el -> el.side == Left)
+                -- ascending: newest (highest id) renders last, nearest the parent
+                |> List.sortWith (\x y -> Id.compareOpId x.id y.id)
+
+        rightChildren : String -> List (Element c)
+        rightChildren k =
+            Dict.get k grouped
+                |> Maybe.withDefault []
+                |> List.filter (\el -> el.side == Right)
+                -- descending: newest (highest id) renders first, nearest the parent
                 |> List.sortWith (\x y -> Id.compareOpId y.id x.id)
 
-        -- Pre-order DFS of the insertion forest via an explicit work-stack, so it
-        -- is tail-recursive (stack-safe for long origin-chains — a list built by
-        -- appending is a chain of depth N) and O(N) overall. The visited set
-        -- guards against origin cycles in adversarial/corrupt input. Children are
-        -- prepended to the stack so they are emitted before later siblings, in
-        -- `sortedChildren` order; `acc` is built reversed and flipped once.
-        loop : List (Element c) -> Set String -> List (Element c) -> ( List (Element c), Set String )
+        -- expand node `k` into stack work, front-first: left subtrees, then the
+        -- node itself (when real — the head passes `Nothing`), then right subtrees.
+        expandKey : String -> Maybe (Element c) -> List (Work c) -> List (Work c)
+        expandKey k maybeSelf rest =
+            List.map Expand (leftChildren k)
+                ++ (case maybeSelf of
+                        Just el ->
+                            Emit el :: List.map Expand (rightChildren k)
+
+                        Nothing ->
+                            List.map Expand (rightChildren k)
+                   )
+                ++ rest
+
+        -- Flat in-order walk via the explicit work-stack (stack-safe for long
+        -- right-spines — a typed run is a chain of depth N). `visited` guards
+        -- against parent cycles in adversarial/corrupt input; marking at expand
+        -- time means each node is emitted at most once. `acc` is built reversed.
+        loop : List (Work c) -> Set String -> List (Element c) -> ( List (Element c), Set String )
         loop stack visited acc =
             case stack of
                 [] ->
                     ( acc, visited )
 
-                el :: rest ->
+                (Emit el) :: rest ->
+                    loop rest visited (el :: acc)
+
+                (Expand el) :: rest ->
                     let
                         key =
                             Id.opIdToString el.id
@@ -272,15 +368,15 @@ toElementsInOrder (Rga d) =
                         loop rest visited acc
 
                     else
-                        loop (sortedChildren key ++ rest) (Set.insert key visited) (el :: acc)
+                        loop (expandKey key (Just el) rest) (Set.insert key visited) acc
 
         ( ordered, seen ) =
-            loop (sortedChildren headKey) Set.empty []
+            loop (expandKey headKey Nothing []) Set.empty []
 
-        -- Concurrent moves can form an origin *cycle* (A after B, B after A), whose
-        -- members are unreachable from the head. Never drop them: take the
-        -- lowest-id unvisited element as an extra root and keep walking, until all
-        -- elements appear. Deterministic (id order) so it still converges.
+        -- A parent *cycle* (A child-of B, B child-of A) leaves its members
+        -- unreachable from the head. Never drop them: take the lowest-id unvisited
+        -- element as an extra root and keep walking, until all elements appear.
+        -- Deterministic (id order) so it still converges.
         sweep : List (Element c) -> Set String -> List (Element c)
         sweep acc visited =
             case
@@ -294,7 +390,7 @@ toElementsInOrder (Rga d) =
                 root :: _ ->
                     let
                         ( acc1, visited1 ) =
-                            loop [ root ] visited acc
+                            loop [ Expand root ] visited acc
                     in
                     sweep acc1 visited1
     in
@@ -304,16 +400,6 @@ toElementsInOrder (Rga d) =
 headKey : String
 headKey =
     ""
-
-
-originKey : Maybe OpId -> String
-originKey origin =
-    case origin of
-        Nothing ->
-            headKey
-
-        Just id ->
-            Id.opIdToString id
 
 
 
@@ -424,17 +510,17 @@ updateElement id f (Rga d) =
 
 
 {-| Largest Lamport counter referenced anywhere in the array (for clock catch-up
-on merge). Considers both element ids and their origins.
+on merge). Considers both element ids and their parent anchors.
 -}
 maxCounter : Rga c -> Int
 maxCounter (Rga d) =
     Dict.foldl
         (\_ el acc ->
             let
-                originCounter =
-                    el.origin |> Maybe.map Id.opIdCounter |> Maybe.withDefault 0
+                parentCounter =
+                    el.parent |> Maybe.map Id.opIdCounter |> Maybe.withDefault 0
             in
-            max acc (max (Id.opIdCounter el.id) originCounter)
+            max acc (max (Id.opIdCounter el.id) parentCounter)
         )
         0
         d

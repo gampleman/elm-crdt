@@ -63,7 +63,7 @@ is position-independent.
 type Action
     = SetReg Target Prim
     | SetPresence { target : Target, present : Bool, seed : Node }
-    | InsertElem { container : Target, elemId : OpId, after : Maybe OpId, seed : Node }
+    | InsertElem { container : Target, elemId : OpId, parent : Maybe OpId, side : Rga.Side, seed : Node }
     | DeleteElem { container : Target, elem : OpId }
     | MoveElem { container : Target, elem : OpId, after : Maybe OpId }
     | Increment { target : Target, delta : Int }
@@ -381,8 +381,8 @@ applyOp { id, action } root =
         SetPresence { target, present, seed } ->
             setPresenceAt target id present seed root
 
-        InsertElem { container, elemId, after, seed } ->
-            updateAt container id (insertElem elemId after seed) root
+        InsertElem { container, elemId, parent, side, seed } ->
+            updateAt container id (insertElem elemId parent side seed) root
 
         DeleteElem { container, elem } ->
             updateAt container id (deleteElem elem) root
@@ -512,21 +512,23 @@ setRegLww stamp prim current =
             Node.reg prim stamp
 
 
-insertElem : OpId -> Maybe OpId -> Node -> Node -> Node
-insertElem elemId after seed current =
+insertElem : OpId -> Maybe OpId -> Rga.Side -> Node -> Node -> Node
+insertElem elemId parent side seed current =
     case current of
         Txt rga ->
-            Txt (Rga.put (Rga.element elemId after seed False) rga)
+            Txt (Rga.put (Rga.element elemId parent side seed False) rga)
 
         Mov ml ->
-            -- movable list: elemId is the valueId, `after` the cell to follow
-            Mov (MoveList.insert elemId after seed ml)
+            -- movable list: elemId is the valueId, `parent` the cell to follow. A
+            -- MoveList cell is always a right-child (structural), so `side` is
+            -- irrelevant here — MoveList manages its own cell ordering.
+            Mov (MoveList.insert elemId parent seed ml)
 
         Seq rga ->
-            Seq (Rga.put (Rga.element elemId after seed False) rga)
+            Seq (Rga.put (Rga.element elemId parent side seed False) rga)
 
         _ ->
-            Seq (Rga.put (Rga.element elemId after seed False) Rga.empty)
+            Seq (Rga.put (Rga.element elemId parent side seed False) Rga.empty)
 
 
 deleteElem : OpId -> Node -> Node

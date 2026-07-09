@@ -17,6 +17,7 @@ The central properties:
 import Crdt.Id as Id exposing (OpId)
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, TargetStep(..))
+import Crdt.Rga as Rga
 import Crdt.Schema.Internal as S exposing (Crdt)
 import Dict
 import Expect
@@ -108,9 +109,9 @@ why a _causal_ order (not just any order) is needed to materialize correctly.
 -}
 sampleOps : List Op
 sampleOps =
-    [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, after = Nothing, seed = emptyItem } }
-    , { id = alice 2, deps = [ alice 1 ], action = InsertElem { container = [ IntoKey "items", IntoElem (alice 1), IntoKey "label" ], elemId = alice 2, after = Nothing, seed = charNode 'A' (alice 2) } }
-    , { id = alice 3, deps = [ alice 1 ], action = InsertElem { container = items, elemId = alice 3, after = Just (alice 1), seed = emptyItem } }
+    [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, parent = Nothing, side = Rga.Right, seed = emptyItem } }
+    , { id = alice 2, deps = [ alice 1 ], action = InsertElem { container = [ IntoKey "items", IntoElem (alice 1), IntoKey "label" ], elemId = alice 2, parent = Nothing, side = Rga.Right, seed = charNode 'A' (alice 2) } }
+    , { id = alice 3, deps = [ alice 1 ], action = InsertElem { container = items, elemId = alice 3, parent = Just (alice 1), side = Rga.Right, seed = emptyItem } }
     , { id = alice 4, deps = [ alice 1 ], action = DeleteElem { container = items, elem = alice 1 } }
     ]
 
@@ -241,7 +242,7 @@ suite =
 
                         ops =
                             [ { id = alice 1, deps = [], action = SetPresence { target = [ IntoKey "notes", IntoKey "k" ], present = True, seed = emptyNote } }
-                            , { id = alice 2, deps = [ alice 1 ], action = InsertElem { container = [ IntoKey "notes", IntoKey "k" ], elemId = alice 2, after = Nothing, seed = charNode 'v' (alice 2) } }
+                            , { id = alice 2, deps = [ alice 1 ], action = InsertElem { container = [ IntoKey "notes", IntoKey "k" ], elemId = alice 2, parent = Nothing, side = Rga.Right, seed = charNode 'v' (alice 2) } }
                             ]
                     in
                     read (storeOf ops)
@@ -270,7 +271,7 @@ suite =
                             [ IntoKey "items", IntoElem (alice 1), IntoKey "done" ]
 
                         ops =
-                            [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, after = Nothing, seed = emptyItem } }
+                            [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, parent = Nothing, side = Rga.Right, seed = emptyItem } }
                             , { id = alice 2, deps = [ alice 1 ], action = SetReg donePath (PBool True) }
                             , { id = alice 5, deps = [ alice 2 ], action = SetReg donePath (PBool False) }
                             ]
@@ -287,7 +288,7 @@ suite =
                         -- bob 9 (higher counter) sets True; alice 3 sets False.
                         -- Whichever fold order, the higher stamp (bob 9 = True) wins.
                         ops =
-                            [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, after = Nothing, seed = emptyItem } }
+                            [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, parent = Nothing, side = Rga.Right, seed = emptyItem } }
                             , { id = alice 3, deps = [ alice 1 ], action = SetReg donePath (PBool False) }
                             , { id = bob 9, deps = [ alice 1 ], action = SetReg donePath (PBool True) }
                             ]
@@ -307,7 +308,7 @@ suite =
 
                         aliceStore =
                             storeOf
-                                [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, after = Nothing, seed = emptyItem } } ]
+                                [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, parent = Nothing, side = Rga.Right, seed = emptyItem } } ]
 
                         bobStore =
                             storeOf

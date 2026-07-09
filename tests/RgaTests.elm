@@ -21,11 +21,12 @@ bob _ n =
     Id.opId n (Id.replica "bob")
 
 
-{-| A single-character text element keyed by an OpId, no origin (head insert).
+{-| A single-character text element keyed by an OpId, anchored as a right-child of
+`origin` (i.e. "inserted after origin" — classic RGA semantics; `Nothing` = head).
 -}
 charEl : OpId -> Maybe OpId -> Char -> Rga.Element Node
 charEl id origin c =
-    Rga.element id origin (Node.reg (PString (String.fromChar c)) id) False
+    Rga.element id origin Rga.Right (Node.reg (PString (String.fromChar c)) id) False
 
 
 {-| Merge two node-RGAs, recursing into element content via Node.merge.

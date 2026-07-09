@@ -572,6 +572,13 @@ emit action doc =
 
 {-| Emit an `InsertElem` whose op id _is_ the new element id (the convention the
 materializer relies on), returning that id so callers can position it afterwards.
+
+Anchors as a **right-child of `after`** (`side = Right`) — i.e. "immediately after
+`after`", or a head root when `after` is `Nothing`. This is the anchor rule for
+appends and for undo re-insertion (revival), where we always want to sit right after
+a known predecessor. Fugue's `Left`-side anchoring is used only by `applyTextDiff`,
+which chooses parent/side itself to keep concurrent runs from interleaving.
+
 -}
 emitInsert : List TargetStep -> Maybe OpId -> Node -> OpDoc a -> ( OpId, OpDoc a )
 emitInsert target after seed doc =
@@ -580,7 +587,7 @@ emitInsert target after seed doc =
             mint doc
     in
     ( elemId
-    , commit [ op elemId (frontierOf doc1) (InsertElem { container = target, elemId = elemId, after = after, seed = seed }) ] doc1
+    , commit [ op elemId (frontierOf doc1) (InsertElem { container = target, elemId = elemId, parent = after, side = Rga.Right, seed = seed }) ] doc1
     )
 
 
@@ -1283,7 +1290,7 @@ remapAction table action =
             SetPresence { r | target = remapTarget table r.target }
 
         InsertElem r ->
-            InsertElem { r | container = remapTarget table r.container, elemId = remapId table r.elemId, after = Maybe.map (remapId table) r.after }
+            InsertElem { r | container = remapTarget table r.container, elemId = remapId table r.elemId, parent = Maybe.map (remapId table) r.parent }
 
         DeleteElem r ->
             DeleteElem { container = remapTarget table r.container, elem = remapId table r.elem }
@@ -1816,13 +1823,22 @@ applyTextDiff target rga value doc =
                 |> List.drop prefix
                 |> List.take (List.length target_ - prefix - suffix)
 
-        -- origin for the first inserted char: the visible element before `prefix`
-        startOrigin =
+        -- Fugue anchoring for the FIRST inserted char. `leftAnchor` = the surviving
+        -- visible element just before the gap (index prefix-1, which survives since
+        -- deletions start at prefix); `rightAnchor` = the first surviving visible
+        -- element after the gap (index len-suffix, first past the deleted range).
+        leftAnchor =
             if prefix <= 0 then
                 Nothing
 
             else
                 Array.get (prefix - 1) ids
+
+        rightAnchor =
+            Array.get (List.length current - suffix) ids
+
+        startPlacement =
+            fuguePlacement rga leftAnchor rightAnchor
 
         deps =
             frontierOf doc
@@ -1840,26 +1856,100 @@ applyTextDiff target rga value doc =
                 ( doc, [] )
                 deleteIds
 
-        -- insert ops, chaining each char after the previous
+        -- insert ops. The first char uses the Fugue placement; each subsequent char
+        -- chains as a RIGHT-CHILD of the previous one, so the whole run is a single
+        -- right-spine subtree — that is what keeps a concurrent run at the same gap
+        -- from interleaving with this one (it renders as one contiguous block).
         ( finalDoc, insertOpsRev, _ ) =
             List.foldl
-                (\char ( d, acc, origin ) ->
+                (\char ( d, acc, placement ) ->
                     let
                         ( elemId, d1 ) =
                             mint d
+
+                        ( parent, side ) =
+                            placement
 
                         seedNode =
                             Node.reg (PString (String.fromChar char)) elemId
                     in
                     ( d1
-                    , op elemId deps (InsertElem { container = target, elemId = elemId, after = origin, seed = seedNode }) :: acc
-                    , Just elemId
+                    , op elemId deps (InsertElem { container = target, elemId = elemId, parent = parent, side = side, seed = seedNode }) :: acc
+                    , ( Just elemId, Rga.Right )
                     )
                 )
-                ( afterDeletes, [], startOrigin )
+                ( afterDeletes, [], startPlacement )
                 insertChars
     in
     commit (deleteOps ++ List.reverse insertOpsRev) finalDoc
+
+
+{-| Choose a Fugue `(parent, side)` for a new element inserted between visible
+neighbors `left` and `right` (either may be absent at the ends of the text).
+
+The rule keeps the element strictly between L and R while making concurrent
+insertions at the same gap attach to the **same** anchor (so they order as whole
+blocks, not interleaved):
+
+  - if `right` exists and descends from `left` (R sits in L's right subtree — the
+    common case, since L and R are adjacent) → attach as a **left-child of R**;
+  - else if `left` exists → attach as a **right-child of L** (e.g. appending at the
+    end, where R is absent);
+  - else if `right` exists → attach as a **left-child of R** (inserting at the head);
+  - else (empty sequence) → a root (`parent = Nothing, side = Right`).
+
+-}
+fuguePlacement : Rga.Rga Node -> Maybe OpId -> Maybe OpId -> ( Maybe OpId, Rga.Side )
+fuguePlacement rga left right =
+    case ( left, right ) of
+        ( Just l, Just r ) ->
+            if descendsFrom rga r l then
+                ( Just r, Rga.Left )
+
+            else
+                ( Just l, Rga.Right )
+
+        ( Just l, Nothing ) ->
+            ( Just l, Rga.Right )
+
+        ( Nothing, Just r ) ->
+            ( Just r, Rga.Left )
+
+        ( Nothing, Nothing ) ->
+            ( Nothing, Rga.Right )
+
+
+{-| Is element `node` a descendant of `ancestor` in the Fugue parent tree? Walks
+parent pointers up from `node`; cycle-safe via a visited set (adversarial input).
+-}
+descendsFrom : Rga.Rga Node -> OpId -> OpId -> Bool
+descendsFrom rga node ancestor =
+    let
+        ancestorKey =
+            Id.opIdToString ancestor
+
+        climb : Maybe OpId -> Set.Set String -> Bool
+        climb current visited =
+            case current of
+                Nothing ->
+                    False
+
+                Just id ->
+                    let
+                        key =
+                            Id.opIdToString id
+                    in
+                    if key == ancestorKey then
+                        True
+
+                    else if Set.member key visited then
+                        False
+
+                    else
+                        climb (Rga.get id rga |> Maybe.andThen .parent) (Set.insert key visited)
+    in
+    -- start from `node`'s parent (a node is not its own descendant)
+    climb (Rga.get node rga |> Maybe.andThen .parent) Set.empty
 
 
 
@@ -2234,7 +2324,7 @@ emitAppend target after seed (OpDoc d) =
 
         committed =
             commit
-                [ op elemId (frontierOf doc1) (InsertElem { container = target, elemId = elemId, after = after, seed = seedNode }) ]
+                [ op elemId (frontierOf doc1) (InsertElem { container = target, elemId = elemId, parent = after, side = Rga.Right, seed = seedNode }) ]
                 doc1
     in
     case committed of

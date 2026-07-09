@@ -63,19 +63,20 @@ encodeAction action =
                 , ( "s", Json.encodeNode seed )
                 ]
 
-        InsertElem { container, elemId, after, seed } ->
+        InsertElem { container, elemId, parent, side, seed } ->
             JE.object
                 [ ( "k", JE.string "ins" )
                 , ( "t", encodeTarget container )
                 , ( "e", Json.encodeOpId elemId )
-                , ( "o"
-                  , case after of
-                        Just o ->
-                            Json.encodeOpId o
+                , ( "p"
+                  , case parent of
+                        Just p ->
+                            Json.encodeOpId p
 
                         Nothing ->
                             JE.null
                   )
+                , ( "sd", Json.encodeSide side )
                 , ( "s", Json.encodeNode seed )
                 ]
 
@@ -183,10 +184,11 @@ actionDecoder =
                             (JD.field "s" Json.nodeDecoder)
 
                     "ins" ->
-                        JD.map4 (\t e o s -> InsertElem { container = t, elemId = e, after = o, seed = s })
+                        JD.map5 (\t e p sd s -> InsertElem { container = t, elemId = e, parent = p, side = sd, seed = s })
                             (JD.field "t" targetDecoder)
                             (JD.field "e" Json.opIdDecoder)
-                            (JD.field "o" (JD.nullable Json.opIdDecoder))
+                            (JD.field "p" (JD.nullable Json.opIdDecoder))
+                            (JD.field "sd" Json.sideDecoder)
                             (JD.field "s" Json.nodeDecoder)
 
                     "del" ->
