@@ -39,6 +39,41 @@
       .status.offline {
         color: #c0392b;
       }
+      /* subtle full-app tint reflecting board status */
+      .app {
+        border-radius: 12px;
+        transition: background 0.4s ease;
+      }
+      .app.status-bg-planning {
+        background: linear-gradient(#f4f5fb, #eef2fb);
+      }
+      .app.status-bg-active {
+        background: linear-gradient(#f2fbf6, #eafaf1);
+      }
+      .app.status-bg-archived {
+        background: linear-gradient(#faf7f2, #f6efe6);
+      }
+      /* status badge in the header */
+      .status-badge {
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 0.1rem 0.5rem;
+        border-radius: 999px;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+      .status-badge.status-planning {
+        background: #e4ebfa;
+        color: #3b5b90;
+      }
+      .status-badge.status-active {
+        background: #d8f5e5;
+        color: #1b8a5a;
+      }
+      .status-badge.status-archived {
+        background: #efe4d4;
+        color: #8a6a3b;
+      }
       .columns {
         display: grid;
         grid-template-columns: 2fr 1fr;
@@ -78,8 +113,7 @@
         position: relative;
         display: block;
       }
-      .todo .field-wrap,
-      .notes li .field-wrap {
+      .todo .field-wrap {
         flex: 1;
       }
       .field-wrap input {
@@ -111,8 +145,7 @@
         padding: 0;
         margin: 0;
       }
-      .todo,
-      .notes li {
+      .todo {
         display: flex;
         gap: 0.5rem;
         align-items: center;
@@ -251,11 +284,168 @@
         color: #c0392b;
         padding: 1rem;
       }
+      /* tabs (local view state) */
+      .tabs {
+        display: flex;
+        gap: 0.25rem;
+        margin: 0.75rem 0 0.25rem;
+        border-bottom: 2px solid #e0e0e0;
+      }
+      .tab {
+        border: none;
+        background: transparent;
+        padding: 0.5rem 1rem;
+        font-size: 0.95rem;
+        cursor: pointer;
+        color: #666;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -2px;
+      }
+      .tab.active {
+        color: #0984e3;
+        border-bottom-color: #0984e3;
+        font-weight: 600;
+      }
+      .tab-peers {
+        display: inline-flex;
+        gap: 2px;
+        margin-left: 0.4rem;
+        vertical-align: middle;
+      }
+      .tab-peer-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        display: inline-block;
+      }
+      .peer-tab {
+        color: #999;
+        font-size: 0.85rem;
+      }
+      /* likes */
+      .likes-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+      .like-btn {
+        padding: 0.4rem 0.9rem;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        background: #fff;
+        cursor: pointer;
+        font-size: 0.95rem;
+      }
+      .like-btn:hover {
+        background: #f0f0f0;
+      }
+      .likes-count {
+        font-size: 1.4rem;
+        font-weight: 600;
+        color: #e84393;
+      }
+      /* files tab (master/detail: list OR the open file's editor) */
+      ul.file-names {
+        list-style: none;
+        padding: 0;
+        margin: 0 0 0.5rem;
+      }
+      .file-name {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.4rem 0.5rem;
+        border-radius: 4px;
+      }
+      .file-name:hover {
+        background: #f0f0f0;
+      }
+      .file-open {
+        flex: 1;
+        cursor: pointer;
+      }
+      .file-remove {
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        color: #999;
+      }
+      .file-editor-head {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 0.5rem;
+      }
+      .file-back {
+        border: 1px solid #d6d6e7;
+        background: #fafaff;
+        border-radius: 6px;
+        padding: 0.3rem 0.7rem;
+        cursor: pointer;
+      }
+      .file-back:hover {
+        background: #f0f0f0;
+      }
+      .file-title {
+        font-weight: 600;
+        font-size: 1.05rem;
+      }
+      .editor-empty {
+        padding: 1.5rem;
+        color: #999;
+        border: 1px dashed #ccc;
+        border-radius: 6px;
+        text-align: center;
+      }
+      /* rich-text editor */
+      .editor-hint {
+        font-size: 0.85rem;
+        color: #666;
+        margin-bottom: 0.5rem;
+      }
+      .pm-toolbar {
+        display: flex;
+        gap: 0.25rem;
+        margin-bottom: 0.5rem;
+      }
+      .pm-toolbar button {
+        min-width: 2rem;
+        padding: 0.3rem 0.5rem;
+        border: 1px solid #ccc;
+        background: #fff;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.9rem;
+      }
+      .pm-toolbar button:hover {
+        background: #f0f0f0;
+      }
+      .pm-mount .ProseMirror {
+        min-height: 8rem;
+        padding: 0.75rem;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        background: #fff;
+        outline: none;
+        line-height: 1.5;
+      }
+      .pm-mount .ProseMirror:focus {
+        border-color: #0984e3;
+      }
+      .pm-mount code {
+        background: #f4f4f4;
+        padding: 0 0.2rem;
+        border-radius: 3px;
+        font-family: ui-monospace, monospace;
+      }
+      .pm-mount a {
+        color: #0984e3;
+      }
     </style>
   </head>
   <body>
     <div id="root"></div>
     <script src="elm.js"></script>
-    <script src="index.js"></script>
+    <script src="bundle.js"></script>
   </body>
 </html>

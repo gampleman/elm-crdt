@@ -68,6 +68,7 @@ type Action
     | MoveElem { container : Target, elem : OpId, after : Maybe OpId }
     | Increment { target : Target, delta : Int }
     | TreeMove { container : Target, child : OpId, parent : Maybe OpId, pos : Frac, seed : Maybe Node }
+    | AddMark { container : Target, markId : OpId, type_ : String, value : Prim, start : Node.MarkAnchor, end : Node.MarkAnchor }
 
 
 {-| A path into the document by stable identity: map keys by name, sequence/text
@@ -396,6 +397,9 @@ applyOp { id, action } root =
         TreeMove { container, child, parent, pos, seed } ->
             updateAt container id (treeMove id child parent pos seed) root
 
+        AddMark { container, markId, type_, value, start, end } ->
+            updateAt container id (addMark markId type_ value start end) root
+
 
 {-| Apply `f` at `steps`, creating intermediate map entries (stamped `stamp`) as
 needed. Sequence/text elements are descended into by id.
@@ -527,6 +531,10 @@ insertElem elemId parent side seed current =
         Seq rga ->
             Seq (Rga.put (Rga.element elemId parent side seed False) rga)
 
+        Rich r ->
+            -- rich text: characters live in the node's `.text` sequence
+            Rich { r | text = Rga.put (Rga.element elemId parent side seed False) r.text }
+
         _ ->
             Seq (Rga.put (Rga.element elemId parent side seed False) Rga.empty)
 
@@ -545,6 +553,9 @@ deleteElem elem current =
 
         Tree t ->
             Tree (Tree.delete elem t)
+
+        Rich r ->
+            Rich { r | text = Rga.delete elem r.text }
 
         _ ->
             current
@@ -572,6 +583,23 @@ treeMove moveOp child parent pos seed current =
 
         Nothing ->
             Tree (Tree.moveOnly moveOp child parent pos t)
+
+
+{-| Record a mark op in a rich-text node's append-only mark set, keyed by the op's
+id (idempotent — re-applying the same op is a no-op). No-op on non-rich nodes.
+-}
+addMark : OpId -> String -> Prim -> Node.MarkAnchor -> Node.MarkAnchor -> Node -> Node
+addMark markId type_ value start end current =
+    case current of
+        Rich r ->
+            let
+                markOp =
+                    { id = markId, type_ = type_, value = value, start = start, end = end }
+            in
+            Rich { r | marks = Dict.insert (Id.opIdToString markId) markOp r.marks }
+
+        _ ->
+            current
 
 
 {-| Move value `elem` after cell `after` in a movable list (no-op on other nodes).

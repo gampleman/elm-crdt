@@ -1,7 +1,8 @@
 module Crdt.Node exposing
     ( Node(..), Register, Prim(..), Entry, Increment, MovNode, TreeNode
-    , reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree
-    , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree
+    , RichNode, MarkOp, MarkAnchor, AnchorSide(..)
+    , reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
+    , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
     , merge, maxCounter
     , restore, reStamp, reStampWithMap
     , Element, RgaNode
@@ -26,8 +27,9 @@ its structural `merge`.
 convergence correctness lives here and nowhere else.
 
 @docs Node, Register, Prim, Entry, Increment, MovNode, TreeNode
-@docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree
-@docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree
+@docs RichNode, MarkOp, MarkAnchor, AnchorSide
+@docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
+@docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
 @docs merge, maxCounter
 @docs restore, reStamp, reStampWithMap
 @docs Element, RgaNode
@@ -52,6 +54,7 @@ type Node
     | Cnt (Dict String Increment)
     | Mov MovNode
     | Tree TreeNode
+    | Rich RichNode
 
 
 {-| A movable list (reorderable sequence) of `Node` content.
@@ -64,6 +67,54 @@ type alias MovNode =
 -}
 type alias TreeNode =
     Tree Node
+
+
+{-| Rich (formatted) text: a Fugue character sequence plus an append-only set of
+**mark operations** keyed by each op's `OpId`. Marks are Peritext-style ranges
+anchored to character identities, not offsets, so they survive concurrent editing
+and are agnostic to the ordering algorithm. Merge of the mark set is a `Dict.union`
+(a semilattice, like the counter and tree move-set). The flatten-to-spans read model
+and cover logic live in `Crdt.RichText`.
+-}
+type alias RichNode =
+    { text : RgaNode
+    , marks : Dict String MarkOp
+    }
+
+
+{-| One mark operation: sets (or, with `value = PNull`, clears) a formatting mark of
+kind `type_` over the range `[start, end]`. `id` is the op's Lamport id and drives
+per-character last-writer-wins at read time (a later op over the same character and
+type wins). `value` is `PBool True` for a boolean mark being turned on, `PString _`
+for a value mark (link href, color), or `PNull` to clear.
+-}
+type alias MarkOp =
+    { id : OpId
+    , type_ : String
+    , value : Prim
+    , start : MarkAnchor
+    , end : MarkAnchor
+    }
+
+
+{-| A mark range endpoint: a character `ref` (or `Nothing` = the very start/end of
+the text) plus a `side` saying whether the boundary sits before or after that
+character. The side controls **boundary expansion** — a start anchored `Before` S
+and an end anchored `After` E make the mark grow as you type inside it (bold/italic),
+whereas a non-expanding right edge (end `Before` the following char) does not
+(`code`, `link`).
+-}
+type alias MarkAnchor =
+    { ref : Maybe OpId
+    , side : AnchorSide
+    }
+
+
+{-| Which side of its `ref` character a `MarkAnchor` binds to.
+-}
+type AnchorSide
+    = Before
+    | After
 
 
 {-| One contribution to a counter: a signed `delta` tagged with the `OpId` of the
@@ -186,6 +237,13 @@ tree =
     Tree
 
 
+{-| A rich-text node.
+-}
+rich : RichNode -> Node
+rich =
+    Rich
+
+
 
 -- ACCESSORS ------------------------------------------------------------------
 
@@ -276,6 +334,18 @@ asTree node =
             Nothing
 
 
+{-| Extract the rich-text node, if this is one.
+-}
+asRich : Node -> Maybe RichNode
+asRich node =
+    case node of
+        Rich r ->
+            Just r
+
+        _ ->
+            Nothing
+
+
 {-| The counter's current value: the sum of all its contributions. `Nothing` if
 this node isn't a counter.
 -}
@@ -331,6 +401,22 @@ merge a b =
 
         ( Tree ta, Tree tb ) ->
             Tree (Tree.merge merge ta tb)
+
+        ( Rich ra, Rich rb ) ->
+            -- text merges as the char RGA; marks are an append-only set unioned by
+            -- op id (each mark op is unique, so a shared key carries an identical
+            -- op; the merge fn only guards corrupt/adversarial input).
+            Rich
+                { text = Rga.merge merge ra.text rb.text
+                , marks =
+                    Dict.merge
+                        Dict.insert
+                        (\k x y -> Dict.insert k (mergeMarkOp x y))
+                        Dict.insert
+                        ra.marks
+                        rb.marks
+                        Dict.empty
+                }
 
         _ ->
             -- constructor mismatch: deterministic, order-independent tiebreak.
@@ -633,6 +719,50 @@ reStampWithMap ctx node =
         Tree t ->
             reStampTree ctx t
 
+        Rich r ->
+            -- re-stamp the char sequence (getting old→new id map), then rebuild the
+            -- marks with fresh op ids and anchor refs remapped through that map, so
+            -- a revived mark still covers the revived characters.
+            let
+                ( newText, ctx1, textRemap ) =
+                    reStampRga ctx Txt r.text
+
+                remapAnchor a =
+                    { a | ref = Maybe.map (remapId textRemap) a.ref }
+
+                ( newMarks, ctx2 ) =
+                    Dict.foldl
+                        (\_ m ( acc, c ) ->
+                            let
+                                ( newId, c1 ) =
+                                    Id.nextId c
+
+                                m1 =
+                                    { m | id = newId, start = remapAnchor m.start, end = remapAnchor m.end }
+                            in
+                            ( Dict.insert (Id.opIdToString newId) m1 acc, c1 )
+                        )
+                        ( Dict.empty, ctx1 )
+                        r.marks
+
+                textNode =
+                    case newText of
+                        Txt t ->
+                            t
+
+                        _ ->
+                            Rga.empty
+            in
+            ( Rich { text = textNode, marks = newMarks }, ctx2, textRemap )
+
+
+{-| Resolve an id through a remap table (used when re-stamping mark anchors).
+Falls back to the original id if it isn't in the map.
+-}
+remapId : Dict String OpId -> OpId -> OpId
+remapId table id =
+    Dict.get (Id.opIdToString id) table |> Maybe.withDefault id
+
 
 {-| Union of two id-remap maps (later overrides on key clash; keys are globally
 fresh so clashes don't occur in practice).
@@ -788,6 +918,27 @@ mergeIncrement a b =
         b
 
 
+{-| Combine two mark ops sharing an id. They mint from one op so are normally
+identical; this only guards corrupt/adversarial input, resolving deterministically
+(by `type_`, then value) so merge stays order-independent.
+-}
+mergeMarkOp : MarkOp -> MarkOp -> MarkOp
+mergeMarkOp a b =
+    case compare a.type_ b.type_ of
+        LT ->
+            b
+
+        GT ->
+            a
+
+        EQ ->
+            if comparePrim a.value b.value == LT then
+                b
+
+            else
+                a
+
+
 rank : Node -> Int
 rank node =
     case node of
@@ -811,6 +962,9 @@ rank node =
 
         Tree _ ->
             6
+
+        Rich _ ->
+            7
 
 
 
@@ -903,6 +1057,26 @@ maxCounter node =
 
         Tree t ->
             Tree.maxCounter maxCounter t
+
+        Rich r ->
+            max (rgaMaxCounter r.text) (marksMaxCounter r.marks)
+
+
+{-| Largest counter referenced by a mark set — each op's own id plus its anchor
+`ref`s (which point at char ids that may themselves be higher than the op id).
+-}
+marksMaxCounter : Dict String MarkOp -> Int
+marksMaxCounter marks =
+    Dict.foldl
+        (\_ m acc ->
+            let
+                anchorMax a =
+                    a.ref |> Maybe.map Id.opIdCounter |> Maybe.withDefault 0
+            in
+            List.foldl max acc [ Id.opIdCounter m.id, anchorMax m.start, anchorMax m.end ]
+        )
+        0
+        marks
 
 
 rgaMaxCounter : RgaNode -> Int

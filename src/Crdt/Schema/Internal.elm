@@ -1,8 +1,8 @@
 module Crdt.Schema.Internal exposing
     ( Crdt, Error(..), Seed
-    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
+    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
     , int, float, string, bool, text, counter, lww
-    , list, movableList, dict, tree
+    , list, movableList, dict, tree, richText
     , record, field, build, RecordBuilder
     , CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, buildCustom
     , variantArgKey
@@ -25,9 +25,9 @@ state — that is the hard diff problem. All in-place mutation goes through
 `Crdt.Edit`, which is decoupled from this layer.
 
 @docs Crdt, Error, Seed
-@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
+@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
 @docs int, float, string, bool, text, counter, lww
-@docs list, movableList, dict, tree
+@docs list, movableList, dict, tree, richText
 @docs record, field, build, RecordBuilder
 @docs CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, buildCustom
 @docs variantArgKey
@@ -40,6 +40,7 @@ import Crdt.Internal as I
 import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
+import Crdt.RichText as RichText exposing (Span)
 import Crdt.Text as Text
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
@@ -122,6 +123,12 @@ add/move/remove of nodes + per-node payload refs.
 -}
 type TreeK ek a
     = TreeK Never
+
+
+{-| Kind marker: rich (formatted) text; supports text edits + `mark`/`unmark`.
+-}
+type RichK
+    = RichK Never
 
 
 {-| What can go wrong reading a `Node` through a schema.
@@ -345,6 +352,32 @@ text =
                         Text.fromString ctx value
                 in
                 ( Node.txt rga, ctx1 )
+        }
+
+
+{-| Collaborative **rich** (formatted) text, read as a list of `Span`s (maximal runs
+sharing formatting). Backed by a Fugue character sequence plus a Peritext mark set;
+edited by text insert/delete plus `mark`/`unmark` (see `Crdt.Ref`).
+-}
+richText : Crdt RichK (List Span)
+richText =
+    Crdt
+        { decode =
+            \node ->
+                case Node.asRich node of
+                    Just r ->
+                        Ok (RichText.toSpans r)
+
+                    Nothing ->
+                        Err (TypeMismatch "expected rich text")
+        , empty = \ctx -> ( Node.rich RichText.empty, ctx )
+        , seed =
+            \spans ctx ->
+                let
+                    ( r, ctx1 ) =
+                        RichText.fromSpans ctx spans
+                in
+                ( Node.rich r, ctx1 )
         }
 
 

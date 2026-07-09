@@ -1,8 +1,8 @@
 module Crdt.Schema exposing
     ( Crdt, Error, Seed
-    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
+    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
     , int, float, string, bool, text, counter, lww
-    , list, movableList, dict, tree
+    , list, movableList, dict, tree, richText
     , with, decodeNode, emptyNode, errorToString
     )
 
@@ -24,15 +24,16 @@ records how the value may be edited, so `Crdt.Ref` can reject nonsensical edits 
 compile time; it never affects reads or merge.
 
 @docs Crdt, Error, Seed
-@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
+@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
 @docs int, float, string, bool, text, counter, lww
-@docs list, movableList, dict, tree
+@docs list, movableList, dict, tree, richText
 @docs with, decodeNode, emptyNode, errorToString
 
 -}
 
 import Crdt.Id exposing (Ctx)
 import Crdt.Node exposing (Node)
+import Crdt.RichText as RichText
 import Crdt.Schema.Internal as I
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
@@ -110,6 +111,12 @@ type alias DictK vk a =
 -}
 type alias TreeK ek a =
     I.TreeK ek a
+
+
+{-| Kind marker: rich (formatted) text; supports text edits + `mark`/`unmark`.
+-}
+type alias RichK =
+    I.RichK
 
 
 {-| An integer LWW register.
@@ -190,6 +197,15 @@ Reads as a `Crdt.Tree.Forest a`; edit through `Crdt.Ref`.
 tree : Crdt ek a -> Crdt (TreeK ek a) (Tree.Forest a)
 tree =
     I.tree
+
+
+{-| Collaborative **rich (formatted) text**: a character sequence plus Peritext
+marks. Reads as a list of `Crdt.RichText.Span`s; edit through `Crdt.Ref` (text edits
+plus `mark`/`unmark`).
+-}
+richText : Crdt RichK (List RichText.Span)
+richText =
+    I.richText
 
 
 {-| Seed a node from a value, producing an opaque `Seed` the edit APIs consume.

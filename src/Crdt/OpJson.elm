@@ -133,6 +133,17 @@ encodeAction action =
                   )
                 ]
 
+        AddMark { container, markId, type_, value, start, end } ->
+            JE.object
+                [ ( "k", JE.string "mark" )
+                , ( "t", encodeTarget container )
+                , ( "m", Json.encodeOpId markId )
+                , ( "ty", JE.string type_ )
+                , ( "v", Json.encodePrim value )
+                , ( "st", Json.encodeMarkAnchor start )
+                , ( "en", Json.encodeMarkAnchor end )
+                ]
+
 
 encodeTarget : List TargetStep -> JE.Value
 encodeTarget =
@@ -214,6 +225,15 @@ actionDecoder =
                             (JD.field "p" (JD.nullable Json.opIdDecoder))
                             (JD.field "pos" (JD.list JD.int))
                             (JD.field "s" (JD.nullable Json.nodeDecoder))
+
+                    "mark" ->
+                        JD.map6 (\t m ty v st en -> AddMark { container = t, markId = m, type_ = ty, value = v, start = st, end = en })
+                            (JD.field "t" targetDecoder)
+                            (JD.field "m" Json.opIdDecoder)
+                            (JD.field "ty" JD.string)
+                            (JD.field "v" Json.primDecoder)
+                            (JD.field "st" Json.markAnchorDecoder)
+                            (JD.field "en" Json.markAnchorDecoder)
 
                     other ->
                         JD.fail ("unknown action kind: " ++ other)

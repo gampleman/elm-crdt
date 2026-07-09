@@ -14,6 +14,7 @@ module Crdt.OpDoc exposing
     , encode, encodeSince, decodeInto
     , seedNodeAt, subValue
     , treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
+    , setRichText, mark, clearMark
     )
 
 {-| An op-log-backed document: the public surface over `Crdt.OpLog`.
@@ -44,6 +45,7 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs encode, encodeSince, decodeInto
 @docs seedNodeAt, subValue
 @docs treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
+@docs setRichText, mark, clearMark
 
 -}
 
@@ -59,6 +61,7 @@ import Crdt.OpJson as OpJson
 import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, Target, TargetStep(..))
 import Crdt.Path as Path exposing (Path, Seg(..))
 import Crdt.Rga as Rga
+import Crdt.RichText as RichText
 import Crdt.Schema as Schema exposing (Crdt)
 import Crdt.Tree as Tree
 import Dict
@@ -155,6 +158,7 @@ type RevAction
     = Rev Action
     | ReInsert { container : List TargetStep, elemId : OpId, afterValue : Maybe OpId, content : Node }
     | ReGraft { container : List TargetStep, parent : Maybe OpId, rootId : OpId, source : Tree.Tree Node }
+    | ReMark { container : List TargetStep, type_ : String, value : Prim, start : Node.MarkAnchor, end : Node.MarkAnchor }
 
 
 {-| A named point in history: a label, the replica that saved it, and the
@@ -1184,6 +1188,24 @@ inverseOf theOp preState =
                         Nothing ->
                             []
 
+        AddMark { container, type_, start, end } ->
+            -- undo a mark by re-asserting, as a fresh (higher-id) op over the same
+            -- range, the value that range had *before* this op — sampled from the
+            -- pre-state (see RichText.valueInRange for the uniform-range caveat).
+            case navigateTarget container preState |> Maybe.andThen Node.asRich of
+                Just r ->
+                    [ ReMark
+                        { container = container
+                        , type_ = type_
+                        , value = RichText.valueInRange r type_ start end
+                        , start = start
+                        , end = end
+                        }
+                    ]
+
+                Nothing ->
+                    []
+
 
 {-| Apply reverse actions as fresh ops (each syncs). Ids named by the inverse ops
 are resolved through (and revivals recorded into) the doc's `idRemap` table, so a
@@ -1227,6 +1249,33 @@ applyRev rev doc =
                     remapOf doc
             in
             reviveNode (remapTarget remap container) (Maybe.map (remapId remap) parent) rootId source doc
+
+        ReMark { container, type_, value, start, end } ->
+            let
+                remap =
+                    remapOf doc
+            in
+            emitMark (remapTarget remap container) type_ value (remapAnchor remap start) (remapAnchor remap end) doc
+
+
+{-| Emit an `AddMark` op (the op id doubles as the mark id) over `[start, end]`.
+-}
+emitMark : List TargetStep -> String -> Prim -> Node.MarkAnchor -> Node.MarkAnchor -> OpDoc a -> OpDoc a
+emitMark container type_ value start end doc =
+    let
+        ( markId, doc1 ) =
+            mint doc
+    in
+    commit
+        [ op markId (frontierOf doc1) (AddMark { container = container, markId = markId, type_ = type_, value = value, start = start, end = end }) ]
+        doc1
+
+
+{-| Remap a mark anchor's `ref` through the undo id-remap table.
+-}
+remapAnchor : Dict.Dict String OpId -> Node.MarkAnchor -> Node.MarkAnchor
+remapAnchor table anchor =
+    { anchor | ref = Maybe.map (remapId table) anchor.ref }
 
 
 {-| The doc's current id-remap table.
@@ -1303,6 +1352,14 @@ remapAction table action =
 
         TreeMove r ->
             TreeMove { r | container = remapTarget table r.container, child = remapId table r.child, parent = Maybe.map (remapId table) r.parent }
+
+        AddMark r ->
+            AddMark
+                { r
+                    | container = remapTarget table r.container
+                    , start = remapAnchor table r.start
+                    , end = remapAnchor table r.end
+                }
 
 
 {-| The element to anchor _after_ to put `elem` back where it was: the id of its
@@ -1557,7 +1614,15 @@ seqRga node =
             Just rga
 
         Nothing ->
-            Node.asTxt node
+            case Node.asTxt node of
+                Just rga ->
+                    Just rga
+
+                Nothing ->
+                    -- rich text is a character RGA (its `.text`) plus marks; the
+                    -- ordered-sequence helpers (undo re-insert, cursors) operate on
+                    -- that sequence, so expose it here too.
+                    Node.asRich node |> Maybe.map .text
 
 
 {-| The visible element/value ids of an ordered node — `Seq`/`Txt` (RGA) **or**
@@ -1775,6 +1840,83 @@ setText path value doc =
 
                     _ ->
                         Err (WrongNodeType "expected text node for setText")
+            )
+
+
+{-| Edit the character content of a **rich-text** field so its plain text reads as
+`value` (a minimal insert/delete diff, like `setText`). Marks are untouched; because
+they anchor to surviving characters, formatting follows the edited text.
+-}
+setRichText : Path -> String -> OpDoc a -> Result Error (OpDoc a)
+setRichText path value doc =
+    resolve path doc
+        |> Result.andThen
+            (\( target, node ) ->
+                case node of
+                    Node.Rich r ->
+                        Ok (applyTextDiff target r.text value doc)
+
+                    _ ->
+                        Err (WrongNodeType "expected rich-text node for setRichText")
+            )
+
+
+{-| Apply a formatting mark of kind `type_` (value `PBool True` for a boolean mark,
+`PString _` for a value mark like a link) over the **visible character range**
+`[from, to)` of a rich-text field. The range is resolved to character identities, so
+the mark is stable under concurrent edits.
+-}
+mark : Path -> Int -> Int -> String -> Prim -> OpDoc a -> Result Error (OpDoc a)
+mark path from to type_ value doc =
+    markRange path from to type_ value doc
+
+
+{-| Clear mark `type_` over the visible range `[from, to)` (an `AddMark` with value
+`PNull`, which competes by LWW with any covering set-op).
+-}
+clearMark : Path -> Int -> Int -> String -> OpDoc a -> Result Error (OpDoc a)
+clearMark path from to type_ doc =
+    markRange path from to type_ PNull doc
+
+
+markRange : Path -> Int -> Int -> String -> Prim -> OpDoc a -> Result Error (OpDoc a)
+markRange path from to type_ value doc =
+    resolve path doc
+        |> Result.andThen
+            (\( target, node ) ->
+                case node of
+                    Node.Rich r ->
+                        let
+                            ids =
+                                Rga.visibleIds r.text |> Array.fromList
+
+                            -- start anchor: before the first char in range; end
+                            -- anchor: after the last char in range. `Nothing` refs
+                            -- fall to text start/end when the range hits an edge.
+                            startAnchor =
+                                case Array.get from ids of
+                                    Just cid ->
+                                        { ref = Just cid, side = Node.Before }
+
+                                    Nothing ->
+                                        { ref = Nothing, side = Node.Before }
+
+                            endAnchor =
+                                case Array.get (to - 1) ids of
+                                    Just cid ->
+                                        { ref = Just cid, side = Node.After }
+
+                                    Nothing ->
+                                        { ref = Nothing, side = Node.After }
+                        in
+                        if from >= to then
+                            Ok doc
+
+                        else
+                            Ok (emitMark target type_ value startAnchor endAnchor doc)
+
+                    _ ->
+                        Err (WrongNodeType "expected rich-text node for mark")
             )
 
 

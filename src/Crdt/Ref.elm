@@ -2,6 +2,7 @@ module Crdt.Ref exposing
     ( Ref
     , at, variantPayload, index, key
     , set, over, increment, switch
+    , setRich, mark, unmark
     , append, remove, move
     , setKey, removeKey
     , treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
@@ -37,6 +38,7 @@ existing op-log runtime — no new merge semantics.
 @docs Ref
 @docs at, variantPayload, index, key
 @docs set, over, increment, switch
+@docs setRich, mark, unmark
 @docs append, remove, move
 @docs setKey, removeKey
 @docs treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
@@ -48,8 +50,10 @@ existing op-log runtime — no new merge semantics.
 
 import Crdt.Cursor exposing (Cursor)
 import Crdt.Id as Id
+import Crdt.Node as Node
 import Crdt.OpDoc as OpDoc exposing (Error, OpDoc)
 import Crdt.Path as Path exposing (Path)
+import Crdt.RichText as RichText exposing (MarkValue, Span)
 import Crdt.Schema as S exposing (Crdt)
 import Crdt.Schema.Internal as SI
 
@@ -194,6 +198,42 @@ within the currently-active variant instead.
 switch : Ref r (S.Variants v) v -> v -> OpDoc doc -> Result Error (OpDoc doc)
 switch (Ref r) value doc =
     OpDoc.seedNodeAt r.path (S.with value r.schema) doc
+
+
+{-| Replace the character content of a **rich-text** ref (a minimal text diff, like
+`set` on plain text). Marks are preserved and follow the surviving characters. Only
+compiles for a `RichK` ref.
+-}
+setRich : Ref r S.RichK (List Span) -> String -> OpDoc doc -> Result Error (OpDoc doc)
+setRich (Ref r) value doc =
+    OpDoc.setRichText r.path value doc
+
+
+{-| Apply a formatting mark of kind `type_` (e.g. `"bold"`, `"link"`) with `value`
+over the visible character range `[from, to)` of a rich-text ref. Use
+`RichText.Flag` for boolean marks (bold/italic/…) and `RichText.Value href` for value
+marks (link/color). Only compiles for a `RichK` ref.
+-}
+mark : Ref r S.RichK (List Span) -> Int -> Int -> String -> MarkValue -> OpDoc doc -> Result Error (OpDoc doc)
+mark (Ref r) from to type_ value doc =
+    OpDoc.mark r.path from to type_ (markPrim value) doc
+
+
+{-| Clear mark `type_` over the visible range `[from, to)` of a rich-text ref.
+-}
+unmark : Ref r S.RichK (List Span) -> Int -> Int -> String -> OpDoc doc -> Result Error (OpDoc doc)
+unmark (Ref r) from to type_ doc =
+    OpDoc.clearMark r.path from to type_ doc
+
+
+markPrim : MarkValue -> Node.Prim
+markPrim value =
+    case value of
+        RichText.Flag ->
+            Node.PBool True
+
+        RichText.Value s ->
+            Node.PString s
 
 
 {-| The underlying path of a ref (used internally).

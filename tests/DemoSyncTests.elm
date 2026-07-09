@@ -9,8 +9,10 @@ schema and the Path edit API; this pins the real thing.
 import Crdt.Id as Id
 import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Ref as Ref exposing (Ref)
+import Crdt.RichText as RichText exposing (MarkValue(..), Span)
 import Crdt.Schema as S
 import Crdt.Tree as Tree
+import Dict exposing (Dict)
 import Expect
 import Test exposing (Test, describe, test)
 
@@ -30,7 +32,13 @@ type alias OutlineNode =
 
 
 type alias Board =
-    { title : String, status : Status, todos : List Todo, outline : Tree.Forest OutlineNode }
+    { title : String
+    , status : Status
+    , todos : List Todo
+    , outline : Tree.Forest OutlineNode
+    , files : Dict String (List Span)
+    , likes : Int
+    }
 
 
 type alias StatusRefs =
@@ -86,6 +94,8 @@ type alias BoardRefs =
     , status : Ref Board (S.Variants Status) Status
     , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
     , outline : Ref Board (S.TreeK S.Nested OutlineNode) (Tree.Forest OutlineNode)
+    , files : Ref Board (S.DictK S.RichK (List Span)) (Dict String (List Span))
+    , likes : Ref Board S.Counter Int
     }
 
 
@@ -96,6 +106,8 @@ boardDoc =
         |> Ref.field "status" .status statusDoc.schema
         |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
         |> Ref.field "outline" .outline (S.tree outlineDoc.schema)
+        |> Ref.field "files" .files (S.dict S.richText)
+        |> Ref.field "likes" .likes S.counter
         |> Ref.build
 
 
@@ -195,4 +207,43 @@ suite =
                 OpDoc.read bob
                     |> Result.map (.outline >> List.map (Tree.itemValue >> .text))
                     |> Expect.equal (Ok [ "root" ])
+        , test "a file's rich-text edit + mark delta reaches a peer (the demo's editor path)" <|
+            \_ ->
+                let
+                    before =
+                        OpDoc.version (init "alice")
+
+                    file =
+                        refs.files |> Ref.key "notes.md" S.richText
+
+                    -- create a file, type text, then bold a range — the demo's intents
+                    alice =
+                        init "alice"
+                            |> (\d -> Ref.setKey S.richText "notes.md" [] refs.files d |> ok d)
+                            |> (\d -> Ref.setRich file "hello" d |> ok d)
+                            |> (\d -> Ref.mark file 0 3 "bold" Flag d |> ok d)
+
+                    bob =
+                        deltaSync before alice (init "bob")
+                in
+                OpDoc.read bob
+                    |> Result.toMaybe
+                    |> Maybe.andThen (\b -> Dict.get "notes.md" b.files)
+                    |> Maybe.map (List.map (\s -> ( s.text, Dict.keys s.marks )))
+                    |> Expect.equal (Just [ ( "hel", [ "bold" ] ), ( "lo", [] ) ])
+        , test "a likes-counter increment delta reaches a peer" <|
+            \_ ->
+                let
+                    before =
+                        OpDoc.version (init "alice")
+
+                    alice =
+                        init "alice"
+                            |> (\d -> Ref.increment refs.likes 1 d |> ok d)
+                            |> (\d -> Ref.increment refs.likes 1 d |> ok d)
+
+                    bob =
+                        deltaSync before alice (init "bob")
+                in
+                OpDoc.read bob |> Result.map .likes |> Expect.equal (Ok 2)
         ]

@@ -201,6 +201,12 @@ collectOpIds node =
             (Tree.moves t |> Dict.values |> List.map .moveOp)
                 ++ (Tree.payloads t |> Dict.values |> List.concatMap collectOpIds)
 
+        Node.Rich r ->
+            -- character element ids + each mark op's id (anchor refs point at char
+            -- ids already counted, so they're not double-counted here).
+            collectRgaOpIds r.text
+                ++ (Dict.values r.marks |> List.map .id)
+
 
 collectRgaOpIds : Node.RgaNode -> List OpId
 collectRgaOpIds rga =

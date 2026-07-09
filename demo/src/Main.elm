@@ -1,14 +1,19 @@
 module Main exposing (main)
 
-{-| Collaborative todo + notes demo for `gampleman/elm-crdt`.
+{-| Collaborative workspace demo for `gampleman/elm-crdt`, organized into four tabs:
+**Todos** (movable list), **Files** (a dict of rich-text docs edited in TipTap),
+**Outline** (movable tree), and **Settings** (title + status sum-type + likes
+counter). The active tab is local view state but is broadcast on the presence
+channel, so peers can see where everyone is.
 
 Runs on the **op-log** core (`Crdt.OpDoc`): the document is an operation log,
 edits emit ops, sync ships ops over a WebSocket, and history is collaborative
 time-travel over the op DAG (`OpDoc.version` / `OpDoc.readAt`).
 
-It exercises the full JSON-like schema (record + list + dict + text + LWW), real
-WebSocket networking, live **presence** (who's here, their cursor), and
-**collaborative history** (named checkpoints + time-travel preview).
+It exercises the full JSON-like schema (record + movable list + dict + text + rich
+text + tree + sum type + counter + LWW), real WebSocket networking, live
+**presence** (who's here, their tab + cursor), and **collaborative history** (named
+checkpoints + time-travel preview).
 
 -}
 
@@ -18,11 +23,13 @@ import Crdt.Id exposing (OpId, ReplicaId)
 import Crdt.OpDoc as OpDoc exposing (Checkpoint, OpDoc, Version)
 import Crdt.Presence as Presence exposing (Presence)
 import Crdt.Ref as Ref exposing (Ref)
+import Crdt.RichText as RichText exposing (Span)
 import Crdt.Schema as S exposing (Crdt)
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
 import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
 import Html.Attributes as A exposing (class, placeholder, value)
+import Html.Keyed
 import Html.Events exposing (on, onBlur, onClick, onFocus, onInput, preventDefaultOn)
 import Json.Decode as JD
 import Json.Encode as JE
@@ -40,8 +47,9 @@ type alias Board =
     { title : String
     , status : Status
     , todos : List Todo
-    , notes : Dict String String
+    , files : Dict String (List Span)
     , outline : Tree.Forest Node
+    , likes : Int
     }
 
 
@@ -78,8 +86,9 @@ type alias BoardRefs =
     { title : Ref Board S.Settable String
     , status : Ref Board (S.Variants Status) Status
     , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
-    , notes : Ref Board (S.DictK S.Settable String) (Dict String String)
+    , files : Ref Board (S.DictK S.RichK (List Span)) (Dict String (List Span))
     , outline : Ref Board (S.TreeK S.Nested Node) (Tree.Forest Node)
+    , likes : Ref Board S.Counter Int
     }
 
 
@@ -89,8 +98,9 @@ boardDoc =
         |> Ref.field "title" .title S.text
         |> Ref.field "status" .status statusDoc.schema
         |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
-        |> Ref.field "notes" .notes (S.dict S.text)
+        |> Ref.field "files" .files (S.dict S.richText)
         |> Ref.field "outline" .outline (S.tree nodeDoc.schema)
+        |> Ref.field "likes" .likes S.counter
         |> Ref.build
 
 
@@ -179,11 +189,14 @@ outlineTextRef id =
 
 
 {-| Per-peer ephemeral state. Never merged into the document — it lives on the
-separate presence channel and expires when a peer goes quiet.
+separate presence channel and expires when a peer goes quiet. `tab` is the tab the
+peer is currently viewing (shared awareness, so the peer list can show who is where);
+which tab *you* see is still your own local choice, it's just also broadcast.
 -}
 type alias Peer =
     { name : String
     , color : String
+    , tab : String -- the tab this peer is viewing (see `tabId`)
     , editing : Maybe String -- which field this peer is focused on
     , caret : Maybe Cursor -- stable text caret, if editing a text field
     }
@@ -194,6 +207,7 @@ peerCodec =
     Presence.codec Peer
         |> Presence.field "name" .name Presence.string
         |> Presence.field "color" .color Presence.string
+        |> Presence.field "tab" .tab Presence.string
         |> Presence.optional "editing" .editing Presence.string
         |> Presence.optional "caret" .caret (Presence.custom Cursor.encode Cursor.decoder)
         |> Presence.buildCodec
@@ -210,11 +224,12 @@ todoDoneRef i =
     refs.todos |> Ref.index i todoDoc.schema |> Ref.at todoDoc.refs.done
 
 
-{-| A text ref into note `k`'s value.
+{-| A rich-text ref into file `k`'s contents (a dict of rich text). Drives the
+TipTap editor and mark commands for the open file.
 -}
-noteRef : String -> Ref Board S.Settable String
-noteRef k =
-    refs.notes |> Ref.key k S.text
+fileRef : String -> Ref Board S.RichK (List Span)
+fileRef k =
+    refs.files |> Ref.key k S.richText
 
 
 
@@ -235,9 +250,9 @@ todoField i =
     "todo:" ++ String.fromInt i
 
 
-noteField : String -> String
-noteField k =
-    "note:" ++ k
+fileField : String -> String
+fileField k =
+    "file:" ++ k
 
 
 outlineField : OpId -> String
@@ -255,9 +270,18 @@ type alias Model =
     , presence : Presence Peer
     , peers : Presence Peer -- merged view of everyone (incl. self)
 
+    -- which tab is showing. This is the viewer's own choice (local view state — all
+    -- tabs' documents keep converging behind whichever is hidden), but it is also
+    -- broadcast on the presence channel so peers can see where everyone is.
+    , tab : Tab
+
+    -- Files tab: which file is open in the editor (local view state — a stored
+    -- selection, not part of the doc). `Nothing` = no file open.
+    , selectedFile : Maybe String
+
     -- transient form state
     , newTodo : String
-    , newNoteKey : String
+    , newFileName : String
 
     -- drag-and-drop reorder: the visible index of the todo currently being
     -- dragged (local, ephemeral — never replicated)
@@ -282,6 +306,56 @@ type alias Model =
     }
 
 
+{-| The demo surfaces, selected by tabs. Which tab *you* see is your own choice, but
+it is also broadcast on the presence channel so peers can see where everyone is.
+-}
+type Tab
+    = TodosTab
+    | FilesTab
+    | OutlineTab
+    | SettingsTab
+
+
+allTabs : List Tab
+allTabs =
+    [ TodosTab, FilesTab, OutlineTab, SettingsTab ]
+
+
+{-| A stable id for a tab, used both as the presence payload and to render peers'
+locations. Paired with `tabFromId` for decoding presence.
+-}
+tabId : Tab -> String
+tabId tab =
+    case tab of
+        TodosTab ->
+            "todos"
+
+        FilesTab ->
+            "files"
+
+        OutlineTab ->
+            "outline"
+
+        SettingsTab ->
+            "settings"
+
+
+tabLabel : Tab -> String
+tabLabel tab =
+    case tab of
+        TodosTab ->
+            "Todos"
+
+        FilesTab ->
+            "Files"
+
+        OutlineTab ->
+            "Outline"
+
+        SettingsTab ->
+            "Settings"
+
+
 type alias Flags =
     { replicaId : String
     , name : String
@@ -298,7 +372,7 @@ init flags =
         presence =
             Presence.init me peerCodec
                 |> Presence.setLocal
-                    { name = flags.name, color = flags.color, editing = Nothing, caret = Nothing }
+                    { name = flags.name, color = flags.color, tab = tabId TodosTab, editing = Nothing, caret = Nothing }
 
         doc =
             OpDoc.init me schema
@@ -307,8 +381,10 @@ init flags =
       , doc = doc
       , presence = presence
       , peers = presence
+      , tab = TodosTab
+      , selectedFile = Nothing
       , newTodo = ""
-      , newNoteKey = ""
+      , newFileName = ""
       , dragging = Nothing
       , dragStartVersion = Nothing
       , editStartVersion = Nothing
@@ -342,10 +418,14 @@ type Msg
     | DragStart Int
     | DragOver Int
     | DragEnd
-      -- notes (dict)
-    | NewNoteKeyChanged String
-    | AddNote
-    | RemoveNote String
+      -- likes (counter)
+    | AddLike
+      -- files (dict of rich text)
+    | NewFileNameChanged String
+    | CreateFile
+    | OpenFile String
+    | CloseFile
+    | RemoveFile String
       -- outline (movable tree)
     | AddOutlineRoot
     | AddOutlineChild OpId
@@ -364,6 +444,10 @@ type Msg
     | RestoreHere
     | Undo
     | Redo
+      -- tabs (local view state)
+    | SwitchTab Tab
+      -- rich-text editor (ProseMirror via custom element)
+    | RichTextInput JD.Value
       -- networking
     | GotMessage JD.Value
     | ConnectionChanged Bool
@@ -484,11 +568,25 @@ update msg model =
                 Nothing ->
                     ( { model | dragging = Nothing }, Cmd.none )
 
-        NewNoteKeyChanged s ->
-            ( { model | newNoteKey = s }, Cmd.none )
+        AddLike ->
+            let
+                before =
+                    OpDoc.version model.doc
 
-        AddNote ->
-            if String.isEmpty (String.trim model.newNoteKey) then
+                doc1 =
+                    Ref.increment refs.likes 1 model.doc |> orKeep model.doc
+            in
+            recordPush before { model | doc = doc1 }
+
+        NewFileNameChanged s ->
+            ( { model | newFileName = s }, Cmd.none )
+
+        CreateFile ->
+            let
+                name =
+                    String.trim model.newFileName
+            in
+            if String.isEmpty name then
                 ( model, Cmd.none )
 
             else
@@ -496,21 +594,42 @@ update msg model =
                     before =
                         OpDoc.version model.doc
 
+                    -- seed an empty rich-text file at this key, then open it
                     doc1 =
-                        Ref.setKey S.text model.newNoteKey "" refs.notes model.doc
+                        Ref.setKey S.richText name [] refs.files model.doc
                             |> orKeep model.doc
                 in
-                recordPush before { model | doc = doc1, newNoteKey = "" }
+                recordPush before
+                    { model | doc = doc1, newFileName = "", selectedFile = Just name }
+                    |> andRenderEditor doc1
 
-        RemoveNote k ->
+        OpenFile k ->
+            -- purely local: open a file into the editor, then push its spans down
+            ( { model | selectedFile = Just k }
+            , renderEditorFor k model.doc
+            )
+
+        CloseFile ->
+            -- purely local: back to the file list
+            ( { model | selectedFile = Nothing }, Cmd.none )
+
+        RemoveFile k ->
             let
                 before =
                     OpDoc.version model.doc
 
                 doc1 =
-                    Ref.removeKey k refs.notes model.doc |> orKeep model.doc
+                    Ref.removeKey k refs.files model.doc |> orKeep model.doc
+
+                -- close the file if it was the open one
+                selected =
+                    if model.selectedFile == Just k then
+                        Nothing
+
+                    else
+                        model.selectedFile
             in
-            recordPush before { model | doc = doc1 }
+            recordPush before { model | doc = doc1, selectedFile = selected }
 
         AddOutlineRoot ->
             outlineEdit (Ref.addChild nodeDoc.schema (Node "") Nothing refs.outline) model
@@ -554,14 +673,14 @@ update msg model =
 
         Undo ->
             if OpDoc.canUndo model.doc then
-                pushDoc { model | doc = OpDoc.undo model.doc, viewing = Nothing }
+                pushDocRerendering model.doc { model | doc = OpDoc.undo model.doc, viewing = Nothing }
 
             else
                 ( model, Cmd.none )
 
         Redo ->
             if OpDoc.canRedo model.doc then
-                pushDoc { model | doc = OpDoc.redo model.doc, viewing = Nothing }
+                pushDocRerendering model.doc { model | doc = OpDoc.redo model.doc, viewing = Nothing }
 
             else
                 ( model, Cmd.none )
@@ -603,9 +722,46 @@ update msg model =
                 Just v ->
                     -- restore emits fresh winning ops, so it syncs like any edit;
                     -- leave the preview and broadcast the revert
-                    pushDoc { model | doc = OpDoc.restoreTo v model.doc, viewing = Nothing }
+                    pushDocRerendering model.doc { model | doc = OpDoc.restoreTo v model.doc, viewing = Nothing }
 
                 Nothing ->
+                    ( model, Cmd.none )
+
+        SwitchTab tab ->
+            -- flip the visible tab (the viewer's own choice) AND broadcast it as
+            -- presence so peers see where we are. If we're opening the Files tab with
+            -- a file already selected, push its spans to a freshly-mounted editor.
+            let
+                presence1 =
+                    Presence.updateLocal (\c -> { c | tab = tabId tab }) model.presence
+            in
+            ( { model | tab = tab, presence = presence1, peers = Presence.merge model.peers presence1 }
+            , Cmd.batch
+                [ broadcastPresence presence1
+                , case ( tab, model.selectedFile ) of
+                    ( FilesTab, Just k ) ->
+                        renderEditorFor k model.doc
+
+                    _ ->
+                        Cmd.none
+                ]
+            )
+
+        RichTextInput raw ->
+            case ( model.selectedFile, JD.decodeValue richTextIntentDecoder raw ) of
+                ( Just file, Ok intent ) ->
+                    let
+                        before =
+                            OpDoc.version model.doc
+
+                        doc1 =
+                            applyRichTextIntent file intent model.doc |> orKeep model.doc
+                    in
+                    -- record + broadcast, but do NOT re-render the editor: it is
+                    -- already showing this local edit (echoing would fight the caret).
+                    recordPush before { model | doc = doc1 }
+
+                _ ->
                     ( model, Cmd.none )
 
         GotMessage raw ->
@@ -616,8 +772,10 @@ update msg model =
                     -- to avoid echoing them back on our next delta.
                     case OpDoc.decodeInto incomingJson model.doc of
                         Ok doc1 ->
+                            -- a remote edit may have changed the open file; push the
+                            -- new spans to the editor so ProseMirror reconciles.
                             ( { model | doc = doc1, lastSent = OpDoc.version doc1 }
-                            , Cmd.none
+                            , renderEditorIfChanged model.selectedFile model.doc doc1
                             )
 
                         Err _ ->
@@ -758,6 +916,71 @@ pushDoc model =
     )
 
 
+{-| Like `pushDoc`, but also re-render the editor if the **open file's** contents
+changed (used by undo/redo/restore, which can rewrite the doc under the editor's
+feet). `old` is the pre-change doc for the diff.
+-}
+pushDocRerendering : OpDoc Board -> Model -> ( Model, Cmd Msg )
+pushDocRerendering old model =
+    let
+        ( m1, syncCmd ) =
+            pushDoc model
+    in
+    ( m1, Cmd.batch [ syncCmd, renderEditorIfChanged model.selectedFile old model.doc ] )
+
+
+{-| Chain an editor re-render for file `k` onto an existing `(model, cmd)` (used
+after `CreateFile`, which opens the new file).
+-}
+andRenderEditor : OpDoc Board -> ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
+andRenderEditor doc ( model, cmd ) =
+    ( model
+    , Cmd.batch
+        [ cmd
+        , case model.selectedFile of
+            Just k ->
+                renderEditorFor k doc
+
+            Nothing ->
+                Cmd.none
+        ]
+    )
+
+
+{-| Push file `k`'s current spans to the ProseMirror editor.
+-}
+renderEditorFor : String -> OpDoc Board -> Cmd Msg
+renderEditorFor k doc =
+    Ports.renderRichText (encodeSpans (fileSpans k doc))
+
+
+{-| Re-render the editor only if the **open file's** contents changed between `old`
+and `new` — avoids churning ProseMirror (and its caret) on unrelated edits.
+-}
+renderEditorIfChanged : Maybe String -> OpDoc Board -> OpDoc Board -> Cmd Msg
+renderEditorIfChanged selected old new =
+    case selected of
+        Just k ->
+            if fileSpans k old == fileSpans k new then
+                Cmd.none
+
+            else
+                renderEditorFor k new
+
+        Nothing ->
+            Cmd.none
+
+
+{-| File `k`'s current spans (empty if the file or doc read is absent).
+-}
+fileSpans : String -> OpDoc Board -> List Span
+fileSpans k doc =
+    OpDoc.read doc
+        |> Result.toMaybe
+        |> Maybe.andThen (\b -> Dict.get k b.files)
+        |> Maybe.withDefault []
+
+
 {-| Broadcast our entire op set — used for catch-up (connect / answering a
 `hello`), the one place full state is needed.
 -}
@@ -846,6 +1069,123 @@ decodeEnvelope =
                             JD.fail ("unknown envelope kind: " ++ kind)
                 )
         )
+
+
+
+-- RICH TEXT EDITOR (ProseMirror bridge) --------------------------------------
+
+
+{-| An edit intent from the ProseMirror editor. `TextIntent` carries the editor's
+whole paragraph text (Elm diffs it into minimal ops); `SetMark`/`ClearMark` carry a
+format command over a character offset range.
+
+The editor sends a mark intent's `value` as `true` for a boolean mark being set, a
+string for a value mark (link href), or `null` to clear — so set-vs-clear turns on
+whether `value` is `null`, not on its type (an earlier bug decoded a boolean set as a
+clear because `true` isn't a string).
+-}
+type RichTextIntent
+    = TextIntent String
+    | SetMark { type_ : String, value : RichText.MarkValue, from : Int, to : Int }
+    | ClearMark { type_ : String, from : Int, to : Int }
+
+
+richTextIntentDecoder : JD.Decoder RichTextIntent
+richTextIntentDecoder =
+    JD.field "tag" JD.string
+        |> JD.andThen
+            (\tag ->
+                case tag of
+                    "text" ->
+                        JD.map TextIntent (JD.field "text" JD.string)
+
+                    "mark" ->
+                        JD.map4 (\t v f to -> markIntent t v f to)
+                            (JD.field "type" JD.string)
+                            (JD.field "value" JD.value)
+                            (JD.field "from" JD.int)
+                            (JD.field "to" JD.int)
+
+                    _ ->
+                        JD.fail ("unknown rich-text intent: " ++ tag)
+            )
+
+
+{-| Build a set/clear mark intent from the decoded `value`: `null` clears; a string
+is a value mark; anything else (i.e. `true`) is a boolean flag.
+-}
+markIntent : String -> JD.Value -> Int -> Int -> RichTextIntent
+markIntent type_ rawValue from to =
+    case JD.decodeValue (JD.nullable JD.string) rawValue of
+        Ok Nothing ->
+            -- `null` → clear. (A JSON `true` also decodes here as Nothing under the
+            -- string decoder, so guard on it explicitly below.)
+            if isJsonNull rawValue then
+                ClearMark { type_ = type_, from = from, to = to }
+
+            else
+                SetMark { type_ = type_, value = RichText.Flag, from = from, to = to }
+
+        Ok (Just s) ->
+            SetMark { type_ = type_, value = RichText.Value s, from = from, to = to }
+
+        Err _ ->
+            SetMark { type_ = type_, value = RichText.Flag, from = from, to = to }
+
+
+isJsonNull : JD.Value -> Bool
+isJsonNull v =
+    JD.decodeValue (JD.null True) v == Ok True
+
+
+{-| Apply a rich-text intent to file `file` through the typed `Ref` API.
+-}
+applyRichTextIntent : String -> RichTextIntent -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+applyRichTextIntent file intent doc =
+    let
+        ref =
+            fileRef file
+    in
+    case intent of
+        TextIntent newText ->
+            Ref.setRich ref newText doc
+
+        SetMark { type_, value, from, to } ->
+            Ref.mark ref from to type_ value doc
+
+        ClearMark { type_, from, to } ->
+            Ref.unmark ref from to type_ doc
+
+
+{-| Encode spans for the editor: `{ spans: [ { text, marks: { type: value } } ] }`,
+where a boolean mark's value is `true` and a value mark's is its string.
+-}
+encodeSpans : List Span -> JE.Value
+encodeSpans spans =
+    JE.object [ ( "spans", JE.list encodeSpan spans ) ]
+
+
+encodeSpan : Span -> JE.Value
+encodeSpan span =
+    JE.object
+        [ ( "text", JE.string span.text )
+        , ( "marks"
+          , JE.object
+                (Dict.toList span.marks
+                    |> List.map (\( k, v ) -> ( k, encodeMarkValue v ))
+                )
+          )
+        ]
+
+
+encodeMarkValue : RichText.MarkValue -> JE.Value
+encodeMarkValue v =
+    case v of
+        RichText.Flag ->
+            JE.bool True
+
+        RichText.Value s ->
+            JE.string s
 
 
 
@@ -998,10 +1338,11 @@ view model =
     in
     case readShown model of
         Ok board ->
-            div [ class "app" ]
-                [ viewHeader model
+            div [ class ("app status-bg-" ++ statusSlug board.status) ]
+                [ viewHeader model board
+                , viewTabs model
                 , div [ class "columns" ]
-                    [ div [ class "board" ] [ viewBoard readOnly model board ]
+                    [ div [ class "board" ] [ viewTab readOnly model board ]
                     , div [ class "sidebar" ]
                         [ viewPresence model
                         , viewHistory model
@@ -1013,10 +1354,112 @@ view model =
             div [ class "error" ] [ text ("schema read error: " ++ S.errorToString err) ]
 
 
-viewHeader : Model -> Html Msg
-viewHeader model =
+{-| A short slug for the board status, used to tint the page background subtly.
+-}
+statusSlug : Status -> String
+statusSlug status =
+    case status of
+        Planning ->
+            "planning"
+
+        Active ->
+            "active"
+
+        Archived _ ->
+            "archived"
+
+
+statusLabel : Status -> String
+statusLabel status =
+    case status of
+        Planning ->
+            "Planning"
+
+        Active ->
+            "Active"
+
+        Archived _ ->
+            "Archived"
+
+
+{-| The active tab's content.
+-}
+viewTab : Bool -> Model -> Board -> Html Msg
+viewTab readOnly model board =
+    case model.tab of
+        TodosTab ->
+            viewTodos readOnly model board
+
+        FilesTab ->
+            viewFiles readOnly model board
+
+        OutlineTab ->
+            div []
+                [ h2 [] [ text "Outline" ]
+                , viewOutline readOnly model board.outline
+                ]
+
+        SettingsTab ->
+            viewSettings readOnly model board
+
+
+{-| The tab bar. Each tab's button also shows dots for any peers currently on that
+tab (shared awareness — see the `tab` field of `Peer`).
+-}
+viewTabs : Model -> Html Msg
+viewTabs model =
+    div [ class "tabs" ] (List.map (tabButton model) allTabs)
+
+
+tabButton : Model -> Tab -> Html Msg
+tabButton model tab =
+    button
+        [ class
+            (if model.tab == tab then
+                "tab active"
+
+             else
+                "tab"
+            )
+        , onClick (SwitchTab tab)
+        ]
+        [ text (tabLabel tab)
+        , span [ class "tab-peers" ] (peerDotsOn model tab)
+        ]
+
+
+{-| Colored dots for the _other_ peers currently viewing `tab`.
+-}
+peerDotsOn : Model -> Tab -> List (Html Msg)
+peerDotsOn model tab =
+    Presence.peers model.peers
+        |> List.filter (\( rid, _ ) -> rid /= model.me)
+        |> List.filter (\( _, p ) -> p.tab == tabId tab)
+        |> List.map
+            (\( _, p ) ->
+                span
+                    [ class "tab-peer-dot"
+                    , A.style "background" p.color
+                    , A.title (p.name ++ " is here")
+                    ]
+                    []
+            )
+
+
+viewHeader : Model -> Board -> Html Msg
+viewHeader model board =
+    let
+        titleText =
+            if String.isEmpty (String.trim board.title) then
+                "elm-crdt"
+
+            else
+                "elm-crdt — " ++ board.title
+    in
     div [ class "header" ]
-        [ h1 [] [ text "elm-crdt — collaborative board" ]
+        [ h1 [] [ text titleText ]
+        , span [ class ("status-badge status-" ++ statusSlug board.status) ]
+            [ text (statusLabel board.status) ]
         , span [ class "replica" ] [ text ("you are " ++ Crdt.Id.toString model.me) ]
         , span
             [ class
@@ -1058,14 +1501,12 @@ viewTextInput readOnly model textRef fieldId currentValue placeholderText =
         )
 
 
-viewBoard : Bool -> Model -> Board -> Html Msg
-viewBoard readOnly model board =
+{-| The Todos tab: the movable todo list + add row.
+-}
+viewTodos : Bool -> Model -> Board -> Html Msg
+viewTodos readOnly model board =
     div []
-        [ h2 [] [ text "Title" ]
-        , viewTextInput readOnly model refs.title titleField board.title "Untitled board"
-        , h2 [] [ text "Status" ]
-        , viewStatus readOnly model board.status
-        , h2 [] [ text "Todos" ]
+        [ h2 [] [ text "Todos" ]
         , ul [ class "todos" ] (List.indexedMap (viewTodo readOnly model) board.todos)
         , if readOnly then
             text ""
@@ -1081,10 +1522,25 @@ viewBoard readOnly model board =
                     []
                 , button [ onClick AddTodo ] [ text "add" ]
                 ]
-        , h2 [] [ text "Notes" ]
-        , viewNotes readOnly model board.notes
-        , h2 [] [ text "Outline" ]
-        , viewOutline readOnly model board.outline
+        ]
+
+
+{-| The Settings tab: the board title, its status (a sum type), and a likes counter.
+-}
+viewSettings : Bool -> Model -> Board -> Html Msg
+viewSettings readOnly model board =
+    div []
+        [ h2 [] [ text "Title" ]
+        , viewTextInput readOnly model refs.title titleField board.title "Untitled board"
+        , h2 [] [ text "Status" ]
+        , viewStatus readOnly model board.status
+        , h2 [] [ text "Likes" ]
+        , div [ class "likes-row" ]
+            [ button
+                [ class "like-btn", A.disabled readOnly, onClick AddLike ]
+                [ text "👍 Like" ]
+            , span [ class "likes-count" ] [ text (String.fromInt board.likes) ]
+            ]
         ]
 
 
@@ -1210,38 +1666,93 @@ viewTodo readOnly model i todo =
         ]
 
 
-viewNotes : Bool -> Model -> Dict String String -> Html Msg
-viewNotes readOnly model notes =
-    div []
-        [ ul [ class "notes" ]
-            (Dict.toList notes
-                |> List.map
-                    (\( k, v ) ->
-                        li []
-                            [ span [ class "note-key" ] [ text k ]
-                            , viewTextInput readOnly model (noteRef k) (noteField k) v ""
-                            , if readOnly then
-                                text ""
+{-| The Files tab: a dict of **rich-text** documents. It is a master/detail view —
+with no file open it shows the file list + a create row; open a file (click it) and
+it shows just that file's editor with a **back** button. Which file is open (and
+whether the list or the editor shows) is local view state (`model.selectedFile`),
+not part of the document.
+-}
+viewFiles : Bool -> Model -> Board -> Html Msg
+viewFiles readOnly model board =
+    case model.selectedFile of
+        Just k ->
+            viewFileEditor readOnly (Dict.get k board.files |> Maybe.withDefault []) k
 
-                              else
-                                button [ onClick (RemoveNote k) ] [ text "✕" ]
-                            ]
-                    )
-            )
+        Nothing ->
+            viewFileList readOnly model board
+
+
+viewFileList : Bool -> Model -> Board -> Html Msg
+viewFileList readOnly model board =
+    div [ class "files" ]
+        [ h2 [] [ text "Files" ]
+        , if Dict.isEmpty board.files then
+            div [ class "editor-empty" ] [ text "No files yet — create one below." ]
+
+          else
+            ul [ class "file-names" ]
+                (Dict.keys board.files
+                    |> List.map (viewFileRow readOnly)
+                )
         , if readOnly then
             text ""
 
           else
             div [ class "add-row" ]
                 [ input
-                    [ value model.newNoteKey
-                    , placeholder "note key…"
-                    , onInput NewNoteKeyChanged
-                    , onEnter AddNote
+                    [ value model.newFileName
+                    , placeholder "new file…"
+                    , onInput NewFileNameChanged
+                    , onEnter CreateFile
                     ]
                     []
-                , button [ onClick AddNote ] [ text "add note" ]
+                , button [ onClick CreateFile ] [ text "create" ]
                 ]
+        ]
+
+
+viewFileRow : Bool -> String -> Html Msg
+viewFileRow readOnly k =
+    li [ class "file-name" ]
+        [ span [ class "file-open", onClick (OpenFile k) ] [ text k ]
+        , if readOnly then
+            text ""
+
+          else
+            button [ class "file-remove", onClick (RemoveFile k) ] [ text "✕" ]
+        ]
+
+
+{-| The editor pane for the open file, with a back button to the list. The
+`<crdt-richtext>` element is **keyed by the file name** so switching files remounts
+a fresh editor (rather than mutating the open one), and its `docSpans` property seeds
+it with the file's spans for the first paint.
+-}
+viewFileEditor : Bool -> List Span -> String -> Html Msg
+viewFileEditor readOnly spans k =
+    Html.Keyed.node "div"
+        [ class "file-editor" ]
+        [ ( "file:" ++ k
+          , div []
+                [ div [ class "file-editor-head" ]
+                    [ button [ class "file-back", onClick CloseFile ] [ text "← Files" ]
+                    , span [ class "file-title" ] [ text k ]
+                    ]
+                , div [ class "editor-hint" ]
+                    [ text "Select text and use the toolbar or ⌘B/⌘I. Open the same file in another tab to edit together." ]
+                , Html.node "crdt-richtext"
+                    [ A.property "docSpans" (JE.list encodeSpan spans)
+                    , A.attribute "readonly"
+                        (if readOnly then
+                            "true"
+
+                         else
+                            "false"
+                        )
+                    ]
+                    []
+                ]
+          )
         ]
 
 
@@ -1342,6 +1853,7 @@ viewPresence model =
                                  else
                                     ""
                                 )
+                            , span [ class "peer-tab" ] [ text (" · " ++ tabLabelForId cursor.tab) ]
                             , case cursor.editing of
                                 Just f ->
                                     span [ class "editing" ] [ text (" editing " ++ f) ]
@@ -1352,6 +1864,17 @@ viewPresence model =
                     )
             )
         ]
+
+
+{-| Human label for a presence `tab` id (defaults gracefully on an unknown id).
+-}
+tabLabelForId : String -> String
+tabLabelForId id =
+    allTabs
+        |> List.filter (\t -> tabId t == id)
+        |> List.head
+        |> Maybe.map tabLabel
+        |> Maybe.withDefault id
 
 
 viewHistory : Model -> Html Msg
@@ -1499,6 +2022,7 @@ subscriptions _ =
     Sub.batch
         [ Ports.incoming GotMessage
         , Ports.connection ConnectionChanged
+        , Ports.richTextInput RichTextInput
         ]
 
 

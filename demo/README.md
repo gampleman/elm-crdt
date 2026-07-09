@@ -1,27 +1,38 @@
 # elm-crdt demo — collaborative board
 
-A two-replica (well, N-replica) collaborative todo + notes board built on
-`gampleman/elm-crdt`'s **op-log core** (`Crdt.OpDoc`). Each browser tab is a real,
+A two-replica (well, N-replica) collaborative workspace — todos, rich-text files,
+an outline tree, and settings — built on `gampleman/elm-crdt`'s **op-log core**
+(`Crdt.OpDoc`). Each browser tab is a real,
 independent replica: edits emit operations, tabs ship only the **new ops since
 their last broadcast** (`OpDoc.encodeSince`) over a real WebSocket through a dumb
 broadcast relay, and each client merges them. On connect, peers exchange full
 state via a `hello` handshake so joiners catch up. Convergence is guaranteed by
 the op-log on each client, not by the server.
 
-It exercises the full library surface:
+It exercises the full library surface, organized into four **tabs** (which tab
+you're on is local view state — not replicated — but it *is* broadcast on the
+presence channel, so the tab bar and "who's here" list show where each peer is):
 
-- **record** — the board (`title`, `todos`, `notes`)
-- **text** — collaborative title and per-todo/per-note text (character-wise merge)
-- **movable list** — the todo list (`S.movableList`); drag the `⠿` handle to
+- **Todos** — a **movable list** (`S.movableList`) of todos; drag the `⠿` handle to
   reorder. Moves keep each todo's identity, so nested edits and cursors follow it.
-- **dict** — free-form notes keyed by string (`S.dict`)
-- **movable tree** — the outline (`S.tree`): add/nest/re-parent nodes with the
+  Todo `done` booleans are **lww**.
+- **Files** — a **dict** (`S.dict`) of **rich-text** documents (`S.richText`):
+  create a file, click to open it, edit its contents in a **TipTap/ProseMirror**
+  editor. Formatting (bold/italic/underline/strike/code/link) is a **Peritext marks
+  CRDT** — concurrent text edits and formats converge. Open the same file in two
+  tabs to edit together.
+- **Outline** — a **movable tree** (`S.tree`): add/nest/re-parent nodes with the
   →/←/+/✕ controls. Concurrent re-parents that would form a cycle converge safely
   (Kleppmann's move algorithm), and siblings stay ordered via a fractional index.
-- **lww** — todo `done` booleans
-- **presence** — live "who's here" + which field each peer is editing, with
-  **stable cursors** (`Crdt.Cursor`) that track the right character across
-  concurrent edits.
+- **Settings** — the board **title** (**text**, character-wise merge), its
+  **status** (a **sum type**, `S.custom`), and a **likes counter** (`S.counter`;
+  concurrent `+1`s from different replicas sum rather than clobber).
+
+Cross-cutting:
+
+- **presence** — live "who's here", which **tab** each peer is on (also shown as
+  colored dots on the tab bar), and which field they're editing, with **stable
+  cursors** (`Crdt.Cursor`) that track the right character across concurrent edits.
 - **collaborative history** — named checkpoints capture a `Version` (a point in
   the shared op DAG); "preview" is true time-travel via `OpDoc.readAt`, and it
   stays meaningful across peers' concurrent edits.
@@ -41,19 +52,31 @@ npm install
 npm start
 ```
 
-`npm start` runs two things in parallel:
+`npm start` runs three things in parallel:
 
-- the **relay** (`server/relay.js`) on `ws://localhost:8080`, and
+- the **relay** (`server/relay.js`) on `ws://localhost:8080`,
 - a live-reloading **client** server on <http://localhost:8000> (via
   [`elm-live`](https://github.com/wking-io/elm-live)), which recompiles and hot-
-  reloads the app whenever you edit `src/`.
+  reloads the Elm app whenever you edit `src/`, and
+- **esbuild** in watch mode, which bundles `index.js` + the TipTap editor
+  (`editor/crdt-richtext.js`) into `bundle.js`.
 
 It opens a tab automatically — open a **second** tab at the same URL to get a
 second replica. Edit in one, watch the other converge. Toggle your network
 offline and keep editing; on reconnect the tabs re-sync and converge
 automatically.
 
-To just build the app once (no server), run `npm run build`.
+The four tabs (Todos / Files / Outline / Settings) are described above. Switching
+tabs is local view state (never in the document — a reminder that not everything in
+a local-first app is a CRDT), but it's broadcast on the presence channel so peers
+can see where you are; every tab's document keeps converging behind whichever is
+hidden. The Files editor is a **TipTap / ProseMirror** view in a `<crdt-richtext>`
+custom element: Elm owns the CRDT, the element reports edit intents up
+(`richTextInput` port) and re-renders from spans pushed down (`renderRichText` port).
+See [`../docs/10-rich-text.md`](../docs/10-rich-text.md).
+
+To just build the app once (no server), run `npm run build` (builds `elm.js` and
+`bundle.js`).
 
 ## How the pieces fit
 

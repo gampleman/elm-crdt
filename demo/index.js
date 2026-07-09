@@ -3,6 +3,9 @@
 // Each browser tab is a real, independent replica. A random replicaId/name/color
 // is generated per tab so two tabs collaborate as two distinct peers.
 
+// registers the <crdt-richtext> custom element (TipTap/ProseMirror editor)
+import "./editor/crdt-richtext.js";
+
 const RELAY_URL =
   (location.protocol === "https:" ? "wss://" : "ws://") +
   (location.hostname || "localhost") +
@@ -35,6 +38,30 @@ const app = Elm.Main.init({
   node: document.getElementById("root"),
   flags: identity,
 });
+
+// --- Rich-text editor bridge ------------------------------------------------
+//
+// Elm owns the CRDT; the <crdt-richtext> element is a ProseMirror view. We connect
+// the two ports to it:
+//   • renderRichText (Elm -> JS): set the element's `docSpans` so it reconciles.
+//   • richTextInput  (JS -> Elm): forward the element's `richtext-input` events.
+//
+// A render only needs applying if the editor is currently mounted (i.e. the editor
+// tab is showing). If it isn't, the Elm view will hand it the current spans as a
+// property the moment it mounts, so there's nothing to cache here.
+app.ports.renderRichText.subscribe((payload) => {
+  const el = document.querySelector("crdt-richtext");
+  if (el) el.docSpans = payload.spans;
+});
+
+// Edits bubble from the element as CustomEvents; forward their detail to Elm.
+document.addEventListener("richtext-input", (event) => {
+  app.ports.richTextInput.send(event.detail);
+});
+
+// Note: no mount observer is needed — the Elm view sets `docSpans` as a property on
+// the <crdt-richtext> element on every render (including the first, when the editor
+// tab mounts), so a freshly-mounted editor is always handed the current spans.
 
 let socket = null;
 let reconnectTimer = null;

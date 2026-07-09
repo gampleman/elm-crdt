@@ -1,8 +1,10 @@
 module Crdt.Json exposing
-    ( encodeNode
+    ( encodeMarkAnchor
+    , encodeNode
     , encodeOpId
     , encodePrim
     , encodeSide
+    , markAnchorDecoder
     , nodeDecoder
     , opIdDecoder
     , primDecoder
@@ -88,6 +90,51 @@ encodeNode node =
                 , ( "vals", JE.dict identity encodeNode (Tree.payloads t) )
                 , ( "del", JE.list JE.string (Set.toList (Tree.deletedIds t)) )
                 ]
+
+        Node.Rich r ->
+            JE.object
+                [ ( "t", JE.string "rich" )
+                , ( "el", JE.list encodeElement (Rga.elements r.text) )
+                , ( "marks", JE.dict identity encodeMarkOp r.marks )
+                ]
+
+
+{-| A mark op: id, type, value (a prim), and its two range anchors.
+-}
+encodeMarkOp : Node.MarkOp -> JE.Value
+encodeMarkOp m =
+    JE.object
+        [ ( "id", encodeOpId m.id )
+        , ( "ty", JE.string m.type_ )
+        , ( "v", encodePrim m.value )
+        , ( "st", encodeMarkAnchor m.start )
+        , ( "en", encodeMarkAnchor m.end )
+        ]
+
+
+encodeMarkAnchor : Node.MarkAnchor -> JE.Value
+encodeMarkAnchor a =
+    JE.object
+        [ ( "r"
+          , case a.ref of
+                Just id ->
+                    encodeOpId id
+
+                Nothing ->
+                    JE.null
+          )
+        , ( "sd", encodeAnchorSide a.side )
+        ]
+
+
+encodeAnchorSide : Node.AnchorSide -> JE.Value
+encodeAnchorSide side =
+    case side of
+        Node.Before ->
+            JE.string "b"
+
+        Node.After ->
+            JE.string "a"
 
 
 {-| A tree move record: the move op, the child, its parent (null = root), and its
@@ -268,6 +315,12 @@ nodeDecoder =
                             (JD.field "vals" (JD.dict (JD.lazy (\_ -> nodeDecoder))))
                             (JD.field "del" (JD.list JD.string))
 
+                    "rich" ->
+                        JD.map2
+                            (\els marks -> Node.rich { text = Rga.fromElements els, marks = marks })
+                            (JD.field "el" (JD.list elementDecoder))
+                            (JD.field "marks" (JD.dict markOpDecoder))
+
                     other ->
                         JD.fail ("unknown node tag: " ++ other)
             )
@@ -289,6 +342,40 @@ moveDecoder =
         (JD.field "c" opIdDecoder)
         (JD.field "p" (JD.nullable opIdDecoder))
         (JD.field "pos" (JD.list JD.int))
+
+
+markOpDecoder : Decoder Node.MarkOp
+markOpDecoder =
+    JD.map5 (\id ty v st en -> { id = id, type_ = ty, value = v, start = st, end = en })
+        (JD.field "id" opIdDecoder)
+        (JD.field "ty" JD.string)
+        (JD.field "v" primDecoder)
+        (JD.field "st" markAnchorDecoder)
+        (JD.field "en" markAnchorDecoder)
+
+
+markAnchorDecoder : Decoder Node.MarkAnchor
+markAnchorDecoder =
+    JD.map2 (\r sd -> { ref = r, side = sd })
+        (JD.field "r" (JD.nullable opIdDecoder))
+        (JD.field "sd" anchorSideDecoder)
+
+
+anchorSideDecoder : Decoder Node.AnchorSide
+anchorSideDecoder =
+    JD.string
+        |> JD.andThen
+            (\s ->
+                case s of
+                    "b" ->
+                        JD.succeed Node.Before
+
+                    "a" ->
+                        JD.succeed Node.After
+
+                    _ ->
+                        JD.fail ("unknown anchor side: " ++ s)
+            )
 
 
 entryDecoder : Decoder Entry

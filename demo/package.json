@@ -4,14 +4,28 @@
   "private": true,
   "description": "Collaborative board demo for gampleman/elm-crdt",
   "scripts": {
-    "start": "run-p start:relay start:client",
+    "start": "run-p start:relay start:elm start:js",
     "start:relay": "node server/relay.js",
-    "start:client": "elm-live src/Main.elm --port=8000 --open --hot -- --output=elm.js",
-    "build": "elm make src/Main.elm --output=elm.js"
+    "start:elm": "elm-live src/Main.elm --port=8000 --open --hot -- --output=elm.js",
+    "start:js": "esbuild index.js --bundle --outfile=bundle.js --format=iife --watch",
+    "build": "run-s build:elm build:js",
+    "build:elm": "elm make src/Main.elm --output=elm.js",
+    "build:js": "esbuild index.js --bundle --outfile=bundle.js --format=iife"
   },
   "dependencies": {
+    "@tiptap/core": "^2.11.0",
+    "@tiptap/extension-bold": "^2.11.0",
+    "@tiptap/extension-code": "^2.11.0",
+    "@tiptap/extension-document": "^2.11.0",
+    "@tiptap/extension-italic": "^2.11.0",
+    "@tiptap/extension-link": "^2.11.0",
+    "@tiptap/extension-paragraph": "^2.11.0",
+    "@tiptap/extension-strike": "^2.11.0",
+    "@tiptap/extension-text": "^2.11.0",
+    "@tiptap/extension-underline": "^2.11.0",
     "elm": "0.19.1-6",
     "elm-live": "4.0.2",
+    "esbuild": "^0.24.0",
     "npm-run-all": "4.1.5",
     "ws": "^8.18.0"
   }
