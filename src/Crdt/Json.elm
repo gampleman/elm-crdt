@@ -22,10 +22,12 @@ and floats survive the roundtrip distinctly.
 
 -}
 
+import Crdt.Frac as Frac
 import Crdt.Id as Id exposing (OpId)
 import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Element, Entry, Node, Prim(..))
 import Crdt.Rga as Rga
+import Crdt.Tree as Tree
 import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
 import Set
@@ -76,6 +78,34 @@ encodeNode node =
                 , ( "vals", JE.dict identity encodeNode (MoveList.values ml) )
                 , ( "del", JE.list JE.string (Set.toList (MoveList.deletedIds ml)) )
                 ]
+
+        Node.Tree t ->
+            JE.object
+                [ ( "t", JE.string "tree" )
+                , ( "moves", JE.dict identity encodeMove (Tree.moves t) )
+                , ( "vals", JE.dict identity encodeNode (Tree.payloads t) )
+                , ( "del", JE.list JE.string (Set.toList (Tree.deletedIds t)) )
+                ]
+
+
+{-| A tree move record: the move op, the child, its parent (null = root), and its
+fractional sibling position (a digit list).
+-}
+encodeMove : Tree.Move -> JE.Value
+encodeMove m =
+    JE.object
+        [ ( "op", encodeOpId m.moveOp )
+        , ( "c", encodeOpId m.child )
+        , ( "p"
+          , case m.parent of
+                Just p ->
+                    encodeOpId p
+
+                Nothing ->
+                    JE.null
+          )
+        , ( "pos", JE.list JE.int (Frac.toList m.pos) )
+        ]
 
 
 {-| A position cell of a movable list: its id, anchor, and the valueId it carries.
@@ -197,6 +227,15 @@ nodeDecoder =
                             (JD.field "vals" (JD.dict (JD.lazy (\_ -> nodeDecoder))))
                             (JD.field "del" (JD.list JD.string))
 
+                    "tree" ->
+                        JD.map3
+                            (\ms vs del ->
+                                Node.tree (Tree.fromParts ms vs (Set.fromList del))
+                            )
+                            (JD.field "moves" (JD.dict moveDecoder))
+                            (JD.field "vals" (JD.dict (JD.lazy (\_ -> nodeDecoder))))
+                            (JD.field "del" (JD.list JD.string))
+
                     other ->
                         JD.fail ("unknown node tag: " ++ other)
             )
@@ -208,6 +247,15 @@ cellDecoder =
         (JD.field "id" opIdDecoder)
         (JD.field "o" (JD.nullable opIdDecoder))
         (JD.field "v" opIdDecoder)
+
+
+moveDecoder : Decoder Tree.Move
+moveDecoder =
+    JD.map4 (\op c p pos -> { moveOp = op, child = c, parent = p, pos = Frac.fromList pos })
+        (JD.field "op" opIdDecoder)
+        (JD.field "c" opIdDecoder)
+        (JD.field "p" (JD.nullable opIdDecoder))
+        (JD.field "pos" (JD.list JD.int))
 
 
 entryDecoder : Decoder Entry

@@ -96,8 +96,9 @@ doc |> Ref.increment board.refs.title 1     -- ✗ compile error: title isn't a 
 | Module | Purpose |
 | --- | --- |
 | `Crdt.OpDoc` | The document: `init`/`read`/`merge`, delta sync (`encodeSince`), time-travel (`version`/`readAt`/`versionAt`), `restoreTo`, local `undo`/`redo`, `gc`, checkpoints, JSON |
-| `Crdt.Schema` | Leaf & container combinators: `text`, `counter`, `int`/`bool`/…, `list`, `movableList`, `dict` — the pieces fields and elements are made of |
-| `Crdt.Ref` | Schema-with-refs builders (`record`/`field`/`build`, `custom`/`variant0..3`/`buildCustom`) **and** the type-safe writes they enable (`set`/`over`/`increment`/`switch`/`append`/`move`/…) |
+| `Crdt.Schema` | Leaf & container combinators: `text`, `counter`, `int`/`bool`/…, `list`, `movableList`, `dict`, `tree` — the pieces fields and elements are made of |
+| `Crdt.Ref` | Schema-with-refs builders (`record`/`field`/`build`, `custom`/`variant0..3`/`buildCustom`) **and** the type-safe writes they enable (`set`/`over`/`increment`/`switch`/`append`/`move`/tree `addChild`/`moveInto`/…) |
+| `Crdt.Tree` | Movable-tree read shape (`Forest`/`Item`) — the value a `tree` schema decodes to |
 | `Crdt.Id` | Replica identifiers |
 | `Crdt.Text` | Collaborative-text helpers over the RGA |
 | `Crdt.Cursor` | Stable positions anchored to element identity (survive concurrent reorder/delete) |

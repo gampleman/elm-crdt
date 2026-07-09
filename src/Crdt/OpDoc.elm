@@ -13,6 +13,7 @@ module Crdt.OpDoc exposing
     , gc
     , encode, encodeSince, decodeInto
     , seedNodeAt, subValue
+    , treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
     )
 
 {-| An op-log-backed document: the public surface over `Crdt.OpLog`.
@@ -42,11 +43,13 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs gc
 @docs encode, encodeSince, decodeInto
 @docs seedNodeAt, subValue
+@docs treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
 
 -}
 
 import Array
 import Crdt.Cursor as Cursor exposing (Cursor)
+import Crdt.Frac exposing (Frac)
 import Crdt.Id as Id exposing (Ctx, OpId, ReplicaId)
 import Crdt.Internal as I exposing (Seed)
 import Crdt.Json as Json
@@ -57,6 +60,7 @@ import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, Target, TargetStep
 import Crdt.Path as Path exposing (Path, Seg(..))
 import Crdt.Rga as Rga
 import Crdt.Schema as Schema exposing (Crdt)
+import Crdt.Tree as Tree
 import Dict
 import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
@@ -106,33 +110,51 @@ type OpDoc a
         -- time-travel, not a local snapshot.
         , checkpoints : List Checkpoint
 
-        -- Loro-style LOCAL undo/redo. Each entry is the list of reverse actions
-        -- that inverts ONE local change — the inverses of exactly the ops that
-        -- change emitted (an insert ⇒ delete *that* element id; a `done` toggle ⇒
-        -- set it back; a counter +3 ⇒ −3). Because we invert our own ops rather
-        -- than diffing whole states, a peer's concurrent insert into the same list
-        -- is untouched, and a same-path conflict resolves by LWW (the undo, being a
-        -- fresh op, wins). The reverts are new ops, so undo/redo sync to peers.
-        --
-        -- Undo and redo each *self-record*: applying an entry emits ops, and the
-        -- opposite stack is rebuilt from the inverses of *those just-emitted* ops.
-        -- That keeps the stacks valid across cycles even though re-creating a
-        -- tombstoned element (delete is permanent) mints a fresh id each time.
+        -- Loro-style LOCAL undo/redo. Each entry brackets ONE local change with the
+        -- versions before/after it. `undo` inverts exactly the ops that change
+        -- added (recomputed fresh from the `before → after` range each time, so it
+        -- never goes stale as other undos/redos re-mint ids), emitting the inverse
+        -- as NEW ops. Because it inverts *specific* ops (delete this element, set
+        -- this register) rather than diffing whole states, a peer's concurrent edit
+        -- to the same container survives and same-path conflicts resolve by LWW
+        -- (the undo, being newer, wins). The reverts are new ops, so they sync.
         --
         -- Local and non-replicated (like checkpoints); preserved across `merge`.
-        , undoStack : List (List RevAction)
-        , redoStack : List (List RevAction)
+        , undoStack : List UndoEntry
+        , redoStack : List UndoEntry
+
+        -- Id remapping for undo/redo. Undoing a *delete* can't resurrect the
+        -- original element (tombstones are permanent) — it re-creates a FRESH copy
+        -- with a new id. A *later* inverse op that still names the original id (e.g.
+        -- undoing the earlier insert that created it) would then miss the live copy
+        -- and orphan it. This table records `originalId → revivedId` so every
+        -- subsequent inverse op is retargeted onto the copy that actually exists.
+        -- Chains resolve transitively (a copy re-revived maps through). Persistent
+        -- across undo/redo steps (the original ops it rewrites never go away), and
+        -- local like the stacks. This is Loro's UndoManager remapping.
+        , idRemap : Dict.Dict String OpId
         }
 
 
-{-| A single reverse step emitted during undo/redo. `Rev` carries an action ready
-to emit verbatim (with a fresh op id); `ReInsert` re-creates an element a delete
-removed — its id is minted at apply time (tombstones are permanent, so the revived
-element is a fresh one), positioned after `afterValue` in the live container.
+{-| One undo/redo step: the document versions immediately **before** and **after** a
+single tracked edit. Undo inverts the ops in the `before → after` range; the
+inverse is recomputed at undo time (from these frozen versions against the live
+store), so the entry stays valid no matter what other undos/redos ran in between.
+-}
+type alias UndoEntry =
+    { before : Version, after : Version }
+
+
+{-| One reverse step produced by inverting an edit's op. `Rev` is an action ready to
+emit verbatim (with a fresh op id). `ReInsert` re-creates a list/text element a
+delete removed (fresh id — tombstones are permanent). `ReGraft` re-creates a
+deleted tree node **and its whole subtree** as one atomic step, so it inverts back
+to a _single_ delete (keeping undo/redo symmetric across cycles).
 -}
 type RevAction
     = Rev Action
-    | ReInsert { container : List TargetStep, afterValue : Maybe OpId, content : Node }
+    | ReInsert { container : List TargetStep, elemId : OpId, afterValue : Maybe OpId, content : Node }
+    | ReGraft { container : List TargetStep, parent : Maybe OpId, rootId : OpId, source : Tree.Tree Node }
 
 
 {-| A named point in history: a label, the replica that saved it, and the
@@ -177,6 +199,7 @@ init replica schema =
         , baseFrontier = []
         , undoStack = []
         , redoStack = []
+        , idRemap = Dict.empty
         }
 
 
@@ -607,9 +630,149 @@ restoreNode target old current doc =
         ( Node.Mov mo, Node.Mov mc ) ->
             restoreMov target (MoveList.toEntries mo) (MoveList.toEntries mc) doc
 
+        ( Node.Tree to, Node.Tree tc ) ->
+            restoreTree target to tc doc
+
         _ ->
             -- shapes differ (shouldn't happen under a fixed schema): leave as-is
             doc
+
+
+{-| Make the tree at `target` read like `old` again, diffing against `current`:
+
+  - a node in BOTH (by id) that moved → move it back to its `old` parent/pos, and
+    recurse into its payload;
+  - a node only in `current` (added since) → delete it;
+  - a node only in `old` (deleted since) → revive it + its subtree with fresh ids
+    under its `old` parent.
+
+Id-agnostic: works off the two node maps, so it's stable no matter how many other
+undos/redos have re-minted ids around it.
+
+-}
+restoreTree : List TargetStep -> Tree.Tree Node -> Tree.Tree Node -> OpDoc a -> OpDoc a
+restoreTree target old current doc =
+    let
+        oldIds =
+            treeNodeIds old
+
+        curIds =
+            treeNodeIds current
+
+        oldKeys =
+            List.map Id.opIdToString oldIds |> Set.fromList
+
+        curKeys =
+            List.map Id.opIdToString curIds |> Set.fromList
+
+        -- 1. delete nodes that exist now but not in `old` (added since). Deleting a
+        -- parent hides its subtree, so only delete nodes whose parent is NOT itself
+        -- being deleted (avoids redundant ops).
+        toDelete =
+            curIds
+                |> List.filter (\id -> not (Set.member (Id.opIdToString id) oldKeys))
+                |> List.filter
+                    (\id ->
+                        case Tree.parentOf id current of
+                            Just p ->
+                                Set.member (Id.opIdToString p) oldKeys
+
+                            Nothing ->
+                                True
+                    )
+
+        afterDeletes =
+            List.foldl (\id d -> emit (DeleteElem { container = target, elem = id }) d) doc toDelete
+
+        -- 2. revive nodes in `old` not present now (deleted since). Only revive
+        -- subtree roots (whose parent still exists or is a root), to avoid double.
+        toRevive =
+            oldIds
+                |> List.filter (\id -> not (Set.member (Id.opIdToString id) curKeys))
+                |> List.filter
+                    (\id ->
+                        case Tree.parentOf id old of
+                            Just p ->
+                                Set.member (Id.opIdToString p) curKeys
+
+                            Nothing ->
+                                True
+                    )
+
+        afterRevives =
+            List.foldl
+                (\id d -> reviveNode target (Tree.parentOf id old) id old d)
+                afterDeletes
+                toRevive
+
+        -- 3. for nodes in BOTH: move back if reparented/reordered, recurse payload
+        shared =
+            oldIds |> List.filter (\id -> Set.member (Id.opIdToString id) curKeys)
+
+        afterMoves =
+            List.foldl (restoreTreeNode target old) afterRevives shared
+    in
+    afterMoves
+
+
+{-| For a node present in both `old` and the live doc: move it back to its `old`
+parent/pos if it differs, then restore its payload.
+-}
+restoreTreeNode : List TargetStep -> Tree.Tree Node -> OpId -> OpDoc a -> OpDoc a
+restoreTreeNode target old id doc =
+    let
+        liveTree =
+            navigateTarget target (state doc) |> Maybe.andThen Node.asTree
+
+        oldParent =
+            Tree.parentOf id old
+
+        moved =
+            case liveTree of
+                Just t ->
+                    (Tree.parentOf id t /= oldParent)
+                        || (Tree.siblingPos id t /= Tree.siblingPos id old)
+
+                Nothing ->
+                    False
+
+        afterMove =
+            if moved then
+                case Tree.siblingPos id old of
+                    Just pos ->
+                        emit (TreeMove { container = target, child = id, parent = oldParent, pos = pos, seed = Nothing }) doc
+
+                    Nothing ->
+                        doc
+
+            else
+                doc
+
+        -- restore the node's payload (recurse via the node ref path)
+        payloadTarget =
+            target ++ [ IntoElem id ]
+
+        afterPayload =
+            case ( Tree.get id old, navigateTarget payloadTarget (state afterMove) ) of
+                ( Just oldContent, Just curContent ) ->
+                    restoreNode payloadTarget oldContent curContent afterMove
+
+                _ ->
+                    afterMove
+    in
+    afterPayload
+
+
+{-| All node ids in a tree, roots-first pre-order (parents before children, so a
+revive/delete of a parent is emitted before its descendants).
+-}
+treeNodeIds : Tree.Tree c -> List OpId
+treeNodeIds t =
+    let
+        go ids =
+            ids |> List.concatMap (\id -> id :: go (Tree.childrenOf id t))
+    in
+    go (Tree.roots t)
 
 
 {-| The visible (id, content) pairs of a `Seq`/`Txt` node, in order.
@@ -815,12 +978,16 @@ A no-op change (no ops added) records nothing.
 -}
 recordEdit : Version -> OpDoc a -> OpDoc a
 recordEdit before ((OpDoc d) as doc) =
-    case inverseBetween before doc of
-        [] ->
-            doc
+    let
+        after =
+            version doc
+    in
+    if before == after then
+        -- no ops added: nothing to undo (a no-op edit)
+        doc
 
-        revs ->
-            OpDoc { d | undoStack = revs :: d.undoStack, redoStack = [] }
+    else
+        OpDoc { d | undoStack = { before = before, after = after } :: d.undoStack, redoStack = [] }
 
 
 {-| Whether there is a local edit to undo.
@@ -837,9 +1004,14 @@ canRedo (OpDoc d) =
     not (List.isEmpty d.redoStack)
 
 
-{-| Undo the most recent recorded local edit: emit the inverse ops (so the undo
-propagates to peers), and push the inverse-of-the-inverse onto the redo stack so
-`redo` can replay it. No-op when there is nothing to undo.
+{-| Undo the most recent recorded local edit: invert exactly the ops the edit added
+(between its `before` and `after` versions) and emit them as fresh ops, so the undo
+syncs to peers and only touches what the edit changed. Records the inverse range on
+the redo stack. No-op when there is nothing to undo.
+
+Robust across sequences: the inverse is recomputed from the frozen version range
+each time, so earlier undos/redos re-minting ids never invalidate this entry.
+
 -}
 undo : OpDoc a -> OpDoc a
 undo ((OpDoc d) as doc) =
@@ -847,23 +1019,28 @@ undo ((OpDoc d) as doc) =
         [] ->
             doc
 
-        revs :: rest ->
+        entry :: rest ->
             let
-                before =
+                -- the doc version *immediately before* this undo emits its ops; the
+                -- redo must invert exactly the ops this undo adds, i.e. the range
+                -- (preUndo, postUndo] — NOT (entry.after, postUndo], which would also
+                -- sweep in ops emitted by earlier undos between entry.after and now.
+                preUndo =
                     version doc
 
                 applied =
-                    applyRevs revs doc
+                    applyRevs (inverseBetween entry.before entry.after doc) doc
 
                 redoEntry =
-                    inverseBetween before applied
+                    { before = preUndo, after = version applied }
             in
             case applied of
                 OpDoc ad ->
                     OpDoc { ad | undoStack = rest, redoStack = redoEntry :: ad.redoStack }
 
 
-{-| Redo the most recently undone edit. Symmetric to `undo`.
+{-| Redo the most recently undone edit: symmetric to `undo` — invert the undo's own
+ops (the range it recorded), restoring the edit.
 -}
 redo : OpDoc a -> OpDoc a
 redo ((OpDoc d) as doc) =
@@ -871,41 +1048,50 @@ redo ((OpDoc d) as doc) =
         [] ->
             doc
 
-        revs :: rest ->
+        entry :: rest ->
             let
-                before =
+                -- symmetric to `undo`: the new undo entry must cover only the ops
+                -- THIS redo emits — the range (preRedo, postRedo].
+                preRedo =
                     version doc
 
                 applied =
-                    applyRevs revs doc
+                    applyRevs (inverseBetween entry.before entry.after doc) doc
 
                 undoEntry =
-                    inverseBetween before applied
+                    { before = preRedo, after = version applied }
             in
             case applied of
                 OpDoc ad ->
                     OpDoc { ad | redoStack = rest, undoStack = undoEntry :: ad.undoStack }
 
 
-{-| The reverse actions that undo every op added between `before` and the current
-state — i.e. the inverses of this replica's just-made ops, newest first (so they
-unwind in reverse emission order). Each inverse is computed against the state
-**as the op was applied** (the checkout at that op), so a `done` toggle inverts to
-its prior value and a counter delta to its negation.
+{-| The reverse actions that undo the ops added between `before` and `after` — the
+ops causally in `after` but not `before`, inverted, newest-first (so they unwind in
+reverse emission order). Each inverse is computed against the state as of _just
+before_ that op applied, so a register set inverts to its prior value, a delete to
+a re-create, etc.
 -}
-inverseBetween : Version -> OpDoc a -> List RevAction
-inverseBetween (Version beforeFrontier) (OpDoc d) =
+inverseBetween : Version -> Version -> OpDoc a -> List RevAction
+inverseBetween (Version beforeFrontier) (Version afterFrontier) (OpDoc d) =
     let
         beforeKeys =
             OpLog.ancestorKeys beforeFrontier d.store
 
-        -- the ops this replica added after `before`, in causal (emission) order
+        afterKeys =
+            OpLog.ancestorKeys afterFrontier d.store
+
+        -- ops in the (before, after] range: ancestors of `after`, not of `before`.
         added =
             OpLog.causalOrder d.store
-                |> List.filter (\o -> not (Set.member (Id.opIdToString o.id) beforeKeys))
+                |> List.filter
+                    (\o ->
+                        Set.member (Id.opIdToString o.id) afterKeys
+                            && not (Set.member (Id.opIdToString o.id) beforeKeys)
+                    )
     in
-    -- fold forward, materializing the pre-op state for each, collecting inverses;
-    -- reverse at the end so undo unwinds last-emitted first
+    -- fold forward from the before-checkout, materializing each op's pre-state,
+    -- collecting inverses; reverse so undo unwinds last-emitted first.
     added
         |> List.foldl
             (\o ( preState, acc ) ->
@@ -934,16 +1120,12 @@ inverseOf theOp preState =
             [ Rev (Increment { target = target, delta = -delta }) ]
 
         SetPresence { target, present } ->
-            -- invert the presence bit; on re-adding a key the seed is irrelevant
-            -- (the value subtree still exists), so reuse an empty map.
             [ Rev (SetPresence { target = target, present = not present, seed = emptyMap }) ]
 
         InsertElem { container, elemId } ->
-            -- undo an insert by deleting exactly the element it created
             [ Rev (DeleteElem { container = container, elem = elemId }) ]
 
         MoveElem { container, elem } ->
-            -- undo a move by moving the element back to where it was before
             case navigateTarget container preState of
                 Just node ->
                     [ Rev (MoveElem { container = container, elem = elem, after = priorAnchor elem node }) ]
@@ -952,14 +1134,22 @@ inverseOf theOp preState =
                     []
 
         DeleteElem { container, elem } ->
-            -- undo a delete by re-inserting the deleted element's content after its
-            -- prior neighbour. The element is tombstoned forever, so this revives a
-            -- fresh copy (new id) — content and position preserved, identity not.
+            -- undo a delete. Tombstones are permanent, so this revives a FRESH copy
+            -- (new id), content/structure preserved, identity not.
             case navigateTarget container preState of
+                Just (Node.Tree t) ->
+                    -- a tree node: revive it + its subtree as ONE atomic graft, so
+                    -- it inverts back to a single delete (keeps undo/redo symmetric).
+                    if Tree.get elem t == Nothing then
+                        []
+
+                    else
+                        [ ReGraft { container = container, parent = Tree.parentOf elem t, rootId = elem, source = t } ]
+
                 Just node ->
                     case elementContent elem node of
                         Just content ->
-                            [ ReInsert { container = container, afterValue = priorAnchor elem node, content = content } ]
+                            [ ReInsert { container = container, elemId = elem, afterValue = priorAnchor elem node, content = content } ]
 
                         Nothing ->
                             []
@@ -967,9 +1157,30 @@ inverseOf theOp preState =
                 Nothing ->
                     []
 
+        TreeMove { container, child, seed } ->
+            case seed of
+                Just _ ->
+                    -- op CREATED this node: undo = delete it (subtree hides with it)
+                    [ Rev (DeleteElem { container = container, elem = child }) ]
 
-{-| Apply a list of reverse actions as fresh ops (each syncs). `ReInsert` mints a
-new element id at apply time and positions it after the still-live `afterValue`.
+                Nothing ->
+                    -- op RE-PARENTED: move it back to its prior parent/pos
+                    case navigateTarget container preState |> Maybe.andThen Node.asTree of
+                        Just t ->
+                            case Tree.siblingPos child t of
+                                Just pos ->
+                                    [ Rev (TreeMove { container = container, child = child, parent = Tree.parentOf child t, pos = pos, seed = Nothing }) ]
+
+                                Nothing ->
+                                    []
+
+                        Nothing ->
+                            []
+
+
+{-| Apply reverse actions as fresh ops (each syncs). Ids named by the inverse ops
+are resolved through (and revivals recorded into) the doc's `idRemap` table, so a
+delete undone as a fresh copy stays targetable by any later inverse — see `idRemap`.
 -}
 applyRevs : List RevAction -> OpDoc a -> OpDoc a
 applyRevs revs doc =
@@ -980,19 +1191,111 @@ applyRev : RevAction -> OpDoc a -> OpDoc a
 applyRev rev doc =
     case rev of
         Rev action ->
-            emit action doc
+            emit (remapAction (remapOf doc) action) doc
 
-        ReInsert { container, afterValue, content } ->
+        ReInsert { container, elemId, afterValue, content } ->
             let
-                -- re-seed with fresh ids so the revived element is a clean new one
-                ( seedNode, ctx1 ) =
-                    Node.reStamp (ctxOf doc) content
+                remap =
+                    remapOf doc
+
+                ( seedNode, ctx1, innerRemap ) =
+                    Node.reStampWithMap (ctxOf doc) content
 
                 after =
-                    liveAnchor container afterValue (state doc)
+                    liveAnchor (remapTarget remap container) (Maybe.map (remapId remap) afterValue) (state doc)
+
+                ( newId, doc1 ) =
+                    emitInsert (remapTarget remap container) after seedNode (withCtx ctx1 doc)
             in
-            emitInsert container after seedNode (withCtx ctx1 doc)
-                |> Tuple.second
+            -- record original elem → its fresh revived id, PLUS every id inside the
+            -- re-stamped content (`innerRemap`), so later inverses that name the
+            -- original element OR anything within it retarget onto this live copy.
+            doc1
+                |> registerRemapAll innerRemap
+                |> registerRemap elemId newId
+
+        ReGraft { container, parent, rootId, source } ->
+            let
+                remap =
+                    remapOf doc
+            in
+            reviveNode (remapTarget remap container) (Maybe.map (remapId remap) parent) rootId source doc
+
+
+{-| The doc's current id-remap table.
+-}
+remapOf : OpDoc a -> Dict.Dict String OpId
+remapOf (OpDoc d) =
+    d.idRemap
+
+
+{-| Record `original → replacement` in the remap table.
+-}
+registerRemap : OpId -> OpId -> OpDoc a -> OpDoc a
+registerRemap original replacement (OpDoc d) =
+    OpDoc { d | idRemap = Dict.insert (Id.opIdToString original) replacement d.idRemap }
+
+
+{-| Merge a whole `originalId → revivedId` map (from `Node.reStampWithMap`) into the
+remap table. Existing entries win (they were recorded by more recent revivals).
+-}
+registerRemapAll : Dict.Dict String OpId -> OpDoc a -> OpDoc a
+registerRemapAll mapping (OpDoc d) =
+    OpDoc { d | idRemap = Dict.union d.idRemap mapping }
+
+
+{-| Resolve an id through the remap table, transitively (a revived copy that was
+itself later revived chains through). Ids are globally fresh, so the chain is acyclic
+and terminates.
+-}
+remapId : Dict.Dict String OpId -> OpId -> OpId
+remapId table id =
+    case Dict.get (Id.opIdToString id) table of
+        Just next ->
+            remapId table next
+
+        Nothing ->
+            id
+
+
+remapTarget : Dict.Dict String OpId -> Target -> Target
+remapTarget table =
+    List.map
+        (\step ->
+            case step of
+                IntoElem id ->
+                    IntoElem (remapId table id)
+
+                IntoKey _ ->
+                    step
+        )
+
+
+{-| Rewrite every element id an inverse action names through the remap table.
+-}
+remapAction : Dict.Dict String OpId -> Action -> Action
+remapAction table action =
+    case action of
+        SetReg target prim ->
+            SetReg (remapTarget table target) prim
+
+        SetPresence r ->
+            SetPresence { r | target = remapTarget table r.target }
+
+        InsertElem r ->
+            InsertElem { r | container = remapTarget table r.container, elemId = remapId table r.elemId, after = Maybe.map (remapId table) r.after }
+
+        DeleteElem r ->
+            DeleteElem { container = remapTarget table r.container, elem = remapId table r.elem }
+
+        MoveElem r ->
+            MoveElem { container = remapTarget table r.container, elem = remapId table r.elem, after = Maybe.map (remapId table) r.after }
+
+        Increment r ->
+            Increment { r | target = remapTarget table r.target }
+
+        TreeMove r ->
+            TreeMove { r | container = remapTarget table r.container, child = remapId table r.child, parent = Maybe.map (remapId table) r.parent }
 
 
 {-| The element to anchor _after_ to put `elem` back where it was: the id of its
@@ -1001,13 +1304,11 @@ predecessor in the current order, or `Nothing` if it was at the head.
 priorAnchor : OpId -> Node -> Maybe OpId
 priorAnchor elem node =
     let
-        ids =
-            orderedIds node |> Maybe.withDefault []
-
         elemKey =
             Id.opIdToString elem
     in
-    ids
+    orderedIds node
+        |> Maybe.withDefault []
         |> List.foldl
             (\id ( prev, found ) ->
                 if found then
@@ -1023,9 +1324,8 @@ priorAnchor elem node =
         |> Tuple.first
 
 
-{-| Resolve a re-insert anchor against the live container: if the recorded
-predecessor `afterValue` is still present use it, else fall back to the head
-(`Nothing`) — its predecessor may have been concurrently deleted.
+{-| Resolve a re-insert anchor against the live container: use the recorded
+predecessor if still present, else fall back to the head.
 -}
 liveAnchor : List TargetStep -> Maybe OpId -> Node -> Maybe OpId
 liveAnchor container afterValue root =
@@ -1058,6 +1358,75 @@ elementContent elem node =
             seqRga node
                 |> Maybe.andThen (Rga.get elem)
                 |> Maybe.map .content
+
+
+{-| Revive tree node `sourceId` (from `source`) and its subtree under `newParent`
+in the live doc, as fresh create ops. Each node gets a new id (the original is
+tombstoned); children are created under their re-minted parent, preserving order.
+-}
+reviveNode : List TargetStep -> Maybe OpId -> OpId -> Tree.Tree Node -> OpDoc a -> OpDoc a
+reviveNode container newParent sourceId source doc =
+    case Tree.get sourceId source of
+        Nothing ->
+            doc
+
+        Just content ->
+            let
+                ( childId, ctx1 ) =
+                    Id.nextId (ctxOf doc)
+
+                -- fresh ids for the payload subtree too, keeping the inner id map so
+                -- a later inverse referencing something inside the payload (e.g. a
+                -- text char a follow-up insert anchored after) still resolves.
+                ( seedNode, ctx2, innerRemap ) =
+                    Node.reStampWithMap ctx1 content
+
+                -- restore the node at its ORIGINAL sibling position (from `source`),
+                -- not the end, so undo puts it back where it was among its siblings.
+                pos =
+                    Tree.siblingPos sourceId source
+                        |> Maybe.withDefault (treeEndPos container newParent (state doc))
+
+                doc1 =
+                    withCtx ctx2 doc
+                        |> emit (TreeMove { container = container, child = childId, parent = newParent, pos = pos, seed = Just seedNode })
+                        |> registerRemapAll innerRemap
+                        -- record original node id → its fresh revived id, so a later
+                        -- inverse that still names the original node retargets here.
+                        |> registerRemap sourceId childId
+            in
+            -- recurse into the source node's children, under the new id
+            List.foldl
+                (\srcChild d -> reviveNode container (Just childId) srcChild source d)
+                doc1
+                (Tree.childrenOf sourceId source)
+
+
+{-| The end position for a new child under `parent` in the live tree at `container`
+(so a revived node lands after existing siblings).
+-}
+treeEndPos : List TargetStep -> Maybe OpId -> Node -> Frac
+treeEndPos container parent root =
+    case navigateTarget container root |> Maybe.andThen Node.asTree of
+        Just t ->
+            let
+                siblings =
+                    case parent of
+                        Just p ->
+                            Tree.childrenOf p t
+
+                        Nothing ->
+                            Tree.roots t
+            in
+            case List.reverse siblings |> List.head of
+                Just last ->
+                    Crdt.Frac.between (Tree.siblingPos last t) Nothing
+
+                Nothing ->
+                    Crdt.Frac.between Nothing Nothing
+
+        Nothing ->
+            Crdt.Frac.between Nothing Nothing
 
 
 
@@ -1235,9 +1604,16 @@ navigateTarget tgt node =
                         |> Maybe.andThen (\content -> navigateTarget rest content)
 
                 Nothing ->
-                    seqRga node
-                        |> Maybe.andThen (Rga.get id)
-                        |> Maybe.andThen (\el -> navigateTarget rest el.content)
+                    case Node.asTree node of
+                        Just t ->
+                            -- descend into a tree node by its stable id
+                            Tree.get id t
+                                |> Maybe.andThen (\content -> navigateTarget rest content)
+
+                        Nothing ->
+                            seqRga node
+                                |> Maybe.andThen (Rga.get id)
+                                |> Maybe.andThen (\el -> navigateTarget rest el.content)
 
 
 {-| Save a named checkpoint pinning the current version. Records the label and
@@ -1643,6 +2019,203 @@ listMove path from to doc =
             )
 
 
+{-| Add a new node to the tree at `path`, as the **last child** of `parent`
+(`Nothing` = a new root), seeded from `seed`. The new node's id is minted here.
+-}
+treeAddChild : Path -> Maybe OpId -> Seed -> OpDoc a -> Result Error (OpDoc a)
+treeAddChild path parent seed doc =
+    treeContainer path doc
+        |> Result.map
+            (\( target, t ) ->
+                let
+                    ( childId, ctx1 ) =
+                        Id.nextId (ctxOf doc)
+
+                    ( moveOp, ctx2 ) =
+                        Id.nextId ctx1
+
+                    ( seedNode, ctx3 ) =
+                        I.runSeed seed ctx2
+
+                    pos =
+                        endPos parent t
+
+                    doc1 =
+                        withCtx ctx3 doc
+                in
+                commit
+                    [ op moveOp (frontierOf doc1) (TreeMove { container = target, child = childId, parent = parent, pos = pos, seed = Just seedNode }) ]
+                    doc1
+            )
+
+
+{-| Re-parent `child` to be the **last child** of `parent` (`Nothing` = a root).
+Cycle-forming moves are skipped at read (the node stays put), so this always
+converges. No seed — the node keeps its content.
+-}
+treeMoveInto : Path -> OpId -> Maybe OpId -> OpDoc a -> Result Error (OpDoc a)
+treeMoveInto path child parent doc =
+    treeMoveTo path child parent (\t -> endPos parent t) doc
+
+
+{-| Move `child` to sit immediately **before** `sibling` (same parent as sibling).
+-}
+treeMoveBefore : Path -> OpId -> OpId -> OpDoc a -> Result Error (OpDoc a)
+treeMoveBefore path child sibling doc =
+    treeMoveTo path child (currentParent path sibling doc) (\t -> beforePos sibling t) doc
+
+
+{-| Move `child` to sit immediately **after** `sibling` (same parent as sibling).
+-}
+treeMoveAfter : Path -> OpId -> OpId -> OpDoc a -> Result Error (OpDoc a)
+treeMoveAfter path child sibling doc =
+    treeMoveTo path child (currentParent path sibling doc) (\t -> afterPos sibling t) doc
+
+
+{-| Delete a tree node (and its subtree, at read) at `path`.
+-}
+treeRemove : Path -> OpId -> OpDoc a -> Result Error (OpDoc a)
+treeRemove path child doc =
+    treeContainer path doc
+        |> Result.map
+            (\( target, _ ) ->
+                let
+                    ( id, doc1 ) =
+                        mint doc
+                in
+                commit [ op id (frontierOf doc1) (DeleteElem { container = target, elem = child }) ] doc1
+            )
+
+
+{-| Shared move emitter: resolve the tree container, compute the position with
+`posOf`, emit a seedless `TreeMove`.
+-}
+treeMoveTo : Path -> OpId -> Maybe OpId -> (Tree.Tree Node -> Crdt.Frac.Frac) -> OpDoc a -> Result Error (OpDoc a)
+treeMoveTo path child parent posOf doc =
+    treeContainer path doc
+        |> Result.map
+            (\( target, t ) ->
+                let
+                    ( moveOp, doc1 ) =
+                        mint doc
+                in
+                commit
+                    [ op moveOp (frontierOf doc1) (TreeMove { container = target, child = child, parent = parent, pos = posOf t, seed = Nothing }) ]
+                    doc1
+            )
+
+
+{-| Resolve a path to a tree node: its id-target plus the `Tree` value.
+-}
+treeContainer : Path -> OpDoc a -> Result Error ( List TargetStep, Tree.Tree Node )
+treeContainer path doc =
+    resolve path doc
+        |> Result.andThen
+            (\( target, node ) ->
+                case Node.asTree node of
+                    Just t ->
+                        Ok ( target, t )
+
+                    Nothing ->
+                        Err (WrongNodeType "expected tree")
+            )
+
+
+{-| The current parent of `sibling` in the tree at `path` (for before/after moves).
+-}
+currentParent : Path -> OpId -> OpDoc a -> Maybe OpId
+currentParent path sibling doc =
+    treeContainer path doc
+        |> Result.toMaybe
+        |> Maybe.andThen (\( _, t ) -> Tree.parentOf sibling t)
+
+
+{-| A fractional position after the last child of `parent` (append at end).
+-}
+endPos : Maybe OpId -> Tree.Tree Node -> Crdt.Frac.Frac
+endPos parent t =
+    let
+        siblings =
+            childIds parent t
+    in
+    case List.reverse siblings |> List.head of
+        Just last ->
+            Crdt.Frac.between (Tree.siblingPos last t) Nothing
+
+        Nothing ->
+            Crdt.Frac.between Nothing Nothing
+
+
+{-| A position immediately before `sibling`.
+-}
+beforePos : OpId -> Tree.Tree Node -> Crdt.Frac.Frac
+beforePos sibling t =
+    let
+        siblings =
+            childIds (Tree.parentOf sibling t) t
+
+        prev =
+            precedingSibling sibling siblings
+    in
+    Crdt.Frac.between (prev |> Maybe.andThen (\p -> Tree.siblingPos p t)) (Tree.siblingPos sibling t)
+
+
+{-| A position immediately after `sibling`.
+-}
+afterPos : OpId -> Tree.Tree Node -> Crdt.Frac.Frac
+afterPos sibling t =
+    let
+        siblings =
+            childIds (Tree.parentOf sibling t) t
+
+        next =
+            followingSibling sibling siblings
+    in
+    Crdt.Frac.between (Tree.siblingPos sibling t) (next |> Maybe.andThen (\n -> Tree.siblingPos n t))
+
+
+childIds : Maybe OpId -> Tree.Tree Node -> List OpId
+childIds parent t =
+    case parent of
+        Just p ->
+            Tree.childrenOf p t
+
+        Nothing ->
+            Tree.roots t
+
+
+precedingSibling : OpId -> List OpId -> Maybe OpId
+precedingSibling target ids =
+    List.foldl
+        (\id ( prev, found ) ->
+            if found then
+                ( prev, found )
+
+            else if Id.opIdToString id == Id.opIdToString target then
+                ( prev, True )
+
+            else
+                ( Just id, False )
+        )
+        ( Nothing, False )
+        ids
+        |> Tuple.first
+
+
+followingSibling : OpId -> List OpId -> Maybe OpId
+followingSibling target ids =
+    case ids of
+        x :: rest ->
+            if Id.opIdToString x == Id.opIdToString target then
+                List.head rest
+
+            else
+                followingSibling target rest
+
+        [] ->
+            Nothing
+
+
 {-| Emit an append op after `after`, then record `elemId` as the new last id for
 `target` so the next append to this list is O(1). `commit` clears `lastAppend`
 first (any edit invalidates it), so we re-establish it here afterwards.
@@ -1842,6 +2415,20 @@ walk segs node acc =
 
                         _ ->
                             Err (WrongNodeType ("expected sequence at index " ++ String.fromInt i))
+
+                NodeId nodeId ->
+                    -- descend into a tree node by its stable id
+                    case node of
+                        Node.Tree t ->
+                            case Tree.get nodeId t of
+                                Just content ->
+                                    walk rest content (IntoElem nodeId :: acc)
+
+                                Nothing ->
+                                    Err (PathNotFound ("tree node " ++ Id.opIdToString nodeId))
+
+                        _ ->
+                            Err (WrongNodeType "expected tree for node id")
 
 
 intoKey : String -> List Seg -> Node -> List TargetStep -> Result Error ( List TargetStep, Node )

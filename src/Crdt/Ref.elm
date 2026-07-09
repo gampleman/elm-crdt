@@ -4,6 +4,7 @@ module Crdt.Ref exposing
     , set, over, increment, switch
     , append, remove, move
     , setKey, removeKey
+    , treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
     , cursorAt, cursorOffset
     , RecordRefs, record, field, build
     , CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
@@ -38,6 +39,7 @@ existing op-log runtime — no new merge semantics.
 @docs set, over, increment, switch
 @docs append, remove, move
 @docs setKey, removeKey
+@docs treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
 @docs cursorAt, cursorOffset
 @docs RecordRefs, record, field, build
 @docs CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
@@ -45,6 +47,7 @@ existing op-log runtime — no new merge semantics.
 -}
 
 import Crdt.Cursor exposing (Cursor)
+import Crdt.Id as Id
 import Crdt.OpDoc as OpDoc exposing (Error, OpDoc)
 import Crdt.Path as Path exposing (Path)
 import Crdt.Schema as S exposing (Crdt)
@@ -145,6 +148,9 @@ stepInto seg path =
         Path.Index i ->
             Path.index i path
 
+        Path.NodeId id ->
+            Path.node id path
+
 
 
 -- EDITS -----------------------------------------------------------------------
@@ -242,6 +248,60 @@ setKey valSchema k value (Ref r) doc =
 removeKey : String -> Ref r (S.DictK vk v) dictType -> OpDoc doc -> Result Error (OpDoc doc)
 removeKey k (Ref r) doc =
     OpDoc.removeKey r.path k doc
+
+
+
+-- TREE OPS --------------------------------------------------------------------
+-- Node ids come from reading the tree (`Crdt.Tree.itemId`); pass them to these.
+
+
+{-| A payload ref for tree node `nodeId`, given the node schema. Compose into it or
+`set`/`over` its content: `treeNode id nodeSchema treeRef |> Ref.at nodeRefs.title`.
+Editing a node not currently present is a no-op.
+-}
+treeNode : Id.OpId -> Crdt ek a -> Ref r (S.TreeK ek a) forest -> Ref r ek a
+treeNode nodeId nodeSchema (Ref container) =
+    Ref
+        { path = container.path |> Path.node nodeId
+        , schema = nodeSchema
+        }
+
+
+{-| Add a new node (seeded from `value`) as the last child of `parent` (`Nothing` =
+a new root) in a tree ref.
+-}
+addChild : Crdt ek a -> a -> Maybe Id.OpId -> Ref r (S.TreeK ek a) forest -> OpDoc doc -> Result Error (OpDoc doc)
+addChild nodeSchema value parent (Ref r) doc =
+    OpDoc.treeAddChild r.path parent (S.with value nodeSchema) doc
+
+
+{-| Re-parent `child` to be the last child of `parent` (`Nothing` = a root).
+Cycle-forming moves are skipped (the node stays put), so this always converges.
+-}
+moveInto : Id.OpId -> Maybe Id.OpId -> Ref r (S.TreeK ek a) forest -> OpDoc doc -> Result Error (OpDoc doc)
+moveInto child parent (Ref r) doc =
+    OpDoc.treeMoveInto r.path child parent doc
+
+
+{-| Move `child` to sit immediately before `sibling` (under the sibling's parent).
+-}
+moveBefore : Id.OpId -> Id.OpId -> Ref r (S.TreeK ek a) forest -> OpDoc doc -> Result Error (OpDoc doc)
+moveBefore child sibling (Ref r) doc =
+    OpDoc.treeMoveBefore r.path child sibling doc
+
+
+{-| Move `child` to sit immediately after `sibling` (under the sibling's parent).
+-}
+moveAfter : Id.OpId -> Id.OpId -> Ref r (S.TreeK ek a) forest -> OpDoc doc -> Result Error (OpDoc doc)
+moveAfter child sibling (Ref r) doc =
+    OpDoc.treeMoveAfter r.path child sibling doc
+
+
+{-| Remove a node and its subtree from a tree ref.
+-}
+removeNode : Id.OpId -> Ref r (S.TreeK ek a) forest -> OpDoc doc -> Result Error (OpDoc doc)
+removeNode child (Ref r) doc =
+    OpDoc.treeRemove r.path child doc
 
 
 

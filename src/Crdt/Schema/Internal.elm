@@ -1,8 +1,8 @@
 module Crdt.Schema.Internal exposing
     ( Crdt, Error(..), Seed
-    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK
+    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
     , int, float, string, bool, text, counter, lww
-    , list, movableList, dict
+    , list, movableList, dict, tree
     , record, field, build, RecordBuilder
     , CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, buildCustom
     , variantArgKey
@@ -25,9 +25,9 @@ state — that is the hard diff problem. All in-place mutation goes through
 `Crdt.Edit`, which is decoupled from this layer.
 
 @docs Crdt, Error, Seed
-@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK
+@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
 @docs int, float, string, bool, text, counter, lww
-@docs list, movableList, dict
+@docs list, movableList, dict, tree
 @docs record, field, build, RecordBuilder
 @docs CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, buildCustom
 @docs variantArgKey
@@ -41,6 +41,7 @@ import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
 import Crdt.Text as Text
+import Crdt.Tree as Tree
 import Dict exposing (Dict)
 
 
@@ -114,6 +115,13 @@ type Movable
 -}
 type DictK vk a
     = DictK Never
+
+
+{-| Kind marker: a movable `tree` of `a` with node kind `ek`; supports
+add/move/remove of nodes + per-node payload refs.
+-}
+type TreeK ek a
+    = TreeK Never
 
 
 {-| What can go wrong reading a `Node` through a schema.
@@ -425,6 +433,67 @@ movableList (Crdt elem) =
                 in
                 ( Node.mov ml, ctx1 )
         }
+
+
+
+-- TREE -----------------------------------------------------------------------
+
+
+{-| A movable **tree** of `a`: hierarchical, re-parentable, sibling-ordered data
+backed by `Crdt.Tree`. Reads as a `Crdt.Tree.Forest a` (ordered nested items with
+stable ids). Edit it through `Crdt.Ref` (`addChild` / `moveNode` / `removeNode`).
+A fresh tree is empty; nodes are added by ref, not seeded, so `seed` yields empty.
+-}
+tree : Crdt ek a -> Crdt (TreeK ek a) (Tree.Forest a)
+tree (Crdt elem) =
+    Crdt
+        { decode =
+            \node ->
+                case Node.asTree node of
+                    Just t ->
+                        -- decode every node's payload; a decode error anywhere
+                        -- fails the whole read (via the sentinel below)
+                        decodeForest elem.decode t
+
+                    Nothing ->
+                        Err (TypeMismatch "expected tree")
+        , empty = \ctx -> ( Node.tree Tree.empty, ctx )
+        , seed = \_ ctx -> ( Node.tree Tree.empty, ctx )
+        }
+
+
+{-| Decode a tree's payloads through `dec`, failing the whole forest if any node's
+payload fails (so a corrupt node surfaces as a `Result` error, not a silent drop).
+-}
+decodeForest : (Node -> Result Error a) -> Tree.Tree Node -> Result Error (Tree.Forest a)
+decodeForest dec t =
+    let
+        -- collect the first decode error, if any, while building the forest
+        forest =
+            Tree.toForest (\n -> dec n |> Result.toMaybe) t
+
+        anyError =
+            Tree.payloads t
+                |> Dict.values
+                |> List.filterMap (\n -> dec n |> resultError)
+                |> List.head
+    in
+    case anyError of
+        Just e ->
+            Err e
+
+        Nothing ->
+            Ok forest
+
+
+resultError : Result e a -> Maybe e
+resultError r =
+    case r of
+        Err e ->
+            Just e
+
+        Ok _ ->
+            Nothing
 
 
 

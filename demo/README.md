@@ -15,6 +15,9 @@ It exercises the full library surface:
 - **movable list** — the todo list (`S.movableList`); drag the `⠿` handle to
   reorder. Moves keep each todo's identity, so nested edits and cursors follow it.
 - **dict** — free-form notes keyed by string (`S.dict`)
+- **movable tree** — the outline (`S.tree`): add/nest/re-parent nodes with the
+  →/←/+/✕ controls. Concurrent re-parents that would form a cycle converge safely
+  (Kleppmann's move algorithm), and siblings stay ordered via a fractional index.
 - **lww** — todo `done` booleans
 - **presence** — live "who's here" + which field each peer is editing, with
   **stable cursors** (`Crdt.Cursor`) that track the right character across

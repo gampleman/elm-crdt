@@ -30,10 +30,12 @@ materialize + checkout. It is not yet wired into the public `Crdt` module.
 
 -}
 
+import Crdt.Frac exposing (Frac)
 import Crdt.Id as Id exposing (OpId)
 import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node(..), Prim)
 import Crdt.Rga as Rga
+import Crdt.Tree as Tree
 import Dict exposing (Dict)
 import Set exposing (Set)
 
@@ -65,6 +67,7 @@ type Action
     | DeleteElem { container : Target, elem : OpId }
     | MoveElem { container : Target, elem : OpId, after : Maybe OpId }
     | Increment { target : Target, delta : Int }
+    | TreeMove { container : Target, child : OpId, parent : Maybe OpId, pos : Frac, seed : Maybe Node }
 
 
 {-| A path into the document by stable identity: map keys by name, sequence/text
@@ -390,6 +393,9 @@ applyOp { id, action } root =
         Increment { target, delta } ->
             updateAt target id (incrementBy id delta) root
 
+        TreeMove { container, child, parent, pos, seed } ->
+            updateAt container id (treeMove id child parent pos seed) root
+
 
 {-| Apply `f` at `steps`, creating intermediate map entries (stamped `stamp`) as
 needed. Sequence/text elements are descended into by id.
@@ -442,6 +448,10 @@ updateAt steps stamp f node =
                 Mov ml ->
                     -- descend into the value `x` (by valueId) and edit its content
                     Mov (MoveList.updateValue x (updateAt rest stamp f) ml)
+
+                Tree t ->
+                    -- descend into tree node `x` (by nodeId) and edit its payload
+                    Tree (Tree.updateValue x (updateAt rest stamp f) t)
 
                 _ ->
                     node
@@ -531,8 +541,35 @@ deleteElem elem current =
         Mov ml ->
             Mov (MoveList.delete elem ml)
 
+        Tree t ->
+            Tree (Tree.delete elem t)
+
         _ ->
             current
+
+
+{-| Place `child` under `parent` at `pos` in a tree. On creation the op carries a
+`seed` (the new node's content); a re-parent/reorder carries `Nothing` and keeps
+the existing payload. `moveOp` (this op's id) keys the move, so the latest move
+wins by causal-order fold. No-op on non-tree nodes.
+-}
+treeMove : OpId -> OpId -> Maybe OpId -> Frac -> Maybe Node -> Node -> Node
+treeMove moveOp child parent pos seed current =
+    let
+        t =
+            case current of
+                Tree existing ->
+                    existing
+
+                _ ->
+                    Tree.empty
+    in
+    case seed of
+        Just content ->
+            Tree (Tree.move moveOp child parent pos content t)
+
+        Nothing ->
+            Tree (Tree.moveOnly moveOp child parent pos t)
 
 
 {-| Move value `elem` after cell `after` in a movable list (no-op on other nodes).

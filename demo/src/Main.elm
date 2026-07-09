@@ -14,11 +14,12 @@ WebSocket networking, live **presence** (who's here, their cursor), and
 
 import Browser
 import Crdt.Cursor as Cursor exposing (Cursor)
-import Crdt.Id exposing (ReplicaId)
+import Crdt.Id exposing (OpId, ReplicaId)
 import Crdt.OpDoc as OpDoc exposing (Checkpoint, OpDoc, Version)
 import Crdt.Presence as Presence exposing (Presence)
 import Crdt.Ref as Ref exposing (Ref)
 import Crdt.Schema as S exposing (Crdt)
+import Crdt.Tree as Tree
 import Dict exposing (Dict)
 import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
 import Html.Attributes as A exposing (class, placeholder, value)
@@ -40,7 +41,16 @@ type alias Board =
     , status : Status
     , todos : List Todo
     , notes : Dict String String
+    , outline : Tree.Forest Node
     }
+
+
+{-| A node in the collaborative **outline** — a movable tree (`S.tree`). Each node
+carries editable text; nodes can be nested under one another and re-parented, and
+concurrent re-parents that would form a cycle converge safely.
+-}
+type alias Node =
+    { text : String }
 
 
 {-| A board-level lifecycle status — a **sum type**, showcasing `S.custom`. The
@@ -69,6 +79,7 @@ type alias BoardRefs =
     , status : Ref Board (S.Variants Status) Status
     , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
     , notes : Ref Board (S.DictK S.Settable String) (Dict String String)
+    , outline : Ref Board (S.TreeK S.Nested Node) (Tree.Forest Node)
     }
 
 
@@ -79,6 +90,7 @@ boardDoc =
         |> Ref.field "status" .status statusDoc.schema
         |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
         |> Ref.field "notes" .notes (S.dict S.text)
+        |> Ref.field "outline" .outline (S.tree nodeDoc.schema)
         |> Ref.build
 
 
@@ -147,6 +159,25 @@ todoTextRef i =
     refs.todos |> Ref.index i todoDoc.schema |> Ref.at todoDoc.refs.text
 
 
+type alias NodeRefs =
+    { text : Ref Node S.Settable String }
+
+
+nodeDoc : Ref.RecordRefs Node NodeRefs
+nodeDoc =
+    Ref.record Node NodeRefs
+        |> Ref.field "text" .text S.text
+        |> Ref.build
+
+
+{-| A text ref into outline node `id`'s `text` field, composed from the tree ref, a
+node ref (by stable id), and the field ref. Drives that node's text input + caret.
+-}
+outlineTextRef : OpId -> Ref Board S.Settable String
+outlineTextRef id =
+    refs.outline |> Ref.treeNode id nodeDoc.schema |> Ref.at nodeDoc.refs.text
+
+
 {-| Per-peer ephemeral state. Never merged into the document — it lives on the
 separate presence channel and expires when a peer goes quiet.
 -}
@@ -207,6 +238,11 @@ todoField i =
 noteField : String -> String
 noteField k =
     "note:" ++ k
+
+
+outlineField : OpId -> String
+outlineField id =
+    "outline:" ++ Crdt.Id.opIdToString id
 
 
 
@@ -310,6 +346,12 @@ type Msg
     | NewNoteKeyChanged String
     | AddNote
     | RemoveNote String
+      -- outline (movable tree)
+    | AddOutlineRoot
+    | AddOutlineChild OpId
+    | IndentNode OpId (Maybe OpId)
+    | OutdentNode OpId (Maybe OpId)
+    | RemoveNode OpId
       -- presence
     | FocusField String
     | BlurField
@@ -469,6 +511,28 @@ update msg model =
                     Ref.removeKey k refs.notes model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
+
+        AddOutlineRoot ->
+            outlineEdit (Ref.addChild nodeDoc.schema (Node "") Nothing refs.outline) model
+
+        AddOutlineChild parent ->
+            outlineEdit (Ref.addChild nodeDoc.schema (Node "") (Just parent) refs.outline) model
+
+        IndentNode node maybePrev ->
+            -- nest under the preceding sibling (Nothing = no previous sibling; no-op)
+            case maybePrev of
+                Just prev ->
+                    outlineEdit (Ref.moveInto node (Just prev) refs.outline) model
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        OutdentNode node maybeGrandparent ->
+            -- promote to sit under the parent's parent (Nothing = already a root)
+            outlineEdit (Ref.moveInto node maybeGrandparent refs.outline) model
+
+        RemoveNode node ->
+            outlineEdit (Ref.removeNode node refs.outline) model
 
         FocusField fieldName ->
             -- mark the start of a typing session so it undoes as one step
@@ -664,6 +728,17 @@ todo/note action so each is one Ctrl-Z step.
 recordPush : Version -> Model -> ( Model, Cmd Msg )
 recordPush before model =
     pushDoc { model | doc = OpDoc.recordEdit before model.doc }
+
+
+{-| Apply one outline (tree) edit, record it as a single undo step, and broadcast.
+-}
+outlineEdit : (OpDoc Board -> Result OpDoc.Error (OpDoc Board)) -> Model -> ( Model, Cmd Msg )
+outlineEdit edit model =
+    let
+        before =
+            OpDoc.version model.doc
+    in
+    recordPush before { model | doc = edit model.doc |> orKeep model.doc }
 
 
 {-| After any local change, broadcast only the **delta** since our last
@@ -1008,6 +1083,8 @@ viewBoard readOnly model board =
                 ]
         , h2 [] [ text "Notes" ]
         , viewNotes readOnly model board.notes
+        , h2 [] [ text "Outline" ]
+        , viewOutline readOnly model board.outline
         ]
 
 
@@ -1165,6 +1242,83 @@ viewNotes readOnly model notes =
                     []
                 , button [ onClick AddNote ] [ text "add note" ]
                 ]
+        ]
+
+
+{-| The collaborative **outline** (movable tree). Renders the forest recursively;
+each node has an editable text field plus controls to indent (nest under the
+preceding sibling), outdent (promote to the grandparent), add a child, and remove.
+`indent`/`outdent` are computed from the node's position among its siblings, which
+is why the recursion threads the parent id and the sibling list.
+-}
+viewOutline : Bool -> Model -> Tree.Forest Node -> Html Msg
+viewOutline readOnly model forest =
+    div []
+        [ ul [ class "outline" ] (viewForest readOnly model Nothing forest)
+        , if readOnly then
+            text ""
+
+          else
+            div [ class "add-row" ]
+                [ button [ onClick AddOutlineRoot ] [ text "+ node" ] ]
+        ]
+
+
+{-| Render a sibling list under `parent`, passing each node its preceding sibling
+(for indent) and its parent's parent (for outdent).
+-}
+viewForest : Bool -> Model -> Maybe OpId -> Tree.Forest Node -> List (Html Msg)
+viewForest readOnly model parent forest =
+    let
+        ids =
+            List.map Tree.itemId forest
+    in
+    List.indexedMap
+        (\i item ->
+            let
+                prevSibling =
+                    List.drop (i - 1) ids |> List.head |> maybeIf (i > 0)
+            in
+            viewOutlineNode readOnly model parent prevSibling item
+        )
+        forest
+
+
+{-| `Just x` only when the condition holds (used to gate "preceding sibling").
+-}
+maybeIf : Bool -> Maybe a -> Maybe a
+maybeIf cond m =
+    if cond then
+        m
+
+    else
+        Nothing
+
+
+viewOutlineNode : Bool -> Model -> Maybe OpId -> Maybe OpId -> Tree.Item Node -> Html Msg
+viewOutlineNode readOnly model parent prevSibling item =
+    let
+        id =
+            Tree.itemId item
+
+        node =
+            Tree.itemValue item
+
+        controls =
+            if readOnly then
+                []
+
+            else
+                [ button [ onClick (IndentNode id prevSibling), A.disabled (prevSibling == Nothing), A.title "indent (nest under previous)" ] [ text "→" ]
+                , button [ onClick (OutdentNode id parent), A.disabled (parent == Nothing), A.title "outdent" ] [ text "←" ]
+                , button [ onClick (AddOutlineChild id), A.title "add child" ] [ text "+" ]
+                , button [ onClick (RemoveNode id), A.title "remove" ] [ text "✕" ]
+                ]
+    in
+    li [ class "outline-node" ]
+        [ div [ class "outline-row" ]
+            (viewTextInput readOnly model (outlineTextRef id) (outlineField id) node.text "untitled" :: controls)
+        , ul [ class "outline" ] (viewForest readOnly model (Just id) (Tree.itemChildren item))
         ]
 
 

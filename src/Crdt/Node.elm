@@ -1,9 +1,9 @@
 module Crdt.Node exposing
-    ( Node(..), Register, Prim(..), Entry, Increment, MovNode
-    , reg, mapFromEntries, entry, seq, txt, counter, increment, mov
-    , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov
+    ( Node(..), Register, Prim(..), Entry, Increment, MovNode, TreeNode
+    , reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree
+    , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree
     , merge, maxCounter
-    , restore, reStamp
+    , restore, reStamp, reStampWithMap
     , Element, RgaNode
     )
 
@@ -25,18 +25,20 @@ its structural `merge`.
 `merge` is monomorphic over `Node` and never touches the typed schema layer —
 convergence correctness lives here and nowhere else.
 
-@docs Node, Register, Prim, Entry, Increment, MovNode
-@docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov
-@docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov
+@docs Node, Register, Prim, Entry, Increment, MovNode, TreeNode
+@docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree
+@docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree
 @docs merge, maxCounter
-@docs restore, reStamp
+@docs restore, reStamp, reStampWithMap
 @docs Element, RgaNode
 
 -}
 
+import Crdt.Frac
 import Crdt.Id as Id exposing (OpId)
 import Crdt.MoveList as MoveList exposing (MoveList)
 import Crdt.Rga as Rga exposing (Rga)
+import Crdt.Tree as Tree exposing (Tree)
 import Dict exposing (Dict)
 
 
@@ -49,12 +51,19 @@ type Node
     | Txt RgaNode
     | Cnt (Dict String Increment)
     | Mov MovNode
+    | Tree TreeNode
 
 
 {-| A movable list (reorderable sequence) of `Node` content.
 -}
 type alias MovNode =
     MoveList Node
+
+
+{-| A movable tree of `Node` content.
+-}
+type alias TreeNode =
+    Tree Node
 
 
 {-| One contribution to a counter: a signed `delta` tagged with the `OpId` of the
@@ -170,6 +179,13 @@ mov =
     Mov
 
 
+{-| A movable-tree node.
+-}
+tree : TreeNode -> Node
+tree =
+    Tree
+
+
 
 -- ACCESSORS ------------------------------------------------------------------
 
@@ -248,6 +264,18 @@ asMov node =
             Nothing
 
 
+{-| Extract the movable tree, if this is one.
+-}
+asTree : Node -> Maybe TreeNode
+asTree node =
+    case node of
+        Tree t ->
+            Just t
+
+        _ ->
+            Nothing
+
+
 {-| The counter's current value: the sum of all its contributions. `Nothing` if
 this node isn't a counter.
 -}
@@ -300,6 +328,9 @@ merge a b =
 
         ( Mov ma, Mov mb ) ->
             Mov (MoveList.merge merge ma mb)
+
+        ( Tree ta, Tree tb ) ->
+            Tree (Tree.merge merge ta tb)
 
         _ ->
             -- constructor mismatch: deterministic, order-independent tiebreak.
@@ -504,32 +535,52 @@ elements. Used to re-create content during a restore.
 -}
 reStamp : Id.Ctx -> Node -> ( Node, Id.Ctx )
 reStamp ctx node =
+    let
+        ( n, ctx1, _ ) =
+            reStampWithMap ctx node
+    in
+    ( n, ctx1 )
+
+
+{-| Like `reStamp`, but also returns the **old → new id mapping** for every
+target-addressable id it re-mints: `Rga` element ids (`Seq`/`Txt`), `MoveList`
+value ids, and `Tree` node ids. Register/counter stamps are LWW stamps addressed by
+key (not by id), so they are not included.
+
+Undo/redo needs this map: reviving a deleted subtree mints fresh ids, and a later
+inverse op may still reference an id _inside_ that subtree (e.g. the character a
+follow-up text insert anchored after). Registering the whole mapping — not just the
+subtree root — keeps those references resolvable. See `OpDoc`'s `idRemap`.
+
+-}
+reStampWithMap : Id.Ctx -> Node -> ( Node, Id.Ctx, Dict String OpId )
+reStampWithMap ctx node =
     case node of
         Reg r ->
             let
                 ( stamp, ctx1 ) =
                     Id.nextId ctx
             in
-            ( Reg { r | stamp = stamp }, ctx1 )
+            ( Reg { r | stamp = stamp }, ctx1, Dict.empty )
 
         Map entries ->
             let
-                ( newEntries, ctx1 ) =
+                ( newEntries, ctx1, remap ) =
                     Dict.foldl
-                        (\k e ( acc, c ) ->
+                        (\k e ( acc, c, m ) ->
                             let
-                                ( v, c1 ) =
-                                    reStamp c e.value
+                                ( v, c1, m1 ) =
+                                    reStampWithMap c e.value
 
                                 ( s, c2 ) =
                                     Id.nextId c1
                             in
-                            ( Dict.insert k { value = v, present = e.present, stamp = s } acc, c2 )
+                            ( Dict.insert k { value = v, present = e.present, stamp = s } acc, c2, mergeRemap m m1 )
                         )
-                        ( Dict.empty, ctx )
+                        ( Dict.empty, ctx, Dict.empty )
                         entries
             in
-            ( Map newEntries, ctx1 )
+            ( Map newEntries, ctx1, remap )
 
         Seq r ->
             reStampRga ctx Seq r
@@ -552,50 +603,124 @@ reStamp ctx node =
                         ( Dict.empty, ctx )
                         d
             in
-            ( Cnt newCnt, ctx1 )
+            ( Cnt newCnt, ctx1, Dict.empty )
 
         Mov ml ->
             -- rebuild a fresh movable list from the old visible order, minting a
             -- new valueId + cell per item (content deep-restamped too).
             let
-                ( rebuilt, ctx1, _ ) =
-                    MoveList.toList ml
+                ( rebuilt, ctx1, remap ) =
+                    MoveList.toEntries ml
                         |> List.foldl
-                            (\childOld ( acc, c, afterCell ) ->
+                            (\( oldVid, childOld ) ( acc, c, ( afterCell, m ) ) ->
                                 let
-                                    ( child, c1 ) =
-                                        reStamp c childOld
+                                    ( child, c1, m1 ) =
+                                        reStampWithMap c childOld
 
                                     ( vid, c2 ) =
                                         Id.nextId c1
                                 in
-                                ( MoveList.insert vid afterCell child acc, c2, Just vid )
+                                ( MoveList.insert vid afterCell child acc
+                                , c2
+                                , ( Just vid, mergeRemap (Dict.insert (Id.opIdToString oldVid) vid m) m1 )
+                                )
                             )
-                            ( MoveList.empty, ctx, Nothing )
+                            ( MoveList.empty, ctx, ( Nothing, Dict.empty ) )
+                        |> (\( acc, c, ( _, m ) ) -> ( acc, c, m ))
             in
-            ( Mov rebuilt, ctx1 )
+            ( Mov rebuilt, ctx1, remap )
+
+        Tree t ->
+            reStampTree ctx t
 
 
-reStampRga : Id.Ctx -> (RgaNode -> Node) -> RgaNode -> ( Node, Id.Ctx )
+{-| Union of two id-remap maps (later overrides on key clash; keys are globally
+fresh so clashes don't occur in practice).
+-}
+mergeRemap : Dict String OpId -> Dict String OpId -> Dict String OpId
+mergeRemap a b =
+    Dict.union b a
+
+
+{-| Rebuild a tree with entirely fresh node ids + move ids, preserving structure.
+Walks roots-first (breadth order over the live tree) so a child's re-minted parent
+already exists in the id remap. Positions are re-derived densely.
+-}
+reStampTree : Id.Ctx -> TreeNode -> ( Node, Id.Ctx, Dict String OpId )
+reStampTree ctx t =
+    let
+        step : Maybe OpId -> OpId -> ( Tree Node, Id.Ctx, Dict String OpId ) -> ( Tree Node, Id.Ctx, Dict String OpId )
+        step newParent oldId ( acc, c, m ) =
+            case Tree.get oldId t of
+                Nothing ->
+                    ( acc, c, m )
+
+                Just content ->
+                    let
+                        ( childContent, c1, m1 ) =
+                            reStampWithMap c content
+
+                        ( newId, c2 ) =
+                            Id.nextId c1
+
+                        ( moveId, c3 ) =
+                            Id.nextId c2
+
+                        pos =
+                            Tree.siblingPos oldId t |> Maybe.withDefault (Crdt.Frac.between Nothing Nothing)
+
+                        acc1 =
+                            Tree.move moveId newId newParent pos childContent acc
+
+                        m2 =
+                            mergeRemap (Dict.insert (Id.opIdToString oldId) newId m) m1
+
+                        -- recurse into this node's children under the new id
+                        ( acc2, c4, m3 ) =
+                            List.foldl (step (Just newId)) ( acc1, c3, m2 ) (Tree.childrenOf oldId t)
+                    in
+                    ( acc2, c4, m3 )
+
+        ( rebuilt, ctx1, remap ) =
+            List.foldl (step Nothing) ( Tree.empty, ctx, Dict.empty ) (Tree.roots t)
+    in
+    ( Tree rebuilt, ctx1, remap )
+
+
+reStampRga : Id.Ctx -> (RgaNode -> Node) -> RgaNode -> ( Node, Id.Ctx, Dict String OpId )
 reStampRga ctx wrap rga =
     let
-        ( rebuilt, ctx1 ) =
-            Rga.toList rga
+        ( rebuilt, ctx1, remap ) =
+            Rga.toElementsInOrder rga
+                |> List.filter (not << .deleted)
                 |> List.foldl
-                    (\childOld ( acc, c, origin ) ->
+                    (\elOld ( acc, c, ( origin, m ) ) ->
                         let
-                            ( child, c1 ) =
-                                reStamp c childOld
+                            ( child, c1, m1 ) =
+                                reStampWithMap c elOld.content
 
                             ( acc1, c2 ) =
                                 Rga.insertAfter c1 origin child acc
+
+                            newId =
+                                Rga.lastVisibleId acc1
                         in
-                        ( acc1, c2, Rga.lastVisibleId acc1 )
+                        ( acc1
+                        , c2
+                        , ( newId
+                          , case newId of
+                                Just nid ->
+                                    mergeRemap (Dict.insert (Id.opIdToString elOld.id) nid m) m1
+
+                                Nothing ->
+                                    mergeRemap m m1
+                          )
+                        )
                     )
-                    ( Rga.empty, ctx, Nothing )
-                |> (\( acc, c, _ ) -> ( acc, c ))
+                    ( Rga.empty, ctx, ( Nothing, Dict.empty ) )
+                |> (\( acc, c, ( _, m ) ) -> ( acc, c, m ))
     in
-    ( wrap rebuilt, ctx1 )
+    ( wrap rebuilt, ctx1, remap )
 
 
 mergeMaps : Dict String Entry -> Dict String Entry -> Dict String Entry
@@ -683,6 +808,9 @@ rank node =
 
         Mov _ ->
             5
+
+        Tree _ ->
+            6
 
 
 
@@ -772,6 +900,9 @@ maxCounter node =
 
         Mov ml ->
             MoveList.maxCounter maxCounter ml
+
+        Tree t ->
+            Tree.maxCounter maxCounter t
 
 
 rgaMaxCounter : RgaNode -> Int

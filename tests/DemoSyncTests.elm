@@ -10,6 +10,7 @@ import Crdt.Id as Id
 import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Ref as Ref exposing (Ref)
 import Crdt.Schema as S
+import Crdt.Tree as Tree
 import Expect
 import Test exposing (Test, describe, test)
 
@@ -24,8 +25,12 @@ type alias Todo =
     { text : String, done : Bool }
 
 
+type alias OutlineNode =
+    { text : String }
+
+
 type alias Board =
-    { title : String, status : Status, todos : List Todo }
+    { title : String, status : Status, todos : List Todo, outline : Tree.Forest OutlineNode }
 
 
 type alias StatusRefs =
@@ -65,10 +70,22 @@ todoDoc =
         |> Ref.build
 
 
+type alias OutlineRefs =
+    { text : Ref OutlineNode S.Settable String }
+
+
+outlineDoc : Ref.RecordRefs OutlineNode OutlineRefs
+outlineDoc =
+    Ref.record OutlineNode OutlineRefs
+        |> Ref.field "text" .text S.text
+        |> Ref.build
+
+
 type alias BoardRefs =
     { title : Ref Board S.Settable String
     , status : Ref Board (S.Variants Status) Status
     , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
+    , outline : Ref Board (S.TreeK S.Nested OutlineNode) (Tree.Forest OutlineNode)
     }
 
 
@@ -78,6 +95,7 @@ boardDoc =
         |> Ref.field "title" .title S.text
         |> Ref.field "status" .status statusDoc.schema
         |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
+        |> Ref.field "outline" .outline (S.tree outlineDoc.schema)
         |> Ref.build
 
 
@@ -161,4 +179,20 @@ suite =
                         deltaSync before alice (init "bob")
                 in
                 OpDoc.read bob |> Result.map (.todos >> List.map .text) |> Expect.equal (Ok [ "buy milk" ])
+        , test "an added outline node delta reaches a peer" <|
+            \_ ->
+                let
+                    before =
+                        OpDoc.version (init "alice")
+
+                    alice =
+                        Ref.addChild outlineDoc.schema (OutlineNode "root") Nothing refs.outline (init "alice")
+                            |> ok (init "alice")
+
+                    bob =
+                        deltaSync before alice (init "bob")
+                in
+                OpDoc.read bob
+                    |> Result.map (.outline >> List.map (Tree.itemValue >> .text))
+                    |> Expect.equal (Ok [ "root" ])
         ]

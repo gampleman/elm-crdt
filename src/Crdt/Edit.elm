@@ -211,6 +211,10 @@ go segs f node ctx =
                 Index i ->
                     descendSeq i rest f node ctx
 
+                NodeId _ ->
+                    -- trees are edited via Crdt.Ref/OpDoc, not the state-based Edit API
+                    Err WrongNodeType
+
 
 descendMap : String -> List Seg -> (Node -> Ctx -> Result Error ( Node, Ctx )) -> Node -> Ctx -> Result Error ( Node, Ctx )
 descendMap name rest f node ctx =

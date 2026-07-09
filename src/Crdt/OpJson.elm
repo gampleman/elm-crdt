@@ -20,6 +20,7 @@ A target is a list of steps: `{ "key": <string> }` or `{ "elem": <opid> }`.
 
 -}
 
+import Crdt.Frac as Frac
 import Crdt.Json as Json
 import Crdt.OpLog exposing (Action(..), Op, TargetStep(..))
 import Json.Decode as JD exposing (Decoder)
@@ -107,6 +108,30 @@ encodeAction action =
                 , ( "d", JE.int delta )
                 ]
 
+        TreeMove { container, child, parent, pos, seed } ->
+            JE.object
+                [ ( "k", JE.string "tree" )
+                , ( "t", encodeTarget container )
+                , ( "c", Json.encodeOpId child )
+                , ( "p"
+                  , case parent of
+                        Just p ->
+                            Json.encodeOpId p
+
+                        Nothing ->
+                            JE.null
+                  )
+                , ( "pos", JE.list JE.int (Frac.toList pos) )
+                , ( "s"
+                  , case seed of
+                        Just n ->
+                            Json.encodeNode n
+
+                        Nothing ->
+                            JE.null
+                  )
+                ]
+
 
 encodeTarget : List TargetStep -> JE.Value
 encodeTarget =
@@ -179,6 +204,14 @@ actionDecoder =
                         JD.map2 (\t delta -> Increment { target = t, delta = delta })
                             (JD.field "t" targetDecoder)
                             (JD.field "d" JD.int)
+
+                    "tree" ->
+                        JD.map5 (\t c p pos s -> TreeMove { container = t, child = c, parent = p, pos = Frac.fromList pos, seed = s })
+                            (JD.field "t" targetDecoder)
+                            (JD.field "c" Json.opIdDecoder)
+                            (JD.field "p" (JD.nullable Json.opIdDecoder))
+                            (JD.field "pos" (JD.list JD.int))
+                            (JD.field "s" (JD.nullable Json.nodeDecoder))
 
                     other ->
                         JD.fail ("unknown action kind: " ++ other)

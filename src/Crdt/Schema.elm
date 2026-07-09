@@ -1,8 +1,8 @@
 module Crdt.Schema exposing
     ( Crdt, Error, Seed
-    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK
+    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
     , int, float, string, bool, text, counter, lww
-    , list, movableList, dict
+    , list, movableList, dict, tree
     , with, decodeNode, emptyNode, errorToString
     )
 
@@ -24,9 +24,9 @@ records how the value may be edited, so `Crdt.Ref` can reject nonsensical edits 
 compile time; it never affects reads or merge.
 
 @docs Crdt, Error, Seed
-@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK
+@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK
 @docs int, float, string, bool, text, counter, lww
-@docs list, movableList, dict
+@docs list, movableList, dict, tree
 @docs with, decodeNode, emptyNode, errorToString
 
 -}
@@ -34,6 +34,7 @@ compile time; it never affects reads or merge.
 import Crdt.Id exposing (Ctx)
 import Crdt.Node exposing (Node)
 import Crdt.Schema.Internal as I
+import Crdt.Tree as Tree
 import Dict exposing (Dict)
 
 
@@ -103,6 +104,12 @@ type alias Movable =
 -}
 type alias DictK vk a =
     I.DictK vk a
+
+
+{-| Kind marker: a movable `tree` of `a` with node kind `ek`.
+-}
+type alias TreeK ek a =
+    I.TreeK ek a
 
 
 {-| An integer LWW register.
@@ -175,6 +182,14 @@ movableList =
 dict : Crdt vk a -> Crdt (DictK vk a) (Dict String a)
 dict =
     I.dict
+
+
+{-| A movable **tree** of `a`: hierarchical, re-parentable, sibling-ordered data.
+Reads as a `Crdt.Tree.Forest a`; edit through `Crdt.Ref`.
+-}
+tree : Crdt ek a -> Crdt (TreeK ek a) (Tree.Forest a)
+tree =
+    I.tree
 
 
 {-| Seed a node from a value, producing an opaque `Seed` the edit APIs consume.

@@ -42,6 +42,7 @@ import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node)
 import Crdt.Rga as Rga
 import Crdt.Schema as Schema exposing (Crdt)
+import Crdt.Tree as Tree
 import Dict
 import Json.Decode as JD
 import Json.Encode as JE
@@ -192,6 +193,13 @@ collectOpIds node =
             -- don't double-count it here.
             (MoveList.cells ml |> Rga.elements |> List.map .id)
                 ++ (MoveList.values ml |> Dict.values |> List.concatMap collectOpIds)
+
+        Node.Tree t ->
+            -- each move's op id (freshly minted per move) + nested payload ids.
+            -- A move's `child` is a node id that equals some move's op id, so it's
+            -- not double-counted here.
+            (Tree.moves t |> Dict.values |> List.map .moveOp)
+                ++ (Tree.payloads t |> Dict.values |> List.concatMap collectOpIds)
 
 
 collectRgaOpIds : Node.RgaNode -> List OpId
