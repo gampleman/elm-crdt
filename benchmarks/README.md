@@ -1,8 +1,70 @@
 # benchmarks
 
-Performance harness for the op-log (`docs/02-oplog.md`, Phase 2).
+Performance + footprint harness for the op-log (`docs/02-oplog.md`).
+
+## Memory / size benchmark (`run-mem.js`)
+
+Measures the footprint of built documents so optimization work is evidence-driven
+(the "measure first" step). Two kinds of number per workload + size:
+
+- **structural proxies** (deterministic): op count and encoded byte size, from Elm
+  via the public API (`OpDoc.opCount`, `String.length` of the encoded JSON). These
+  are attributable to a *structure* — compare the per-container workloads.
+- an absolute **heap** figure: the Elm worker retains N built docs in its model, so
+  their live heap sits in the shared V8 process and `process.memoryUsage().heapUsed`
+  sees it. GC-noisy, so force GC (`--expose-gc`) and average.
+
+```sh
+cd benchmarks
+../node_modules/.bin/elm make src/Headless.elm --output headless.js --optimize
+node --expose-gc run-mem.js
+# env knobs: SIZES=100,400  WORKLOADS=demo,text,list,dict,tree  HEAP_COPIES=20
+```
+
+Workloads: `demo` (realistic mixed doc), `text`, `list`, `dict`, `tree` (each
+per-container, for attribution). The `roundtrip` command flag retains a
+decoded-from-wire copy (fresh `ReplicaId` per op) instead of a locally-built one
+(shared `ReplicaId` reference), to measure the received-doc overhead. **Always build
+with `--optimize`** — dev mode adds debug wrappers that skew heap. See
+`docs/02-oplog.md` "Memory / size" for the findings.
+
+Headline: text is the *cheapest* structure per op; per-op `OpId` metadata dominates.
+The received-doc heap carries a replica string per op (text +67%, demo +20% over the
+built doc). We **tried** a wire replica-table to intern it: it cut encoded size ~14%
+(a real bandwidth win) but did **not** reduce heap — the `Array.get`-shared
+`ReplicaId` sharing didn't survive into the retained structure — so it was reverted
+as not worth the codec complexity for a wire-only gain. Footprint work is parked
+until it's a demonstrated bottleneck.
+
+Caveat: `heapUsed` deltas include `Dict`/V8 bookkeeping and assume linear retention —
+trust the *ranking* between structures, not the absolute per-doc MB.
+
+## Wire-size benchmark (`run-wire.js` + `run-packed.js`)
+
+Decides whether a custom binary wire format is worth building, against the real
+baseline of **gzipped JSON** (`node`'s built-in `zlib`). `Headless` `mode:"wire"`
+hands back the full-doc encoding + a one-edit delta as JSON strings; the runners gzip
+them.
+
+```sh
+node run-wire.js     # raw JSON vs gzip(JSON), full docs + deltas
+node run-packed.js   # + a prototype columnar/delta/varint/interned packed format, gzipped
+```
+
+**Finding (see `docs/02` and ROADMAP):** gzip(JSON) compresses full docs to 6–9%
+(11–16×); the packed prototype beats gzip(JSON) by only 0–18% on full docs and ~0% on
+small deltas — **a custom format is not worth it** at these sizes. Two takeaways that
+are: use **raw DEFLATE** (not gzip framing) for tiny deltas (free ~5%), and the real
+wire bloat is an **algorithmic** bug, not a format one — sequence-insert ops carry the
+entire causal frontier as `deps` (979 deps/op measured), which belongs in the
+optimization pass, not a codec.
 
 ## Read-path benchmark (the Phase 2 go/no-go gate)
+
+> **Note:** `run.js` is the original read-path gate and expects `OpDoc.cachedState`/
+> `freshState` on `Headless`. `src/Headless.elm` has since been repurposed for the
+> memory benchmark above; restore the read-path worker (git history) before running
+> `run.js` again. Kept here as a record of the Phase 2 result.
 
 Compares reading an op-document via the maintained **cache** (`OpDoc.read` /
 `cachedState`) against a full **re-materialization** of the same op store
