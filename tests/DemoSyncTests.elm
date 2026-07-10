@@ -9,7 +9,7 @@ schema and the Path edit API; this pins the real thing.
 import Crdt.Id as Id
 import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Ref as Ref exposing (Ref)
-import Crdt.RichText as RichText exposing (MarkValue(..), Span)
+import Crdt.RichText exposing (MarkValue(..), Span)
 import Crdt.Schema as S
 import Crdt.Tree as Tree
 import Dict exposing (Dict)

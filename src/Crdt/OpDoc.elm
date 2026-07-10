@@ -1982,29 +1982,37 @@ applyTextDiff target rga value doc =
         startPlacement =
             fuguePlacement rga leftAnchor rightAnchor
 
-        deps =
+        -- The batch is CHAINED, not stamped with a shared frontier: the first op
+        -- depends on the pre-edit frontier, and each subsequent op depends only on
+        -- the previous op in the batch (`prevDep`). This keeps the causal frontier
+        -- O(1) after the run — otherwise every char op is a fresh tip and the *next*
+        -- edit's delta must enumerate the whole run as `deps` (measured: ~979 deps/op
+        -- for a 5-char edit on a 1000-char doc, 99% of the delta). Chaining preserves
+        -- ordering: each op still transitively follows all prior history.
+        startDeps =
             frontierOf doc
 
-        -- delete ops
-        ( afterDeletes, deleteOps ) =
+        -- delete ops (chained; `prevDep` threads the last-minted op id forward)
+        ( afterDeletes, deleteOps, depsAfterDeletes ) =
             List.foldl
-                (\elemId ( d, acc ) ->
+                (\elemId ( d, acc, prevDep ) ->
                     let
                         ( id, d1 ) =
                             mint d
                     in
-                    ( d1, op id deps (DeleteElem { container = target, elem = elemId }) :: acc )
+                    ( d1, op id prevDep (DeleteElem { container = target, elem = elemId }) :: acc, [ id ] )
                 )
-                ( doc, [] )
+                ( doc, [], startDeps )
                 deleteIds
 
         -- insert ops. The first char uses the Fugue placement; each subsequent char
         -- chains as a RIGHT-CHILD of the previous one, so the whole run is a single
         -- right-spine subtree — that is what keeps a concurrent run at the same gap
         -- from interleaving with this one (it renders as one contiguous block).
+        -- `deps` chains the same way (`prevDep`), continuing from the deletes.
         ( finalDoc, insertOpsRev, _ ) =
             List.foldl
-                (\char ( d, acc, placement ) ->
+                (\char ( d, acc, ( placement, prevDep ) ) ->
                     let
                         ( elemId, d1 ) =
                             mint d
@@ -2016,11 +2024,11 @@ applyTextDiff target rga value doc =
                             Node.reg (PString (String.fromChar char)) elemId
                     in
                     ( d1
-                    , op elemId deps (InsertElem { container = target, elemId = elemId, parent = parent, side = side, seed = seedNode }) :: acc
-                    , ( Just elemId, Rga.Right )
+                    , op elemId prevDep (InsertElem { container = target, elemId = elemId, parent = parent, side = side, seed = seedNode }) :: acc
+                    , ( ( Just elemId, Rga.Right ), [ elemId ] )
                     )
                 )
-                ( afterDeletes, [], startPlacement )
+                ( afterDeletes, [], ( startPlacement, depsAfterDeletes ) )
                 insertChars
     in
     commit (deleteOps ++ List.reverse insertOpsRev) finalDoc
