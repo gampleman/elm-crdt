@@ -2,8 +2,13 @@ elm-stuff/
 node_modules/
 docs.json
 
-# demo build artifact
+# demo build artifacts
 demo/elm.js
+demo/bundle.js
+
+# playwright e2e artifacts
+demo/test-results/
+demo/playwright-report/
 
 # editor / OS
 .DS_Store

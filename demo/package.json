@@ -10,7 +10,12 @@
     "start:js": "esbuild index.js --bundle --outfile=bundle.js --format=iife --watch",
     "build": "run-s build:elm build:js",
     "build:elm": "elm make src/Main.elm --output=elm.js",
-    "build:js": "esbuild index.js --bundle --outfile=bundle.js --format=iife"
+    "build:js": "esbuild index.js --bundle --outfile=bundle.js --format=iife",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "http-server": "^14.1.1"
   },
   "dependencies": {
     "@tiptap/core": "^2.11.0",

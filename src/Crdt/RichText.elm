@@ -3,6 +3,9 @@ module Crdt.RichText exposing
     , covers, markValueAt
     , valueInRange
     , empty, fromSpans
+    , Block, toBlocks, blockTypeMark
+    , markerNode, nestTokenNode, isMarker, isNestToken
+    , isLeadingTypeMark, leadingTypeMark
     )
 
 {-| The read model for rich (formatted) text: flatten a `Node.RichNode` — a Fugue
@@ -34,6 +37,9 @@ character (per the anchor `side`). So:
 @docs covers, markValueAt
 @docs valueInRange
 @docs empty, fromSpans
+@docs Block, toBlocks, blockTypeMark
+@docs markerNode, nestTokenNode, isMarker, isNestToken
+@docs isLeadingTypeMark, leadingTypeMark
 
 -}
 
@@ -60,6 +66,29 @@ type alias Span =
     { text : String
     , marks : Dict String MarkValue
     }
+
+
+{-| A block in the document: the `OpId` of the **marker** element that opened it
+(`Nothing` for the implicit leading block, which has no marker), its app-defined
+`type_` (`""` = the default block, e.g. paragraph), its indent `depth`, and its
+inline content as formatted spans. The marker id is what block edits address
+(`OpDoc.mergeBlock`/`setBlockType`/`indentBlock`). See `toBlocks` and `docs/11`.
+-}
+type alias Block =
+    { marker : Maybe OpId
+    , type_ : String
+    , depth : Int
+    , spans : List Span
+    }
+
+
+{-| The mark `type_` that carries a block's app-defined type on its marker element.
+The library never interprets the value (an opaque string like a `link` href); the app
+picks the vocabulary (`"h1"`, `"blockquote"`, `"ul"`, …). No mark = the default block.
+-}
+blockTypeMark : String
+blockTypeMark =
+    "block"
 
 
 {-| The visible (non-tombstoned) characters concatenated, ignoring formatting.
@@ -120,6 +149,196 @@ toSpans r =
         |> List.indexedMap Tuple.pair
         |> List.foldl step []
         |> List.reverse
+
+
+
+-- BLOCK STRUCTURE ------------------------------------------------------------
+--
+-- The char sequence carries two extra *distinguished* element kinds besides text:
+--   • a MARKER = a block boundary (its `block` mark gives the following block's type,
+--     the live nest tokens right after it give the block's depth);
+--   • a NEST TOKEN = one unit of indent depth for the block it follows a marker in.
+-- Both are encoded as non-string prims (marker = PInt 0, token = PInt 1) so they can
+-- never collide with a text char (`Reg (PString _)`) and are already skipped by
+-- `charOf`/`toSpans` (which match only `PString`). See `docs/11`.
+
+
+markerTag : Int
+markerTag =
+    0
+
+
+nestTokenTag : Int
+nestTokenTag =
+    1
+
+
+{-| Is a mark op the **leading-block type mark** — the `block`-type mark that carries
+block 0's type? Block 0 has no marker element to anchor to (it is the run of text
+before the first real marker), so its type is stored as a `block` mark anchored to the
+document **head**: both endpoints `ref = Nothing`. Such an op never covers any
+character (start and end coincide at −∞), so it is inert for normal per-character mark
+resolution and is read only by `toBlocks` via `leadingTypeMark`. Concurrent block-0
+formatting converges by the same per-target LWW as any mark (highest `OpId` wins) — no
+constant id, no phantom element.
+-}
+isLeadingTypeMark : MarkOp -> Bool
+isLeadingTypeMark m =
+    m.type_ == blockTypeMark && m.start.ref == Nothing && m.end.ref == Nothing
+
+
+{-| The winning app-defined type for **block 0** from the head-anchored `block` marks
+(see `isLeadingTypeMark`): the highest-`OpId` such op's value, or `""` if none / the
+winner is a clear.
+-}
+leadingTypeMark : List MarkOp -> String
+leadingTypeMark marks =
+    marks
+        |> List.filter isLeadingTypeMark
+        |> List.foldl
+            (\m acc ->
+                case acc of
+                    Just prev ->
+                        if Id.compareOpId m.id prev.id == GT then
+                            Just m
+
+                        else
+                            acc
+
+                    Nothing ->
+                        Just m
+            )
+            Nothing
+        |> Maybe.andThen (\m -> markValue m.value)
+        |> Maybe.map
+            (\v ->
+                case v of
+                    Value s ->
+                        s
+
+                    Flag ->
+                        ""
+            )
+        |> Maybe.withDefault ""
+
+
+{-| The content `Node` for a block-boundary marker element (used when seeding /
+emitting a split). Distinguished from a text char by being a non-string prim.
+-}
+markerNode : Node.Node
+markerNode =
+    Node.reg (PInt markerTag) (Id.opId 0 (Id.replica ""))
+
+
+{-| The content `Node` for one nest-token (indent-unit) element.
+-}
+nestTokenNode : Node.Node
+nestTokenNode =
+    Node.reg (PInt nestTokenTag) (Id.opId 0 (Id.replica ""))
+
+
+{-| Is this element content a block marker?
+-}
+isMarker : Node.Node -> Bool
+isMarker node =
+    Node.asPrim node == Just (PInt markerTag)
+
+
+{-| Is this element content a nest token?
+-}
+isNestToken : Node.Node -> Bool
+isNestToken node =
+    Node.asPrim node == Just (PInt nestTokenTag)
+
+
+{-| Flatten a rich-text node into its **blocks**, each with its app-defined type,
+indent depth, and inline spans (see `docs/11`). The document always has at least the
+implicit leading block (characters before the first marker), so an empty/marker-free
+node reads as one default block.
+
+Walk the elements in Fugue order: a live **marker** ends the current block and starts
+the next (its resolved `block` mark = the next block's type; the run of live nest
+tokens immediately following it = the next block's depth); **nest tokens** are
+consumed as depth, not emitted; **chars** flatten into the current block's spans via
+the same per-character active-mark logic as `toSpans`. Tombstoned markers/tokens are
+skipped (a merged block / an outdent).
+
+-}
+toBlocks : RichNode -> List Block
+toBlocks r =
+    let
+        ordered =
+            Rga.toElementsInOrder r.text
+
+        indexOf =
+            ordered
+                |> List.indexedMap (\i el -> ( Id.opIdToString el.id, i ))
+                |> Dict.fromList
+
+        marksList =
+            Dict.values r.marks
+
+        -- resolve the `block` mark on a marker element (its own single-char range) to
+        -- the app-defined type string; `""` when unmarked (the default block).
+        markerType : Int -> String
+        markerType i =
+            case markValueAt marksList indexOf blockTypeMark i of
+                Just (Value s) ->
+                    s
+
+                _ ->
+                    ""
+
+        emptyBlock marker type_ depth =
+            { marker = marker, type_ = type_, depth = depth, spans = [] }
+
+        addChar ch active block =
+            case List.reverse block.spans of
+                span :: restRev ->
+                    if span.marks == active then
+                        { block | spans = List.reverse ({ span | text = span.text ++ ch } :: restRev) }
+
+                    else
+                        { block | spans = block.spans ++ [ { text = ch, marks = active } ] }
+
+                [] ->
+                    { block | spans = [ { text = ch, marks = active } ] }
+
+        -- fold state: (finished blocks reversed, current block, depth accumulating
+        -- for the current block from nest tokens seen since its marker)
+        step ( i, el ) ( done, cur ) =
+            if el.deleted then
+                ( done, cur )
+
+            else if isMarker el.content then
+                -- a separator marker: close current block, open next (its `block` mark
+                -- gives the next block's type; nest tokens after it give its depth).
+                ( cur :: done, emptyBlock (Just el.id) (markerType i) 0 )
+
+            else if isNestToken el.content then
+                ( done, { cur | depth = cur.depth + 1 } )
+
+            else
+                case charOf el.content of
+                    Just ch ->
+                        ( done, addChar ch (activeMarks marksList indexOf i) cur )
+
+                    Nothing ->
+                        ( done, cur )
+
+        -- Block 0 has no marker element: its type comes from the head-anchored `block`
+        -- mark (`leadingTypeMark`) and its depth from the nest tokens before the first
+        -- separator (counted by the same `isNestToken` branch above, since they precede
+        -- any marker). `marker = Nothing`.
+        block0 =
+            emptyBlock Nothing (leadingTypeMark marksList) 0
+
+        ( doneRev, lastBlock ) =
+            ordered
+                |> List.indexedMap Tuple.pair
+                |> List.foldl step ( [], block0 )
+    in
+    List.reverse (lastBlock :: doneRev)
 
 
 {-| The active mark set for the character at order-index `i`: for each mark `type_`,

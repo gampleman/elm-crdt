@@ -2,16 +2,27 @@
 // owned by Elm's CRDT. The element is a *view + input device* only — it never holds
 // authoritative state:
 //
-//   • Elm pushes the current document down as `docSpans` (a property) and via the
+//   • Elm pushes the current document down as `docBlocks` (a property) and via the
 //     `renderRichText` port; the element reconciles its ProseMirror doc to match.
-//   • User edits/format commands are reported up as `richtext-input` CustomEvents,
-//     which index.js forwards to Elm's `richTextInput` port. Elm turns them into
-//     CRDT ops (setRichText / mark / unmark), which converge, then flow back down.
+//   • User edits/format/block commands are reported up as `richtext-input`
+//     CustomEvents, which index.js forwards to Elm's `richTextInput` port. Elm turns
+//     them into CRDT ops (setRich / mark / split / merge / setType / indent /
+//     outdent), which converge, then flow back down.
+//
+// Block model (see docs/11): the CRDT is a flat list of blocks, each { type, depth,
+// spans }. We render each block as a SINGLE top-level ProseMirror node (paragraph /
+// heading / blockquote, or a paragraph visually styled as a list item), with depth
+// applied as CSS indentation via a `data-depth` attribute — deliberately NOT PM's
+// genuinely-nested bullet_list/list_item trees. That keeps the PM↔CRDT position
+// mapping one-block-to-one-block (no nested-list position arithmetic), which is what
+// makes the binding robust; the CRDT fully supports nesting, the editor just renders
+// it flat-with-indent. Type/depth are block attributes the CRDT stores opaquely.
 //
 // Loop avoidance: a doc pushed *down* is applied with a transaction meta flag, so the
 // resulting ProseMirror transaction is not echoed back up as user input.
 
 import { Editor } from "@tiptap/core";
+import { TextSelection } from "@tiptap/pm/state";
 import Document from "@tiptap/extension-document";
 import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
@@ -22,33 +33,69 @@ import Strike from "@tiptap/extension-strike";
 import Code from "@tiptap/extension-code";
 import Link from "@tiptap/extension-link";
 
-// v1 rich text is a SINGLE paragraph of inline-formatted text (see docs/10). Two
-// things enforce that so the editor can't drift from the CRDT model:
-//   • the document schema allows exactly one paragraph (`content: "paragraph"`), so
-//     ProseMirror structurally refuses to split into a second block; and
-//   • Enter / Shift-Enter are bound to no-ops, so pressing Enter does nothing rather
-//     than attempting (and visibly half-doing) a split that the round-trip undoes.
-const SingleParagraphDocument = Document.extend({ content: "paragraph" });
+// A meta key marking a transaction as "applied from Elm", so onTransaction skips it.
+const FROM_ELM = "crdtFromElm";
 
-const NoLineBreaks = Paragraph.extend({
-  addKeyboardShortcuts() {
-    const swallow = () => true; // handled: do nothing
-    return { Enter: swallow, "Shift-Enter": swallow, "Mod-Enter": swallow };
+// The block type strings the CRDT stores (opaque to the library; this is the demo's
+// vocabulary). "" = default paragraph.
+const BLOCK_PARAGRAPH = "";
+
+// Our single block node: a `block` node holding inline content, carrying `blockType`
+// (opaque CRDT string) and `depth` (indent). We render it as the right HTML tag and
+// tag it with data-* so CSS can style headings/quotes/list items + indentation, and
+// so we can read the type/depth back off the DOM if needed.
+const Block = Paragraph.extend({
+  name: "block",
+  addAttributes() {
+    // Parse the attributes back FROM the DOM (data-type / data-depth) as well as
+    // rendering them. The very first editor content is built as an HTML string (the
+    // schema doesn't exist yet at `new Editor({content})`), so without these parse
+    // rules the initial parse would drop blockType/depth to their defaults and the
+    // document would load unformatted until the next edit re-rendered through the
+    // schema. See `renderHTML` for the matching output.
+    return {
+      blockType: {
+        default: BLOCK_PARAGRAPH,
+        parseHTML: (el) => el.getAttribute("data-type") || BLOCK_PARAGRAPH,
+        renderHTML: (attrs) => ({ "data-type": attrs.blockType || BLOCK_PARAGRAPH }),
+      },
+      depth: {
+        default: 0,
+        parseHTML: (el) => parseInt(el.getAttribute("data-depth") || "0", 10) || 0,
+        renderHTML: (attrs) => ({ "data-depth": String(attrs.depth || 0) }),
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: "div.block" }];
+  },
+  renderHTML({ node }) {
+    const t = node.attrs.blockType || BLOCK_PARAGRAPH;
+    return [
+      "div",
+      {
+        class: "block",
+        "data-type": t,
+        "data-depth": String(node.attrs.depth || 0),
+      },
+      0,
+    ];
   },
 });
 
-// TipTap mark name → the mark `type_` string the CRDT uses (they line up here, but
-// keeping the map explicit documents the contract with the Elm side).
-const MARK_TYPES = ["bold", "italic", "underline", "strike", "code", "link"];
-
-// A meta key marking a transaction as "applied from Elm", so onUpdate skips it.
-const FROM_ELM = "crdtFromElm";
+const BlockDocument = Document.extend({ content: "block+" });
 
 class CrdtRichText extends HTMLElement {
   constructor() {
     super();
     this.editor = null;
-    this._pendingSpans = null; // spans set before the editor existed
+    this._pendingBlocks = null;
+    // Where to place the caret after the NEXT block re-render, as a block-relative
+    // {blockIndex, charOffset}. Set when we emit a local structural intent (split /
+    // merge / indent / setType) whose result Elm pushes back — because that rebuild
+    // replaces the whole PM doc and would otherwise drop the caret to the end. Null =
+    // no explicit target, so a re-render just preserves the current caret position.
+    this._desiredCaret = null;
   }
 
   connectedCallback() {
@@ -59,8 +106,8 @@ class CrdtRichText extends HTMLElement {
     this.editor = new Editor({
       element: mount,
       extensions: [
-        SingleParagraphDocument,
-        NoLineBreaks,
+        BlockDocument,
+        Block,
         Text,
         Bold,
         Italic,
@@ -69,16 +116,18 @@ class CrdtRichText extends HTMLElement {
         Code,
         Link.configure({ openOnClick: false }),
       ],
-      content: spansToHtml(this._pendingSpans || currentSpansProp(this)),
+      content: blocksToDoc(this._pendingBlocks || [{ type: "", depth: 0, spans: [] }]),
       onTransaction: ({ editor, transaction }) => {
         if (transaction.getMeta(FROM_ELM)) return; // don't echo Elm-driven changes
-        if (!transaction.docChanged) return;
         this._emitTransaction(editor, transaction);
       },
     });
 
-    // format commands come from our own toolbar (below), dispatched as CustomEvents
-    // on this element so the binding stays declarative.
+    // block/format keyboard behavior (Enter split, Backspace merge, Tab indent) is
+    // installed via a plain DOM keydown handler so we control the exact intents.
+    this._keydown = (e) => this._onKeydown(e);
+    mount.addEventListener("keydown", this._keydown, true);
+
     this._toolbar = buildToolbar(this);
     this.insertBefore(this._toolbar, mount);
   }
@@ -90,50 +139,120 @@ class CrdtRichText extends HTMLElement {
     }
   }
 
-  // Elm sets this property (via A.property "docSpans") on mount and on every render.
-  set docSpans(spans) {
-    this._pendingSpans = spans;
-    if (this.editor) this._applySpans(spans);
+  set docBlocks(blocks) {
+    this._pendingBlocks = blocks;
+    if (this.editor) this._applyBlocks(blocks);
   }
 
-  get docSpans() {
-    return this._pendingSpans;
+  get docBlocks() {
+    return this._pendingBlocks;
   }
 
-  // Reconcile the ProseMirror doc to `spans` without echoing back to Elm. We skip
-  // the replace when the editor already shows these exact spans (compared against
-  // the *live* editor doc, not a cache) — otherwise we'd stomp the user's caret on
-  // every keystroke's round-trip through Elm.
-  _applySpans(spans) {
+  // Reconcile the PM doc to `blocks` without echoing back to Elm. Skip when the
+  // editor already shows these exact blocks (so we don't stomp the caret on the
+  // round-trip of every keystroke). Replacing the doc content drops the selection to
+  // the end, so we compute a block-relative caret to restore BEFORE the replace and
+  // re-apply it after — using the explicit `_desiredCaret` from a local structural
+  // intent when present, else the caret's current block-relative position (for remote
+  // edits, so a peer's change doesn't fling our cursor to the end).
+  _applyBlocks(blocks) {
     if (!this.editor) return;
-    if (spansEqual(currentEditorSpans(this.editor), spans || [])) return;
+    if (blocksEqual(currentEditorBlocks(this.editor), blocks || [])) {
+      // nothing to re-render; drop any pending caret target so it can't leak into a
+      // later, unrelated re-render.
+      this._desiredCaret = null;
+      return;
+    }
 
     const { state, view } = this.editor;
+    const caret = this._desiredCaret || this._currentBlockCaret();
+    this._desiredCaret = null;
+
     const tr = state.tr.setMeta(FROM_ELM, true);
-    const node = spansToDoc(state.schema, spans);
-    tr.replaceWith(0, state.doc.content.size, node.content);
+    const doc = blocksToDoc(blocks, state.schema);
+    tr.replaceWith(0, state.doc.content.size, doc.content);
+
+    if (caret) {
+      const pos = blockCaretToPos(tr.doc, caret.blockIndex, caret.charOffset);
+      if (pos != null) tr.setSelection(TextSelection.create(tr.doc, pos));
+    }
     view.dispatch(tr);
+
+    // keep focus so the caret is actually visible after a structural edit
+    if (caret && !view.hasFocus()) view.focus();
   }
 
-  // Translate a user ProseMirror transaction into CRDT intents. Text changes (typing,
-  // delete, paste) become a `text` intent carrying the whole paragraph; formatting
-  // changes (from the toolbar OR keyboard shortcuts, both of which are real PM
-  // transactions) become `mark` intents per mark step. A single transaction can carry
-  // both (e.g. paste), so we look at all its steps.
+  // The current selection head as a block-relative {blockIndex, charOffset}, or null.
+  _currentBlockCaret() {
+    const { selection } = this.editor.state;
+    const $head = selection.$head;
+    return { blockIndex: $head.index(0), charOffset: $head.parentOffset };
+  }
+
+  // --- position helpers ----------------------------------------------------
+  // A "block index" is the index of a top-level block node; a "char offset" within a
+  // block is the number of text characters before a position. Document char offset =
+  // sum of block lengths before + offset within.
+
+  _blockIndexAt(pos) {
+    // which top-level block contains PM position `pos`
+    const $pos = this.editor.state.doc.resolve(pos);
+    // depth 1 = the block node; index at depth 0 is the block index
+    return $pos.index(0);
+  }
+
+  _charOffsetInBlock(pos) {
+    const $pos = this.editor.state.doc.resolve(pos);
+    // start of this block's content:
+    const blockStart = $pos.start(1);
+    return pos - blockStart;
+  }
+
+  // --- input → intents -----------------------------------------------------
+
+  _onKeydown(e) {
+    const { state } = this.editor;
+    const { selection } = state;
+    const { $from, empty } = selection;
+    const blockIndex = $from.index(0);
+
+    // Enter (split) and Backspace-at-block-start (merge) are handled NATIVELY by
+    // ProseMirror — we do not intercept them. The resulting block-count change is
+    // detected in `_emitTransaction`, which emits a `reconcile` carrying the full new
+    // block structure; Elm transforms the CRDT to match. Letting PM own the DOM edit
+    // (rather than preventDefault + re-render from Elm) avoids a race where a re-render
+    // carrying a pre-edit snapshot wiped text typed immediately after a split.
+    //
+    // Only indent/outdent are intercepted, since ProseMirror has no native notion of
+    // our flat depth attribute.
+    if (e.key === "Tab") {
+      e.preventDefault();
+      this._desiredCaret = { blockIndex, charOffset: $from.parentOffset };
+      this._emit({ tag: e.shiftKey ? "outdent" : "indent", blockIndex });
+    }
+    // everything else (typing, Enter, Backspace, arrows) flows through PM →
+    // onTransaction, which mirrors text and structural changes to the CRDT.
+  }
+
+  // Translate a user PM transaction into text/mark intents. Block-structure edits
+  // (split/merge/indent/outdent) come from _onKeydown / the toolbar directly; here we
+  // only report text + marks. Text intents are emitted PER BLOCK ({tag,blockIndex,text})
+  // so Elm diffs within that block's characters — typed text can't leak across a block
+  // boundary (the bug the whole-document diff had). We emit a block's text when it
+  // differs from the last blocks Elm pushed down (`_pendingBlocks`); re-emitting an
+  // unchanged block is harmless (Elm's per-block diff is a no-op).
   _emitTransaction(editor, transaction) {
+    if (!transaction.docChanged) return;
+
     let textChanged = false;
     const markIntents = [];
 
     for (const step of transaction.steps) {
-      // Discriminate by ProseMirror's registered step type, NOT constructor.name —
-      // bundlers (esbuild) rename classes (we saw `_AddMarkStep`), so class-name
-      // matching silently breaks. `stepType` is a stable string in the step's JSON.
       const stepType = step.toJSON().stepType;
       if (stepType === "addMark" || stepType === "removeMark") {
         const type = step.mark.type.name;
-        // step.from/to are PM positions; the paragraph opens at 1 → char = pos-1.
-        const from = Math.max(0, step.from - 1);
-        const to = Math.max(from, step.to - 1);
+        const from = this._docCharOffset(step.from);
+        const to = this._docCharOffset(step.to);
         if (to > from) {
           markIntents.push({
             tag: "mark",
@@ -149,53 +268,229 @@ class CrdtRichText extends HTMLElement {
           });
         }
       } else {
-        // replace / replaceAround — the text content changed
         textChanged = true;
       }
     }
 
-    // Emit the text change first (so a mark applied to just-typed text lands on
-    // characters Elm already knows about), then each mark change.
     if (textChanged) {
-      this._emit({ tag: "text", text: editor.getText() });
+      const current = currentEditorBlocks(editor);
+      const prev = this._pendingBlocks || [];
+
+      if (current.length === prev.length) {
+        // same block count: per-block text diff (typing within blocks).
+        current.forEach((blk, index) => {
+          const text = blockText(blk);
+          if (text !== blockText(prev[index])) {
+            this._emit({ tag: "text", blockIndex: index, text });
+          }
+        });
+      } else {
+        // The block count changed. Prefer the PRECISE structural op (split / merge)
+        // when it's a single clean Enter / Backspace, because those map to the CRDT's
+        // COMMUTATIVE `splitBlock` / `mergeBlock` primitives and so converge under
+        // concurrent editing. Only fall back to the whole-structure `reconcile` (which
+        // does not commute) for genuinely complex edits — a multi-block paste or
+        // selection delete.
+        const op = diffStructural(prev, current);
+        if (op && op.kind === "split") {
+          this._emit({ tag: "split", blockIndex: op.blockIndex, charOffset: op.charOffset });
+        } else if (op && op.kind === "merge") {
+          this._emit({ tag: "merge", blockIndex: op.blockIndex });
+        } else {
+          this._emit({
+            tag: "reconcile",
+            blocks: current.map((b) => ({
+              type: b.type || "",
+              depth: b.depth || 0,
+              text: blockText(b),
+            })),
+          });
+        }
+      }
     }
-    for (const intent of markIntents) {
-      this._emit(intent);
-    }
+    for (const intent of markIntents) this._emit(intent);
+  }
+
+  // PM position → document-wide character offset (chars in all blocks before it +
+  // chars before it within its block). Block boundaries don't count as chars — they
+  // match the CRDT's flattened char stream that setRich/mark operate on.
+  _docCharOffset(pos) {
+    const doc = this.editor.state.doc;
+    let offset = 0;
+    let found = 0;
+    const $pos = doc.resolve(pos);
+    const targetIndex = $pos.index(0);
+    doc.forEach((blockNode, _blockPmOffset, index) => {
+      if (index < targetIndex) offset += blockNode.textContent.length;
+    });
+    found = offset + $pos.parentOffset;
+    return found;
+  }
+
+  emitSetType(type) {
+    // setType re-renders the block (its type changes) — keep the caret where it is.
+    const { $from } = this.editor.state.selection;
+    this._desiredCaret = { blockIndex: $from.index(0), charOffset: $from.parentOffset };
+    this._emit({ tag: "setType", blockIndex: $from.index(0), type });
   }
 
   _emit(detail) {
     this.dispatchEvent(
-      new CustomEvent("richtext-input", {
-        detail,
-        bubbles: true,
-        composed: true,
-      })
+      new CustomEvent("richtext-input", { detail, bubbles: true, composed: true })
     );
   }
 }
 
-function currentSpansProp(el) {
-  return el._pendingSpans || [{ text: "", marks: {} }];
+// --- blocks <-> ProseMirror doc --------------------------------------------
+
+// The demo's block-type vocabulary → PM heading level / node styling. The CRDT stores
+// the string opaquely; this map is purely the demo's presentation choice.
+function headingLevel(type) {
+  return { h1: 1, h2: 2, h3: 3 }[type] || 0;
 }
 
-// Serialize the editor's current single paragraph as CRDT-shaped spans (adjacent
-// characters with equal marks grouped), so we can compare against an incoming render.
-function currentEditorSpans(editor) {
-  const spans = [];
-  const doc = editor.state.doc;
-  doc.descendants((node) => {
-    if (!node.isText) return true;
-    const marks = {};
-    for (const m of node.marks) {
-      marks[m.type.name] = m.type.name === "link" ? m.attrs.href : true;
+// A block-relative caret ({blockIndex, charOffset}) → an absolute PM position in
+// `doc`, clamped to that block's text. Returns null if the block index is out of
+// range. Used to restore the caret after a doc rebuild.
+function blockCaretToPos(doc, blockIndex, charOffset) {
+  const bi = Math.max(0, Math.min(blockIndex, doc.childCount - 1));
+  if (bi < 0) return null;
+  const blockNode = doc.child(bi);
+  // start-of-content position of block `bi` = 1 (open doc) + sum of prior block sizes
+  let pos = 1;
+  for (let i = 0; i < bi; i++) pos += doc.child(i).nodeSize;
+  const maxOffset = blockNode.content.size;
+  return pos + Math.max(0, Math.min(charOffset, maxOffset));
+}
+
+function crdtMarkToPm(schema, type, value) {
+  const m = schema.marks[type];
+  if (!m) return null;
+  return type === "link" ? m.create({ href: String(value) }) : m.create();
+}
+
+function blocksToDoc(blocks, schema) {
+  // schema may be omitted on the very first content build (TipTap parses HTML then);
+  // in that case fall back to an HTML string.
+  if (!schema) return blocksToHtml(blocks);
+
+  const blockNodes = (blocks && blocks.length ? blocks : [{ type: "", depth: 0, spans: [] }]).map(
+    (block) => {
+      const inline = [];
+      for (const span of block.spans || []) {
+        if (!span.text) continue;
+        const marks = [];
+        for (const [type, value] of Object.entries(span.marks || {})) {
+          const mk = crdtMarkToPm(schema, type, value);
+          if (mk) marks.push(mk);
+        }
+        inline.push(schema.text(span.text, marks));
+      }
+      return schema.nodes.block.create(
+        { blockType: block.type || "", depth: block.depth || 0 },
+        inline
+      );
     }
-    const last = spans[spans.length - 1];
-    if (last && sameMarkObj(last.marks, marks)) last.text += node.text;
-    else spans.push({ text: node.text, marks });
-    return false;
+  );
+  return schema.nodes.doc.create(null, blockNodes);
+}
+
+// Initial content before the editor's schema exists: an HTML string of div.block's.
+function blocksToHtml(blocks) {
+  const esc = (s) =>
+    (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const spanHtml = (span) => {
+    let t = esc(span.text);
+    const m = span.marks || {};
+    if (m.code) t = `<code>${t}</code>`;
+    if (m.strike) t = `<s>${t}</s>`;
+    if (m.underline) t = `<u>${t}</u>`;
+    if (m.italic) t = `<em>${t}</em>`;
+    if (m.bold) t = `<strong>${t}</strong>`;
+    if (m.link) t = `<a href="${esc(String(m.link))}">${t}</a>`;
+    return t;
+  };
+  const list = blocks && blocks.length ? blocks : [{ type: "", depth: 0, spans: [] }];
+  return list
+    .map((b) => {
+      const inner = (b.spans || []).map(spanHtml).join("") || "";
+      return `<div class="block" data-type="${esc(b.type)}" data-depth="${b.depth || 0}">${inner}</div>`;
+    })
+    .join("");
+}
+
+// Serialize the editor's current PM doc back to CRDT-shaped blocks (for the skip
+// comparison in _applyBlocks).
+function currentEditorBlocks(editor) {
+  const blocks = [];
+  editor.state.doc.forEach((blockNode) => {
+    const spans = [];
+    blockNode.forEach((child) => {
+      if (!child.isText) return;
+      const marks = {};
+      for (const mk of child.marks) {
+        marks[mk.type.name] = mk.type.name === "link" ? mk.attrs.href : true;
+      }
+      const last = spans[spans.length - 1];
+      if (last && sameMarkObj(last.marks, marks)) last.text += child.text;
+      else spans.push({ text: child.text, marks });
+    });
+    blocks.push({
+      type: blockNode.attrs.blockType || "",
+      depth: blockNode.attrs.depth || 0,
+      spans,
+    });
   });
-  return spans;
+  return blocks;
+}
+
+// The plain text of a CRDT-shaped block (concatenated span text). `undefined` blocks
+// (e.g. reading past the end of the previous list) read as "".
+function blockText(block) {
+  if (!block) return "";
+  return (block.spans || []).map((s) => s.text || "").join("");
+}
+
+// Classify a block-count change between two block lists as a single `split` or `merge`
+// when it cleanly is one, else null (→ the caller falls back to a full reconcile).
+// Text is compared per block; a split at block i means prev[i] === cur[i] + cur[i+1]
+// with every other block unchanged (a merge is the inverse). Returns the block-relative
+// position so Elm can call the commutative `splitBlock`/`mergeBlock` primitive.
+function diffStructural(prev, cur) {
+  const pt = prev.map(blockTextOf);
+  const ct = cur.map(blockTextOf);
+
+  if (ct.length === pt.length + 1) {
+    // find the first index where they diverge; that's the split point
+    let i = 0;
+    while (i < pt.length && pt[i] === ct[i]) i++;
+    // prev[i] must equal cur[i] + cur[i+1], and the tails must line up
+    if (i < pt.length && pt[i] === ct[i] + ct[i + 1] && tailsMatch(pt, ct, i + 1, i + 2)) {
+      return { kind: "split", blockIndex: i, charOffset: ct[i].length };
+    }
+  } else if (ct.length === pt.length - 1) {
+    // merge: the inverse — cur[i] === prev[i] + prev[i+1]
+    let i = 0;
+    while (i < ct.length && ct[i] === pt[i]) i++;
+    if (i < ct.length && ct[i] === pt[i] + pt[i + 1] && tailsMatch(ct, pt, i + 1, i + 2)) {
+      // merging block (i+1) into block i
+      return { kind: "merge", blockIndex: i + 1 };
+    }
+  }
+  return null;
+}
+
+function blockTextOf(b) {
+  return typeof b.text === "string" ? b.text : blockText(b);
+}
+
+// Do a[ai..] and b[bi..] contain the same texts to the end (same remaining length)?
+function tailsMatch(a, b, ai, bi) {
+  if (a.length - ai !== b.length - bi) return false;
+  for (let k = 0; ai + k < a.length; k++) {
+    if (a[ai + k] !== b[bi + k]) return false;
+  }
+  return true;
 }
 
 function sameMarkObj(a, b) {
@@ -205,113 +500,79 @@ function sameMarkObj(a, b) {
   return ak.every((k) => a[k] === b[k]);
 }
 
-// Compare two span lists for text+mark equality (empty spans ignored).
-function spansEqual(a, b) {
-  const norm = (spans) =>
-    (spans || [])
-      .filter((s) => s.text && s.text.length)
-      .map((s) => ({ text: s.text, marks: s.marks || {} }));
+function blocksEqual(a, b) {
+  const norm = (bs) =>
+    (bs || []).map((b) => ({
+      type: b.type || "",
+      depth: b.depth || 0,
+      spans: (b.spans || []).filter((s) => s.text && s.text.length).map((s) => ({ text: s.text, marks: s.marks || {} })),
+    }));
   const na = norm(a);
   const nb = norm(b);
   if (na.length !== nb.length) return false;
-  return na.every(
-    (s, i) => s.text === nb[i].text && sameMarkObj(s.marks, nb[i].marks)
-  );
+  return na.every((blk, i) => {
+    const o = nb[i];
+    if (blk.type !== o.type || blk.depth !== o.depth || blk.spans.length !== o.spans.length) return false;
+    return blk.spans.every((s, j) => s.text === o.spans[j].text && sameMarkObj(s.marks, o.spans[j].marks));
+  });
 }
 
-// Build a minimal formatting toolbar. Each button runs the matching TipTap command,
-// which produces a real ProseMirror transaction — the same path as the keyboard
-// shortcuts — so `onTransaction` picks up the mark change and reports it to Elm.
-// (Applying the mark in PM immediately also gives instant local feedback; the CRDT
-// round-trip then confirms it and syncs to peers.)
+// --- toolbar ---------------------------------------------------------------
+
 function buildToolbar(host) {
   const bar = document.createElement("div");
   bar.className = "pm-toolbar";
-  const btn = (label, run) => {
+
+  const markBtn = (label, run) => {
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = label;
     b.addEventListener("mousedown", (e) => {
-      e.preventDefault(); // keep the editor selection
+      e.preventDefault();
       run(host.editor.chain().focus());
     });
     return b;
   };
-  bar.appendChild(btn("B", (c) => c.toggleBold().run()));
-  bar.appendChild(btn("I", (c) => c.toggleItalic().run()));
-  bar.appendChild(btn("U", (c) => c.toggleUnderline().run()));
-  bar.appendChild(btn("S", (c) => c.toggleStrike().run()));
-  bar.appendChild(btn("</>", (c) => c.toggleCode().run()));
+
+  bar.appendChild(markBtn("B", (c) => c.toggleBold().run()));
+  bar.appendChild(markBtn("I", (c) => c.toggleItalic().run()));
+  bar.appendChild(markBtn("U", (c) => c.toggleUnderline().run()));
+  bar.appendChild(markBtn("S", (c) => c.toggleStrike().run()));
+  bar.appendChild(markBtn("</>", (c) => c.toggleCode().run()));
   bar.appendChild(
-    btn("link", (c) => {
-      if (host.editor.isActive("link")) {
-        c.unsetLink().run();
-      } else {
+    markBtn("link", (c) => {
+      if (host.editor.isActive("link")) c.unsetLink().run();
+      else {
         const href = window.prompt("Link URL:", "https://");
         if (href) c.setLink({ href }).run();
       }
     })
   );
+
+  // block-type buttons: emit a setType intent (toggles back to paragraph if already
+  // that type). These do not touch PM directly — the CRDT round-trip re-renders.
+  const typeBtn = (label, type) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const cur = host.editor.state.selection.$from.parent.attrs.blockType || "";
+      host.emitSetType(cur === type ? "" : type);
+    });
+    return b;
+  };
+  const sep = document.createElement("span");
+  sep.className = "pm-toolbar-sep";
+  bar.appendChild(sep);
+  bar.appendChild(typeBtn("H1", "h1"));
+  bar.appendChild(typeBtn("H2", "h2"));
+  bar.appendChild(typeBtn("H3", "h3"));
+  bar.appendChild(typeBtn("❝", "blockquote"));
+  bar.appendChild(typeBtn("•", "ul"));
+  bar.appendChild(typeBtn("1.", "ol"));
+
   return bar;
 }
 
-// ---- span <-> ProseMirror conversions -------------------------------------
-
-// Marks the CRDT knows → TipTap mark spec name (+ attrs for value marks).
-function crdtMarkToPm(schema, type, value) {
-  switch (type) {
-    case "link":
-      return schema.marks.link.create({ href: String(value) });
-    case "bold":
-      return schema.marks.bold.create();
-    case "italic":
-      return schema.marks.italic.create();
-    case "underline":
-      return schema.marks.underline.create();
-    case "strike":
-      return schema.marks.strike.create();
-    case "code":
-      return schema.marks.code.create();
-    default:
-      return null;
-  }
-}
-
-// Build a ProseMirror doc node (one paragraph) from CRDT spans.
-function spansToDoc(schema, spans) {
-  const inline = [];
-  for (const span of spans || []) {
-    if (!span.text) continue;
-    const marks = [];
-    for (const [type, value] of Object.entries(span.marks || {})) {
-      const m = crdtMarkToPm(schema, type, value);
-      if (m) marks.push(m);
-    }
-    inline.push(schema.text(span.text, marks));
-  }
-  const paragraph = schema.nodes.paragraph.create(null, inline);
-  return schema.nodes.doc.create(null, [paragraph]);
-}
-
-// Initial HTML content for the editor before the first port render.
-function spansToHtml(spans) {
-  const esc = (s) =>
-    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  let html = "";
-  for (const span of spans || []) {
-    let t = esc(span.text || "");
-    const marks = span.marks || {};
-    if (marks.code) t = `<code>${t}</code>`;
-    if (marks.strike) t = `<s>${t}</s>`;
-    if (marks.underline) t = `<u>${t}</u>`;
-    if (marks.italic) t = `<em>${t}</em>`;
-    if (marks.bold) t = `<strong>${t}</strong>`;
-    if (marks.link) t = `<a href="${esc(String(marks.link))}">${t}</a>`;
-    html += t;
-  }
-  return `<p>${html}</p>`;
-}
-
 customElements.define("crdt-richtext", CrdtRichText);
-
-export { MARK_TYPES };

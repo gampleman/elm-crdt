@@ -441,6 +441,57 @@
       .pm-mount a {
         color: #0984e3;
       }
+      .pm-toolbar-sep {
+        width: 1px;
+        background: #ddd;
+        margin: 0 0.35rem;
+        align-self: stretch;
+      }
+      /* block rendering: each CRDT block is one div.block, styled by data-type +
+         indented by data-depth (flat blocks, CSS nesting — see crdt-richtext.js). */
+      .pm-mount .block {
+        margin: 0.25rem 0;
+      }
+      .pm-mount .block[data-type="h1"] {
+        font-size: 1.6rem;
+        font-weight: 700;
+        margin: 0.6rem 0 0.3rem;
+      }
+      .pm-mount .block[data-type="h2"] {
+        font-size: 1.3rem;
+        font-weight: 700;
+        margin: 0.5rem 0 0.25rem;
+      }
+      .pm-mount .block[data-type="h3"] {
+        font-size: 1.1rem;
+        font-weight: 700;
+      }
+      .pm-mount .block[data-type="blockquote"] {
+        border-left: 3px solid #ccc;
+        padding-left: 0.75rem;
+        color: #555;
+        font-style: italic;
+      }
+      .pm-mount .block[data-type="ul"],
+      .pm-mount .block[data-type="ol"] {
+        padding-left: 1.5rem;
+        position: relative;
+      }
+      .pm-mount .block[data-type="ul"]::before {
+        content: "•";
+        position: absolute;
+        left: 0.5rem;
+      }
+      .pm-mount .block[data-type="ol"]::before {
+        content: "–";
+        position: absolute;
+        left: 0.5rem;
+      }
+      /* indent depth: 1.5rem per level (data-depth 0..n) */
+      .pm-mount .block[data-depth="1"] { margin-left: 1.5rem; }
+      .pm-mount .block[data-depth="2"] { margin-left: 3rem; }
+      .pm-mount .block[data-depth="3"] { margin-left: 4.5rem; }
+      .pm-mount .block[data-depth="4"] { margin-left: 6rem; }
     </style>
   </head>
   <body>

@@ -18,9 +18,12 @@ presence channel, so the tab bar and "who's here" list show where each peer is):
   Todo `done` booleans are **lww**.
 - **Files** — a **dict** (`S.dict`) of **rich-text** documents (`S.richText`):
   create a file, click to open it, edit its contents in a **TipTap/ProseMirror**
-  editor. Formatting (bold/italic/underline/strike/code/link) is a **Peritext marks
-  CRDT** — concurrent text edits and formats converge. Open the same file in two
-  tabs to edit together.
+  editor. Inline formatting (bold/italic/underline/strike/code/link) is a **Peritext
+  marks CRDT**, and **block structure** (paragraphs, headings, blockquote, list items,
+  indent depth — Enter to split, Backspace to merge, Tab/Shift-Tab to indent) uses
+  in-sequence block markers so concurrent split/merge/type/indent all converge. Open
+  the same file in two tabs to edit together. See
+  [`../docs/10`](../docs/10-rich-text.md) + [`../docs/11`](../docs/11-block-structure.md).
 - **Outline** — a **movable tree** (`S.tree`): add/nest/re-parent nodes with the
   →/←/+/✕ controls. Concurrent re-parents that would form a cycle converge safely
   (Kleppmann's move algorithm), and siblings stay ordered via a fractional index.
@@ -77,6 +80,17 @@ See [`../docs/10-rich-text.md`](../docs/10-rich-text.md).
 
 To just build the app once (no server), run `npm run build` (builds `elm.js` and
 `bundle.js`).
+
+## Browser tests (multi-client)
+
+`npm run test:e2e` runs the [Playwright](https://playwright.dev) suite in `e2e/`. It
+builds the app, starts the relay + a static server, and drives **real browser
+contexts as independent replicas** — the layer the pure-Elm tests can't reach: the
+TipTap binding, the caret/reconcile JS, the port round-trip, and genuine two-client
+convergence over a socket. It covers the reported first-load formatting bug, block
+split/merge/list editing, and concurrent multi-client convergence. The relay runs on
+an isolated port (`?relayPort=8091`) so a stray tab on the default `8080` relay can't
+leak its document into a test replica. First run: `npx playwright install chromium`.
 
 ## How the pieces fit
 

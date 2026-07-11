@@ -23,14 +23,14 @@ import Crdt.Id exposing (OpId, ReplicaId)
 import Crdt.OpDoc as OpDoc exposing (Checkpoint, OpDoc, Version)
 import Crdt.Presence as Presence exposing (Presence)
 import Crdt.Ref as Ref exposing (Ref)
-import Crdt.RichText as RichText exposing (Span)
+import Crdt.RichText as RichText exposing (Block, Span)
 import Crdt.Schema as S exposing (Crdt)
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
 import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
 import Html.Attributes as A exposing (class, placeholder, value)
-import Html.Keyed
 import Html.Events exposing (on, onBlur, onClick, onFocus, onInput, preventDefaultOn)
+import Html.Keyed
 import Json.Decode as JD
 import Json.Encode as JE
 import Ports
@@ -191,7 +191,7 @@ outlineTextRef id =
 {-| Per-peer ephemeral state. Never merged into the document — it lives on the
 separate presence channel and expires when a peer goes quiet. `tab` is the tab the
 peer is currently viewing (shared awareness, so the peer list can show who is where);
-which tab *you* see is still your own local choice, it's just also broadcast.
+which tab _you_ see is still your own local choice, it's just also broadcast.
 -}
 type alias Peer =
     { name : String
@@ -306,7 +306,7 @@ type alias Model =
     }
 
 
-{-| The demo surfaces, selected by tabs. Which tab *you* see is your own choice, but
+{-| The demo surfaces, selected by tabs. Which tab _you_ see is your own choice, but
 it is also broadcast on the presence channel so peers can see where everyone is.
 -}
 type Tab
@@ -756,10 +756,19 @@ update msg model =
 
                         doc1 =
                             applyRichTextIntent file intent model.doc |> orKeep model.doc
+
+                        ( m1, syncCmd ) =
+                            recordPush before { model | doc = doc1 }
                     in
-                    -- record + broadcast, but do NOT re-render the editor: it is
-                    -- already showing this local edit (echoing would fight the caret).
-                    recordPush before { model | doc = doc1 }
+                    -- Text/mark intents were already applied optimistically by
+                    -- ProseMirror, so re-rendering would fight the caret. Block
+                    -- intents (split/merge/setType/indent/outdent) were preventDefault'd
+                    -- in the editor — it hasn't changed yet — so those we must push back.
+                    if isBlockIntent intent then
+                        ( m1, Cmd.batch [ syncCmd, renderEditorFor file doc1 ] )
+
+                    else
+                        ( m1, syncCmd )
 
                 _ ->
                     ( model, Cmd.none )
@@ -947,11 +956,11 @@ andRenderEditor doc ( model, cmd ) =
     )
 
 
-{-| Push file `k`'s current spans to the ProseMirror editor.
+{-| Push file `k`'s current blocks to the ProseMirror editor.
 -}
 renderEditorFor : String -> OpDoc Board -> Cmd Msg
 renderEditorFor k doc =
-    Ports.renderRichText (encodeSpans (fileSpans k doc))
+    Ports.renderRichText (encodeBlocks (fileBlocks k doc))
 
 
 {-| Re-render the editor only if the **open file's** contents changed between `old`
@@ -961,7 +970,7 @@ renderEditorIfChanged : Maybe String -> OpDoc Board -> OpDoc Board -> Cmd Msg
 renderEditorIfChanged selected old new =
     case selected of
         Just k ->
-            if fileSpans k old == fileSpans k new then
+            if fileBlocks k old == fileBlocks k new then
                 Cmd.none
 
             else
@@ -971,14 +980,11 @@ renderEditorIfChanged selected old new =
             Cmd.none
 
 
-{-| File `k`'s current spans (empty if the file or doc read is absent).
+{-| File `k`'s current blocks (empty if the file or doc read is absent).
 -}
-fileSpans : String -> OpDoc Board -> List Span
-fileSpans k doc =
-    OpDoc.read doc
-        |> Result.toMaybe
-        |> Maybe.andThen (\b -> Dict.get k b.files)
-        |> Maybe.withDefault []
+fileBlocks : String -> OpDoc Board -> List Block
+fileBlocks k doc =
+    Ref.readBlocks (fileRef k) doc |> Result.withDefault []
 
 
 {-| Broadcast our entire op set — used for catch-up (connect / answering a
@@ -1075,19 +1081,34 @@ decodeEnvelope =
 -- RICH TEXT EDITOR (ProseMirror bridge) --------------------------------------
 
 
-{-| An edit intent from the ProseMirror editor. `TextIntent` carries the editor's
-whole paragraph text (Elm diffs it into minimal ops); `SetMark`/`ClearMark` carry a
-format command over a character offset range.
+{-| An edit intent from the ProseMirror editor. Text/mark intents carry document-wide
+character offsets (over the flattened text of all blocks); block intents identify a
+block by its index (0 = leading block) — Elm resolves the index to a marker `OpId` via
+`OpDoc.readBlocks` before calling the block edits, which are marker-addressed.
 
 The editor sends a mark intent's `value` as `true` for a boolean mark being set, a
 string for a value mark (link href), or `null` to clear — so set-vs-clear turns on
 whether `value` is `null`, not on its type (an earlier bug decoded a boolean set as a
 clear because `true` isn't a string).
+
 -}
 type RichTextIntent
-    = TextIntent String
+    = TextIntent { blockIndex : Int, text : String }
     | SetMark { type_ : String, value : RichText.MarkValue, from : Int, to : Int }
     | ClearMark { type_ : String, from : Int, to : Int }
+    | Split { blockIndex : Int, charOffset : Int }
+    | Merge { blockIndex : Int }
+    | SetType { blockIndex : Int, type_ : Maybe String }
+    | Indent { blockIndex : Int }
+    | Outdent { blockIndex : Int }
+    | Reconcile (List BlockShape)
+
+
+{-| The desired shape of one block from the editor, for a `Reconcile`: its type, depth,
+and plain text (marks are re-applied by the editor's own mark intents, not here).
+-}
+type alias BlockShape =
+    { type_ : String, depth : Int, text : String }
 
 
 richTextIntentDecoder : JD.Decoder RichTextIntent
@@ -1097,7 +1118,9 @@ richTextIntentDecoder =
             (\tag ->
                 case tag of
                     "text" ->
-                        JD.map TextIntent (JD.field "text" JD.string)
+                        JD.map2 (\bi t -> TextIntent { blockIndex = bi, text = t })
+                            (JD.field "blockIndex" JD.int)
+                            (JD.field "text" JD.string)
 
                     "mark" ->
                         JD.map4 (\t v f to -> markIntent t v f to)
@@ -1106,9 +1129,80 @@ richTextIntentDecoder =
                             (JD.field "from" JD.int)
                             (JD.field "to" JD.int)
 
+                    "split" ->
+                        JD.map2 (\bi off -> Split { blockIndex = bi, charOffset = off })
+                            (JD.field "blockIndex" JD.int)
+                            (JD.field "charOffset" JD.int)
+
+                    "merge" ->
+                        JD.map (\bi -> Merge { blockIndex = bi }) (JD.field "blockIndex" JD.int)
+
+                    "setType" ->
+                        JD.map2 (\bi t -> SetType { blockIndex = bi, type_ = t })
+                            (JD.field "blockIndex" JD.int)
+                            (JD.maybe (JD.field "type" JD.string))
+
+                    "indent" ->
+                        JD.map (\bi -> Indent { blockIndex = bi }) (JD.field "blockIndex" JD.int)
+
+                    "outdent" ->
+                        JD.map (\bi -> Outdent { blockIndex = bi }) (JD.field "blockIndex" JD.int)
+
+                    "reconcile" ->
+                        JD.map Reconcile (JD.field "blocks" (JD.list blockShapeDecoder))
+
                     _ ->
                         JD.fail ("unknown rich-text intent: " ++ tag)
             )
+
+
+blockShapeDecoder : JD.Decoder BlockShape
+blockShapeDecoder =
+    JD.map3 BlockShape
+        (JD.field "type" JD.string)
+        (JD.field "depth" JD.int)
+        (JD.field "text" JD.string)
+
+
+{-| Whether an intent changes block _structure_ (split/merge/type/indent/outdent).
+The editor preventDefaults these and only emits the intent, so after applying we must
+push the new blocks back; text/mark intents PM already applied, so we must not.
+-}
+isBlockIntent : RichTextIntent -> Bool
+isBlockIntent intent =
+    case intent of
+        TextIntent _ ->
+            False
+
+        SetMark _ ->
+            False
+
+        ClearMark _ ->
+            False
+
+        Split _ ->
+            -- ProseMirror performs Enter/Backspace splits & merges natively now, so the
+            -- editor is already correct; mirroring them to the CRDT must NOT re-render
+            -- (that raced with text typed right after — the "type d after Enter" bug).
+            False
+
+        Merge _ ->
+            False
+
+        SetType _ ->
+            True
+
+        Indent _ ->
+            True
+
+        Outdent _ ->
+            True
+
+        Reconcile _ ->
+            -- A reconcile mirrors a structural edit ProseMirror ALREADY applied
+            -- natively (paste / multi-block delete), so the editor is already correct —
+            -- a re-render would fight the caret and could clobber text typed right after.
+            False
 
 
 {-| Build a set/clear mark intent from the decoded `value`: `null` clears; a string
@@ -1138,7 +1232,10 @@ isJsonNull v =
     JD.decodeValue (JD.null True) v == Ok True
 
 
-{-| Apply a rich-text intent to file `file` through the typed `Ref` API.
+{-| Apply a rich-text intent to file `file` through the typed `Ref` API. Both text and
+block-structure edits are **block-relative** — the editor reports a block index and the
+library resolves it internally (text diffs are scoped to that block so typed text can't
+leak across a block boundary; block edits address their marker by index).
 -}
 applyRichTextIntent : String -> RichTextIntent -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
 applyRichTextIntent file intent doc =
@@ -1147,8 +1244,8 @@ applyRichTextIntent file intent doc =
             fileRef file
     in
     case intent of
-        TextIntent newText ->
-            Ref.setRich ref newText doc
+        TextIntent { blockIndex, text } ->
+            Ref.setBlockText ref blockIndex text doc
 
         SetMark { type_, value, from, to } ->
             Ref.mark ref from to type_ value doc
@@ -1156,13 +1253,170 @@ applyRichTextIntent file intent doc =
         ClearMark { type_, from, to } ->
             Ref.unmark ref from to type_ doc
 
+        Split { blockIndex, charOffset } ->
+            Ref.splitBlock ref blockIndex charOffset doc
 
-{-| Encode spans for the editor: `{ spans: [ { text, marks: { type: value } } ] }`,
-where a boolean mark's value is `true` and a value mark's is its string.
+        Merge { blockIndex } ->
+            Ref.mergeBlock ref blockIndex doc
+
+        SetType { blockIndex, type_ } ->
+            Ref.setBlockType ref blockIndex type_ doc
+
+        Indent { blockIndex } ->
+            Ref.indentBlock ref blockIndex doc
+
+        Outdent { blockIndex } ->
+            Ref.outdentBlock ref blockIndex doc
+
+        Reconcile shapes ->
+            reconcileBlocks ref shapes doc
+
+
+{-| Transform the CRDT's blocks to match the editor's desired `shapes` (used when a
+plain text transaction changed the block COUNT — a bulk delete / Delete-key / cut /
+paste spanning blocks, none of which go through the keydown handler). We first match
+the block count (merging the last block into the previous to shrink, splitting the last
+at its end to grow — both no-ops on block 0), then set each block's text, type, and
+depth via the tested primitives. Marks on surviving characters follow their chars; a
+bulk structural edit carries no mark changes (those ride their own intents).
 -}
-encodeSpans : List Span -> JE.Value
-encodeSpans spans =
-    JE.object [ ( "spans", JE.list encodeSpan spans ) ]
+reconcileBlocks : Ref Board S.RichK (List Span) -> List BlockShape -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+reconcileBlocks ref shapes doc =
+    let
+        desiredCount =
+            List.length shapes
+
+        blocksOf d =
+            Ref.readBlocks ref d |> Result.withDefault []
+
+        lastBlockTextLen d =
+            blocksOf d
+                |> List.reverse
+                |> List.head
+                |> Maybe.map blockTextLength
+                |> Maybe.withDefault 0
+
+        -- shrink: merge the last block into the previous, `n` times
+        shrink n d =
+            List.range 1 n
+                |> List.foldl
+                    (\_ acc ->
+                        acc |> Result.andThen (\dd -> Ref.mergeBlock ref (List.length (blocksOf dd) - 1) dd)
+                    )
+                    (Ok d)
+
+        -- grow: split the last block at its end (append an empty block), `n` times
+        grow n d =
+            List.range 1 n
+                |> List.foldl
+                    (\_ acc ->
+                        acc |> Result.andThen (\dd -> Ref.splitBlock ref (List.length (blocksOf dd) - 1) (lastBlockTextLen dd) dd)
+                    )
+                    (Ok d)
+
+        adjustCount d =
+            let
+                c =
+                    List.length (blocksOf d)
+            in
+            if c > desiredCount then
+                shrink (c - desiredCount) d
+
+            else if c < desiredCount then
+                grow (desiredCount - c) d
+
+            else
+                Ok d
+
+        -- set one block's text, then type, then depth to match `shape`
+        applyShape i shape d =
+            Ref.setBlockText ref i shape.text d
+                |> Result.andThen (reconcileType ref i shape.type_)
+                |> Result.andThen (reconcileDepth ref i shape.depth)
+    in
+    adjustCount doc
+        |> Result.andThen
+            (\counted ->
+                List.indexedMap Tuple.pair shapes
+                    |> List.foldl
+                        (\( i, shape ) acc -> acc |> Result.andThen (applyShape i shape))
+                        (Ok counted)
+            )
+
+
+{-| Set block `i`'s type to match `desired` ("" → clear the mark), only if it differs
+from the current type (so we don't emit a redundant op every reconcile).
+-}
+reconcileType : Ref Board S.RichK (List Span) -> Int -> String -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+reconcileType ref i desired doc =
+    let
+        current =
+            Ref.readBlocks ref doc
+                |> Result.withDefault []
+                |> List.drop i
+                |> List.head
+                |> Maybe.map .type_
+                |> Maybe.withDefault ""
+    in
+    if current == desired then
+        Ok doc
+
+    else if desired == "" then
+        Ref.setBlockType ref i Nothing doc
+
+    else
+        Ref.setBlockType ref i (Just desired) doc
+
+
+{-| Indent/outdent block `i` until its depth matches `desired`.
+-}
+reconcileDepth : Ref Board S.RichK (List Span) -> Int -> Int -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+reconcileDepth ref i desired doc =
+    let
+        current =
+            Ref.readBlocks ref doc
+                |> Result.withDefault []
+                |> List.drop i
+                |> List.head
+                |> Maybe.map .depth
+                |> Maybe.withDefault 0
+
+        step op_ n d =
+            List.range 1 n |> List.foldl (\_ acc -> acc |> Result.andThen (op_ ref i)) (Ok d)
+    in
+    if desired > current then
+        step Ref.indentBlock (desired - current) doc
+
+    else if desired < current then
+        step Ref.outdentBlock (current - desired) doc
+
+    else
+        Ok doc
+
+
+{-| The character length of a block's text (sum of its span text lengths).
+-}
+blockTextLength : Block -> Int
+blockTextLength b =
+    b.spans |> List.map (.text >> String.length) |> List.sum
+
+
+{-| Encode blocks for the editor: `{ blocks: [ { type, depth, spans:[…] } ] }`. The
+block `type` is the app's opaque string (`""` = default paragraph); `spans` carry the
+inline text + marks as before.
+-}
+encodeBlocks : List Block -> JE.Value
+encodeBlocks blocks =
+    JE.object [ ( "blocks", JE.list encodeBlock blocks ) ]
+
+
+encodeBlock : Block -> JE.Value
+encodeBlock block =
+    JE.object
+        [ ( "type", JE.string block.type_ )
+        , ( "depth", JE.int block.depth )
+        , ( "spans", JE.list encodeSpan block.spans )
+        ]
 
 
 encodeSpan : Span -> JE.Value
@@ -1676,7 +1930,7 @@ viewFiles : Bool -> Model -> Board -> Html Msg
 viewFiles readOnly model board =
     case model.selectedFile of
         Just k ->
-            viewFileEditor readOnly (Dict.get k board.files |> Maybe.withDefault []) k
+            viewFileEditor readOnly (fileBlocks k model.doc) k
 
         Nothing ->
             viewFileList readOnly model board
@@ -1725,11 +1979,11 @@ viewFileRow readOnly k =
 
 {-| The editor pane for the open file, with a back button to the list. The
 `<crdt-richtext>` element is **keyed by the file name** so switching files remounts
-a fresh editor (rather than mutating the open one), and its `docSpans` property seeds
-it with the file's spans for the first paint.
+a fresh editor (rather than mutating the open one), and its `docBlocks` property seeds
+it with the file's blocks for the first paint.
 -}
-viewFileEditor : Bool -> List Span -> String -> Html Msg
-viewFileEditor readOnly spans k =
+viewFileEditor : Bool -> List Block -> String -> Html Msg
+viewFileEditor readOnly blocks k =
     Html.Keyed.node "div"
         [ class "file-editor" ]
         [ ( "file:" ++ k
@@ -1739,9 +1993,9 @@ viewFileEditor readOnly spans k =
                     , span [ class "file-title" ] [ text k ]
                     ]
                 , div [ class "editor-hint" ]
-                    [ text "Select text and use the toolbar or ⌘B/⌘I. Open the same file in another tab to edit together." ]
+                    [ text "Enter for a new block; Tab/Shift-Tab to indent; toolbar for headings/lists/formatting. Open the same file in another tab to edit together." ]
                 , Html.node "crdt-richtext"
-                    [ A.property "docSpans" (JE.list encodeSpan spans)
+                    [ A.property "docBlocks" (JE.list encodeBlock blocks)
                     , A.attribute "readonly"
                         (if readOnly then
                             "true"

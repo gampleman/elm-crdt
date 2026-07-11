@@ -6,10 +6,15 @@
 // registers the <crdt-richtext> custom element (TipTap/ProseMirror editor)
 import "./editor/crdt-richtext.js";
 
+// Relay port defaults to 8080 but can be overridden with `?relayPort=NNNN` — used by
+// the e2e tests to run an isolated relay that stray tabs on the default port can't
+// reach (so a leftover tab's document never leaks into a test replica).
+const RELAY_PORT = new URLSearchParams(location.search).get("relayPort") || "8080";
 const RELAY_URL =
   (location.protocol === "https:" ? "wss://" : "ws://") +
   (location.hostname || "localhost") +
-  ":8080";
+  ":" +
+  RELAY_PORT;
 
 const COLORS = ["#e84393", "#0984e3", "#00b894", "#fdcb6e", "#6c5ce7", "#e17055"];
 const ANIMALS = ["otter", "lynx", "heron", "marten", "shrike", "vole"];
@@ -51,7 +56,7 @@ const app = Elm.Main.init({
 // property the moment it mounts, so there's nothing to cache here.
 app.ports.renderRichText.subscribe((payload) => {
   const el = document.querySelector("crdt-richtext");
-  if (el) el.docSpans = payload.spans;
+  if (el) el.docBlocks = payload.blocks;
 });
 
 // Edits bubble from the element as CustomEvents; forward their detail to Elm.
@@ -59,9 +64,9 @@ document.addEventListener("richtext-input", (event) => {
   app.ports.richTextInput.send(event.detail);
 });
 
-// Note: no mount observer is needed — the Elm view sets `docSpans` as a property on
+// Note: no mount observer is needed — the Elm view sets `docBlocks` as a property on
 // the <crdt-richtext> element on every render (including the first, when the editor
-// tab mounts), so a freshly-mounted editor is always handed the current spans.
+// tab mounts), so a freshly-mounted editor is always handed the current blocks.
 
 let socket = null;
 let reconnectTimer = null;

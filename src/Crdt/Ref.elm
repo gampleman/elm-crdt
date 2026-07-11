@@ -2,7 +2,8 @@ module Crdt.Ref exposing
     ( Ref
     , at, variantPayload, index, key
     , set, over, increment, switch
-    , setRich, mark, unmark
+    , setRich, mark, unmark, readBlocks
+    , setBlockText, splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock
     , append, remove, move
     , setKey, removeKey
     , treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
@@ -38,7 +39,8 @@ existing op-log runtime — no new merge semantics.
 @docs Ref
 @docs at, variantPayload, index, key
 @docs set, over, increment, switch
-@docs setRich, mark, unmark
+@docs setRich, mark, unmark, readBlocks
+@docs setBlockText, splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock
 @docs append, remove, move
 @docs setKey, removeKey
 @docs treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
@@ -209,6 +211,15 @@ setRich (Ref r) value doc =
     OpDoc.setRichText r.path value doc
 
 
+{-| Read a rich-text ref as **blocks** (type + depth + spans + marker id), rather
+than the flat `List Span` the schema decodes to. Used to resolve a block index to its
+marker `OpId` for the block edits. See `Crdt.RichText.toBlocks`.
+-}
+readBlocks : Ref r S.RichK (List Span) -> OpDoc doc -> Result Error (List RichText.Block)
+readBlocks (Ref r) doc =
+    OpDoc.readBlocks r.path doc
+
+
 {-| Apply a formatting mark of kind `type_` (e.g. `"bold"`, `"link"`) with `value`
 over the visible character range `[from, to)` of a rich-text ref. Use
 `RichText.Flag` for boolean marks (bold/italic/…) and `RichText.Value href` for value
@@ -224,6 +235,54 @@ mark (Ref r) from to type_ value doc =
 unmark : Ref r S.RichK (List Span) -> Int -> Int -> String -> OpDoc doc -> Result Error (OpDoc doc)
 unmark (Ref r) from to type_ doc =
     OpDoc.clearMark r.path from to type_ doc
+
+
+{-| Split at a block-relative caret: `charOffset` characters into block `blockIndex`
+(0 = the leading block). Inserts a block boundary there. See `docs/11`.
+-}
+splitBlock : Ref r S.RichK (List Span) -> Int -> Int -> OpDoc doc -> Result Error (OpDoc doc)
+splitBlock (Ref r) blockIndex charOffset doc =
+    OpDoc.splitBlock r.path blockIndex charOffset doc
+
+
+{-| Replace the text of **block `blockIndex`** (a minimal diff scoped to that block's
+characters), leaving marks and other blocks untouched. This is what an editor should
+call per keystroke so typed text lands inside the right block (unlike `setRich`, which
+diffs the whole document and can misplace text across a block boundary).
+-}
+setBlockText : Ref r S.RichK (List Span) -> Int -> String -> OpDoc doc -> Result Error (OpDoc doc)
+setBlockText (Ref r) blockIndex value doc =
+    OpDoc.setBlockText r.path blockIndex value doc
+
+
+{-| Merge block `blockIndex` into the previous block (tombstones its marker). No-op on
+block 0. See `docs/11`.
+-}
+mergeBlock : Ref r S.RichK (List Span) -> Int -> OpDoc doc -> Result Error (OpDoc doc)
+mergeBlock (Ref r) blockIndex doc =
+    OpDoc.mergeBlock r.path blockIndex doc
+
+
+{-| Set (`Just t`) or clear (`Nothing`) the app-defined type of block `blockIndex`.
+`type_` is an opaque string the library never interprets.
+-}
+setBlockType : Ref r S.RichK (List Span) -> Int -> Maybe String -> OpDoc doc -> Result Error (OpDoc doc)
+setBlockType (Ref r) blockIndex maybeType doc =
+    OpDoc.setBlockType r.path blockIndex maybeType doc
+
+
+{-| Indent (raise depth by one) block `blockIndex`.
+-}
+indentBlock : Ref r S.RichK (List Span) -> Int -> OpDoc doc -> Result Error (OpDoc doc)
+indentBlock (Ref r) blockIndex doc =
+    OpDoc.indentBlock r.path blockIndex doc
+
+
+{-| Outdent (lower depth by one, min 0) block `blockIndex`.
+-}
+outdentBlock : Ref r S.RichK (List Span) -> Int -> OpDoc doc -> Result Error (OpDoc doc)
+outdentBlock (Ref r) blockIndex doc =
+    OpDoc.outdentBlock r.path blockIndex doc
 
 
 markPrim : MarkValue -> Node.Prim

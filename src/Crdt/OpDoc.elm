@@ -14,7 +14,8 @@ module Crdt.OpDoc exposing
     , encode, encodeSince, decodeInto
     , seedNodeAt, subValue
     , treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
-    , setRichText, mark, clearMark
+    , setRichText, setBlockText, mark, clearMark
+    , splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock, readBlocks
     )
 
 {-| An op-log-backed document: the public surface over `Crdt.OpLog`.
@@ -45,7 +46,8 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs encode, encodeSince, decodeInto
 @docs seedNodeAt, subValue
 @docs treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
-@docs setRichText, mark, clearMark
+@docs setRichText, setBlockText, mark, clearMark
+@docs splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock, readBlocks
 
 -}
 
@@ -1861,6 +1863,93 @@ setRichText path value doc =
             )
 
 
+{-| Edit the text of **block `blockIndex`** so that block reads as `value`, diffing
+only that block's characters. This is the per-block edit an editor should use: it
+anchors inserts inside the block (so text can't leak across a block marker into the
+wrong block — the whole-document `setRichText` can't express that). Marks/other
+blocks are untouched.
+-}
+setBlockText : Path -> Int -> String -> OpDoc a -> Result Error (OpDoc a)
+setBlockText path blockIndex value doc =
+    withRich path
+        doc
+        (\target r ->
+            let
+                -- char elements grouped by block (a marker starts a new block; the
+                -- leading marker stays in block 0), plus the markers bounding this
+                -- block: its own marker (left) and the next block's marker (right).
+                block =
+                    charElemsOfBlock r blockIndex
+            in
+            applyCharDiff target r.text block.chars block.leftAnchor block.rightAnchor value doc
+        )
+
+
+{-| The char elements belonging to block `blockIndex` (in order), plus the markers that
+bound it: `leftAnchor` = the block's own marker (or `Nothing` for the leading block
+with no marker → document head), `rightAnchor` = the marker opening the **next** block
+(or `Nothing` if this is the last block → document end). Both anchors are needed so a
+text insert into an _empty_ block is bounded on both sides and lands strictly between
+the two markers, instead of floating past the next marker into the following block.
+Walks the live element stream tracking the block index; a real separator marker
+increments it, the leading marker does not.
+-}
+charElemsOfBlock :
+    Node.RichNode
+    -> Int
+    -> { chars : List ( OpId, String ), leftAnchor : Maybe OpId, rightAnchor : Maybe OpId }
+charElemsOfBlock r blockIndex =
+    let
+        live =
+            Rga.toElementsInOrder r.text |> List.filter (not << .deleted)
+
+        -- fold state: current block index `bi`, the target block's marker (`marker`,
+        -- Nothing for block 0 which has none), the next block's marker (`nextMarker`),
+        -- and the target block's chars (reversed). Each separator marker opens the next
+        -- block.
+        step el acc =
+            if RichText.isMarker el.content then
+                let
+                    nextBi =
+                        acc.bi + 1
+                in
+                { acc
+                    | bi = nextBi
+                    , marker =
+                        if nextBi == blockIndex then
+                            Just el.id
+
+                        else
+                            acc.marker
+                    , nextMarker =
+                        if nextBi == blockIndex + 1 then
+                            Just el.id
+
+                        else
+                            acc.nextMarker
+                }
+
+            else
+                case charElemOf el of
+                    Just idChar ->
+                        if acc.bi == blockIndex then
+                            { acc | charsRev = idChar :: acc.charsRev }
+
+                        else
+                            acc
+
+                    Nothing ->
+                        acc
+
+        result =
+            List.foldl step { bi = 0, marker = Nothing, nextMarker = Nothing, charsRev = [] } live
+    in
+    { chars = List.reverse result.charsRev
+    , leftAnchor = result.marker
+    , rightAnchor = result.nextMarker
+    }
+
+
 {-| Apply a formatting mark of kind `type_` (value `PBool True` for a boolean mark,
 `PString _` for a value mark like a link) over the **visible character range**
 `[from, to)` of a rich-text field. The range is resolved to character identities, so
@@ -1887,8 +1976,17 @@ markRange path from to type_ value doc =
                 case node of
                     Node.Rich r ->
                         let
+                            -- CHARACTER ids only. `from`/`to` are char offsets (block
+                            -- markers and nest tokens are not characters — the editor's
+                            -- offsets skip them), so the id array must skip them too, or
+                            -- a mark on a later block lands one char early per preceding
+                            -- marker.
                             ids =
-                                Rga.visibleIds r.text |> Array.fromList
+                                Rga.toElementsInOrder r.text
+                                    |> List.filter (not << .deleted)
+                                    |> List.filterMap charElemOf
+                                    |> List.map Tuple.first
+                                    |> Array.fromList
 
                             -- start anchor: before the first char in range; end
                             -- anchor: after the last char in range. `Nothing` refs
@@ -1920,27 +2018,427 @@ markRange path from to type_ value doc =
             )
 
 
+{-| Split at a **block-relative** caret: `blockIndex` (0 = the leading block) and
+`charOffset` characters into that block. A block-boundary marker is inserted at that
+point (Fugue-placed between the surrounding elements). The characters keep their ids,
+so cursors and marks survive; the run after the split becomes a new block. This is
+the position an editor naturally reports (which block the caret is in + offset within
+it); the library resolves it to the underlying element position. See `docs/11`.
+
+The new block **inherits the split block's type and depth** — pressing Enter in a list
+item yields another list item at the same indent, an indented paragraph stays indented,
+etc. (This copies an opaque string/count, so it defines no block vocabulary — an app
+that wants a different rule, e.g. heading → paragraph, applies it on top with a
+follow-up `setBlockType`.)
+
+-}
+splitBlock : Path -> Int -> Int -> OpDoc a -> Result Error (OpDoc a)
+splitBlock path blockIndex charOffset doc =
+    withRich path
+        doc
+        (\target r ->
+            let
+                ( parent, side ) =
+                    blockSplitPlacement r.text blockIndex charOffset
+
+                srcBlock =
+                    RichText.toBlocks r |> List.drop blockIndex |> List.head
+
+                srcType =
+                    srcBlock |> Maybe.map .type_ |> Maybe.withDefault ""
+
+                srcDepth =
+                    srcBlock |> Maybe.map .depth |> Maybe.withDefault 0
+
+                ( markerId, doc1 ) =
+                    mint doc
+
+                withMarker =
+                    emitBlockElemWithId markerId target parent side RichText.markerNode doc1
+
+                withType =
+                    if srcType == "" then
+                        withMarker
+
+                    else
+                        emitMark target
+                            RichText.blockTypeMark
+                            (PString srcType)
+                            { ref = Just markerId, side = Node.Before }
+                            { ref = Just markerId, side = Node.After }
+                            withMarker
+            in
+            -- inherit depth: one nest token per level, right-children of the new marker
+            -- (as repeated `indentBlock` would place them)
+            List.range 1 srcDepth
+                |> List.foldl
+                    (\_ acc -> emitBlockElem target (Just markerId) Rga.Right RichText.nestTokenNode acc)
+                    withType
+        )
+
+
+{-| Merge block `blockIndex` into the previous one: tombstone that block's marker
+(`DeleteElem`). The two runs coalesce; no characters move. No-op on block 0 (it has
+no separator before it) or an out-of-range index.
+-}
+mergeBlock : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+mergeBlock path blockIndex doc =
+    withRich path
+        doc
+        (\target r ->
+            -- only a *separator* marker can be merged; the leading marker (block 0)
+            -- is not a separator, so merging block 0 is a no-op.
+            case separatorMarkerAt r blockIndex of
+                Just markerId ->
+                    let
+                        ( id, doc1 ) =
+                            mint doc
+                    in
+                    commit [ op id (frontierOf doc1) (DeleteElem { container = target, elem = markerId }) ] doc1
+
+                Nothing ->
+                    doc
+        )
+
+
+{-| Set (or clear, with `Nothing`) the app-defined type of block `blockIndex`: an
+`AddMark` of `RichText.blockTypeMark`. For a separator block (index ≥ 1) the mark
+covers that block's marker element. **Block 0 has no marker element** — its type is a
+`block` mark anchored to the document **head** (both endpoints `ref = Nothing`), read
+back by `RichText.leadingTypeMark`. Either way the mark uses a freshly minted id and
+converges by per-target LWW; there is no reserved element or constant id.
+-}
+setBlockType : Path -> Int -> Maybe String -> OpDoc a -> Result Error (OpDoc a)
+setBlockType path blockIndex maybeType doc =
+    withRich path
+        doc
+        (\target r ->
+            let
+                value =
+                    case maybeType of
+                        Just t ->
+                            PString t
+
+                        Nothing ->
+                            PNull
+
+                ( start, end ) =
+                    if blockIndex <= 0 then
+                        -- head-anchored sentinel range (covers no character): block 0
+                        ( { ref = Nothing, side = Node.Before }
+                        , { ref = Nothing, side = Node.Before }
+                        )
+
+                    else
+                        case blockMarkerId r blockIndex of
+                            Just markerId ->
+                                ( { ref = Just markerId, side = Node.Before }
+                                , { ref = Just markerId, side = Node.After }
+                                )
+
+                            Nothing ->
+                                -- out of range: a no-op sentinel that covers nothing
+                                ( { ref = Nothing, side = Node.After }
+                                , { ref = Nothing, side = Node.After }
+                                )
+            in
+            if blockIndex >= 1 && blockMarkerId r blockIndex == Nothing then
+                doc
+
+            else
+                emitMark target RichText.blockTypeMark value start end doc
+        )
+
+
+{-| Indent block `blockIndex`: insert one nest token (a freshly minted element).
+Accretive — concurrent indent/outdent commute. For block 0 the token is placed at the
+document head (before the first char); for a separator block, right after its marker.
+-}
+indentBlock : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+indentBlock path blockIndex doc =
+    withRich path
+        doc
+        (\target r ->
+            if blockIndex <= 0 then
+                -- head-anchored nest token: a left-child of the head, so it precedes
+                -- block 0's text (which lives in the head's right subtree). Counted as
+                -- block-0 depth by `toBlocks` (it appears before any marker).
+                emitBlockElem target Nothing Rga.Left RichText.nestTokenNode doc
+
+            else
+                case blockMarkerId r blockIndex of
+                    Just markerId ->
+                        emitBlockElem target (Just markerId) Rga.Right RichText.nestTokenNode doc
+
+                    Nothing ->
+                        doc
+        )
+
+
+{-| Outdent block `blockIndex`: tombstone its highest-`OpId` live nest token (no-op at
+depth 0). Two concurrent outdents hit the same token → one net outdent. For block 0 the
+tokens are the head nest tokens (before the first marker).
+-}
+outdentBlock : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+outdentBlock path blockIndex doc =
+    withRich path
+        doc
+        (\target r ->
+            let
+                tokenId =
+                    if blockIndex <= 0 then
+                        leadingNestToken r.text
+
+                    else
+                        blockMarkerId r blockIndex |> Maybe.andThen (highestNestToken r.text)
+            in
+            case tokenId of
+                Just tid ->
+                    let
+                        ( id, doc1 ) =
+                            mint doc
+                    in
+                    commit [ op id (frontierOf doc1) (DeleteElem { container = target, elem = tid }) ] doc1
+
+                Nothing ->
+                    doc
+        )
+
+
+{-| The marker `OpId` of block `blockIndex` from the read model (`Nothing` if the
+index is out of range, or block 0 has no leading marker yet).
+-}
+blockMarkerId : Node.RichNode -> Int -> Maybe OpId
+blockMarkerId r blockIndex =
+    RichText.toBlocks r
+        |> List.drop blockIndex
+        |> List.head
+        |> Maybe.andThen .marker
+
+
+{-| The marker of block `blockIndex` only if it is a **separator** (not the leading
+marker of block 0). Used by merge, which can't merge block 0 into a previous block.
+-}
+separatorMarkerAt : Node.RichNode -> Int -> Maybe OpId
+separatorMarkerAt r blockIndex =
+    if blockIndex <= 0 then
+        Nothing
+
+    else
+        blockMarkerId r blockIndex
+
+
+{-| The highest-`OpId` live nest token appearing **before the first marker** — i.e. a
+block-0 nest token, placed at the document head by `indentBlock 0`. `Nothing` if block
+0 has depth 0. (Outdent deletes the highest-`OpId` one, the merge-friendly rule shared
+with `highestNestToken`.)
+-}
+leadingNestToken : Rga.Rga Node -> Maybe OpId
+leadingNestToken rga =
+    let
+        -- walk visible elements; collect nest tokens seen before the first marker.
+        collect els acc =
+            case els of
+                [] ->
+                    acc
+
+                el :: rest ->
+                    if RichText.isMarker el.content then
+                        acc
+
+                    else if RichText.isNestToken el.content then
+                        collect rest (el.id :: acc)
+
+                    else
+                        collect rest acc
+    in
+    Rga.toElementsInOrder rga
+        |> List.filter (not << .deleted)
+        |> (\els -> collect els [])
+        |> List.sortWith (\x y -> Id.compareOpId y x)
+        |> List.head
+
+
+{-| Resolve a rich-text field and run `f target richNode`, or a `WrongNodeType` error.
+-}
+withRich : Path -> OpDoc a -> (List TargetStep -> Node.RichNode -> OpDoc a) -> Result Error (OpDoc a)
+withRich path doc f =
+    resolve path doc
+        |> Result.andThen
+            (\( target, node ) ->
+                case node of
+                    Node.Rich r ->
+                        Ok (f target r)
+
+                    _ ->
+                        Err (WrongNodeType "expected rich-text node")
+            )
+
+
+{-| Emit an `InsertElem` for a block-structure element (marker or nest token) at a
+Fugue placement. Distinct from `emitInsert` only in that the caller supplies the
+`parent`/`side` directly (block elements are placed by us, not appended after).
+-}
+emitBlockElem : List TargetStep -> Maybe OpId -> Rga.Side -> Node -> OpDoc a -> OpDoc a
+emitBlockElem target parent side seed doc =
+    let
+        ( elemId, doc1 ) =
+            mint doc
+    in
+    emitBlockElemWithId elemId target parent side seed doc1
+
+
+{-| Like `emitBlockElem` but with a caller-supplied element id (not a fresh mint) —
+used for the **leading marker**, which has a well-known constant id so concurrent
+creators dedupe. The op is idempotent: re-inserting the same id/action is a no-op in
+the store, so two peers both creating it converge to one element.
+-}
+emitBlockElemWithId : OpId -> List TargetStep -> Maybe OpId -> Rga.Side -> Node -> OpDoc a -> OpDoc a
+emitBlockElemWithId elemId target parent side seed doc =
+    let
+        seeded =
+            reStampSeed elemId seed
+    in
+    commit [ op elemId (frontierOf doc) (InsertElem { container = target, elemId = elemId, parent = parent, side = side, seed = seeded }) ] doc
+
+
+{-| Give a block-element seed node the fresh element id as its stamp (marker/token
+nodes are built with a placeholder id; the actual element id must own the stamp so
+the clock stays consistent).
+-}
+reStampSeed : OpId -> Node -> Node
+reStampSeed elemId node =
+    case Node.asPrim node of
+        Just prim ->
+            Node.reg prim elemId
+
+        Nothing ->
+            node
+
+
+{-| The Fugue `(parent, side)` for a marker inserted at a **block-relative** caret:
+`charOffset` characters into block `blockIndex` (blocks are marker-delimited; block 0
+is the leading block). We walk the live visible elements tracking the current block
+index and, within it, how many characters we've passed; the split element is the one
+just after the target char (its Fugue left neighbor is that char). Placing the marker
+there makes the run from the caret onward a new block.
+-}
+blockSplitPlacement : Rga.Rga Node -> Int -> Int -> ( Maybe OpId, Rga.Side )
+blockSplitPlacement rga blockIndex charOffset =
+    let
+        live =
+            Rga.toElementsInOrder rga |> List.filter (not << .deleted)
+
+        -- find the element id immediately to the LEFT of the split point, and the one
+        -- to the RIGHT, by scanning while tracking (block, chars-into-block).
+        scan els bi charsIn prevId =
+            case els of
+                [] ->
+                    ( prevId, Nothing )
+
+                el :: rest ->
+                    if bi == blockIndex && charsIn == charOffset then
+                        -- split point reached: prevId is left, el.id is right
+                        ( prevId, Just el.id )
+
+                    else if RichText.isMarker el.content then
+                        -- a separator marker opens the next block
+                        scan rest (bi + 1) 0 (Just el.id)
+
+                    else if RichText.isNestToken el.content then
+                        scan rest bi charsIn (Just el.id)
+
+                    else
+                        -- a character
+                        scan rest bi (charsIn + 1) (Just el.id)
+
+        ( left, right ) =
+            scan live 0 0 Nothing
+    in
+    fuguePlacement rga left right
+
+
+{-| The highest-`OpId` live nest token that belongs to the block opened by
+`markerId`: the live nest-token elements appearing after that marker and before the
+next marker, in element order. `Nothing` if the block has no tokens (depth 0).
+-}
+highestNestToken : Rga.Rga Node -> OpId -> Maybe OpId
+highestNestToken rga markerId =
+    let
+        markerKey =
+            Id.opIdToString markerId
+
+        -- walk visible elements; collect nest tokens that fall in this marker's block
+        -- (after this marker, before the next marker).
+        collect els inThisBlock acc =
+            case els of
+                [] ->
+                    acc
+
+                el :: rest ->
+                    if RichText.isMarker el.content then
+                        collect rest (Id.opIdToString el.id == markerKey) acc
+
+                    else if inThisBlock && RichText.isNestToken el.content then
+                        collect rest inThisBlock (el.id :: acc)
+
+                    else
+                        collect rest inThisBlock acc
+    in
+    Rga.toElementsInOrder rga
+        |> List.filter (not << .deleted)
+        |> (\els -> collect els False [])
+        |> List.sortWith (\x y -> Id.compareOpId y x)
+        |> List.head
+
+
+{-| Diff the whole char sequence of a text/rich node to read as `value`.
+-}
 applyTextDiff : List TargetStep -> Rga.Rga Node -> String -> OpDoc a -> OpDoc a
 applyTextDiff target rga value doc =
     let
-        -- compute the visible order ONCE; index into it rather than re-ordering
-        -- the array for every position (which made a replace O(D*N) per edit)
+        -- CHARACTER elements only — a rich-text sequence may also hold block markers /
+        -- nest tokens (non-`PString`), which are not text and must not shift indices.
+        charElems =
+            Rga.toElementsInOrder rga
+                |> List.filter (not << .deleted)
+                |> List.filterMap charElemOf
+    in
+    applyCharDiff target rga charElems Nothing Nothing value doc
+
+
+{-| The `(id, char)` of a char element, or `Nothing` for markers/tokens/tombstones.
+-}
+charElemOf : Rga.Element Node -> Maybe ( OpId, String )
+charElemOf el =
+    case Node.asPrim el.content of
+        Just (PString s) ->
+            Just ( el.id, s )
+
+        _ ->
+            Nothing
+
+
+{-| Diff a specific list of char elements (`charElems`, in order) to read as `value`,
+emitting the minimal insert/delete run scoped to those chars. `fallbackLeft` /
+`fallbackRight` bound the range when it has no char of its own on that side: for a
+block edit they are the block's own marker (left) and the next block's marker (right),
+so text typed into an _empty_ block lands strictly **between** the two markers instead
+of floating past the next marker into the following block. `Nothing` on a side means
+the document edge (head / end). `rga` is the full text sequence (for Fugue placement).
+Used by both `applyTextDiff` (whole sequence, both fallbacks `Nothing`) and
+`setBlockText` (one block's chars).
+-}
+applyCharDiff : List TargetStep -> Rga.Rga Node -> List ( OpId, String ) -> Maybe OpId -> Maybe OpId -> String -> OpDoc a -> OpDoc a
+applyCharDiff target rga charElems fallbackLeft fallbackRight value doc =
+    let
+        -- each char element holds exactly one char (they are minted per-char), so
+        -- `ids` and `current` stay index-aligned one-to-one.
         ids =
-            Rga.visibleIds rga |> Array.fromList
+            charElems |> List.map Tuple.first |> Array.fromList
 
         current =
-            Rga.toList rga
-                |> List.filterMap
-                    (\n ->
-                        case Node.asPrim n of
-                            Just (PString s) ->
-                                Just s
-
-                            _ ->
-                                Nothing
-                    )
-                |> String.concat
-                |> String.toList
+            charElems |> List.filterMap (\( _, s ) -> String.uncons s |> Maybe.map Tuple.first)
 
         target_ =
             String.toList value
@@ -1971,13 +2469,24 @@ applyTextDiff target rga value doc =
         -- element after the gap (index len-suffix, first past the deleted range).
         leftAnchor =
             if prefix <= 0 then
-                Nothing
+                -- no char to the left within this range: anchor after the block's
+                -- marker (fallbackLeft) so an insert lands inside the block, not at
+                -- the document head. Nothing for the whole-sequence / leading case.
+                fallbackLeft
 
             else
                 Array.get (prefix - 1) ids
 
         rightAnchor =
-            Array.get (List.length current - suffix) ids
+            case Array.get (List.length current - suffix) ids of
+                Just cid ->
+                    Just cid
+
+                Nothing ->
+                    -- no surviving char after the gap within this range: bound the
+                    -- insert by the next block's marker (fallbackRight) so it can't
+                    -- float past it into the following block. Nothing = document end.
+                    fallbackRight
 
         startPlacement =
             fuguePlacement rga leftAnchor rightAnchor
@@ -2591,6 +3100,25 @@ subValue schema path doc =
             (\( _, node ) ->
                 Schema.decodeNode schema node
                     |> Result.mapError (\e -> WrongNodeType (Schema.errorToString e))
+            )
+
+
+{-| Read a rich-text field as **blocks** (type + depth + spans), rather than the flat
+`List Span` the `S.richText` schema decodes to. A rich field supports both views;
+block edits (`splitBlock` etc.) address markers by the `marker` id these carry. See
+`Crdt.RichText.toBlocks` / `docs/11`.
+-}
+readBlocks : Path -> OpDoc a -> Result Error (List RichText.Block)
+readBlocks path doc =
+    resolve path doc
+        |> Result.andThen
+            (\( _, node ) ->
+                case Node.asRich node of
+                    Just r ->
+                        Ok (RichText.toBlocks r)
+
+                    Nothing ->
+                        Err (WrongNodeType "expected rich-text node for readBlocks")
             )
 
 
