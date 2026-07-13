@@ -2,6 +2,7 @@ module Crdt.Schema exposing
     ( Crdt, Error, Seed
     , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
     , int, float, string, bool, text, counter, lww
+    , optional, withDefault, map
     , list, movableList, dict, tree, richText
     , with, decodeNode, emptyNode, errorToString
     )
@@ -26,6 +27,7 @@ compile time; it never affects reads or merge.
 @docs Crdt, Error, Seed
 @docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
 @docs int, float, string, bool, text, counter, lww
+@docs optional, withDefault, map
 @docs list, movableList, dict, tree, richText
 @docs with, decodeNode, emptyNode, errorToString
 
@@ -167,6 +169,43 @@ counter =
 lww : Crdt kind a -> Crdt kind a
 lww =
     I.lww
+
+
+{-| Make a field's schema **optional** for schema evolution: it reads `Nothing` when
+the field is absent (a document written before the field existed) instead of failing,
+and `Just v` when present. Seeding `Nothing` writes no value. See `docs/13`.
+
+    |> Ref.field "priority" .priority (S.optional prioritySchema)
+
+-}
+optional : Crdt kind a -> Crdt kind (Maybe a)
+optional =
+    I.optional
+
+
+{-| Give a field's schema a **default** read when the field is absent (a document
+written before the field existed): it reads `default` instead of failing, without
+changing the value type. The real value is minted on first write. See `docs/13`.
+
+    |> Ref.field "priority" .priority (S.withDefault Medium prioritySchema)
+
+-}
+withDefault : a -> Crdt kind a -> Crdt kind a
+withDefault =
+    I.withDefault
+
+
+{-| Transform the value a schema reads and seeds, in **both** directions (`to` on read,
+`from` on seed) — for evolving a value's shape (re-spell an enum, int↔string, unit
+change) while the stored `Node` is unchanged. Both directions are required so seeding
+round-trips; a non-invertible change is a lens, not a `map` (see `docs/13`).
+
+    S.map statusFromString statusToString S.string
+
+-}
+map : (a -> b) -> (b -> a) -> Crdt kind a -> Crdt kind b
+map =
+    I.map
 
 
 {-| An ordered list of `a`, backed by an RGA.

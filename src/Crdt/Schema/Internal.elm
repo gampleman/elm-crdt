@@ -2,9 +2,10 @@ module Crdt.Schema.Internal exposing
     ( Crdt, Error(..), Seed
     , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
     , int, float, string, bool, text, counter, lww
+    , optional, withDefault, map
     , list, movableList, dict, tree, richText
-    , record, field, build, RecordBuilder
-    , CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, buildCustom
+    , record, field, aliasedField, build, RecordBuilder
+    , CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
     , variantArgKey
     , with, decodeNode, emptyNode, errorToString
     )
@@ -27,9 +28,10 @@ state — that is the hard diff problem. All in-place mutation goes through
 @docs Crdt, Error, Seed
 @docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
 @docs int, float, string, bool, text, counter, lww
+@docs optional, withDefault, map
 @docs list, movableList, dict, tree, richText
-@docs record, field, build, RecordBuilder
-@docs CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, buildCustom
+@docs record, field, aliasedField, build, RecordBuilder
+@docs CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
 @docs variantArgKey
 @docs with, decodeNode, emptyNode, errorToString
 
@@ -64,6 +66,15 @@ type Crdt kind a
         { decode : Node -> Result Error a
         , empty : Ctx -> ( Node, Ctx )
         , seed : a -> Ctx -> ( Node, Ctx )
+
+        -- Schema-evolution support (see docs/13). What this schema reads when its slot
+        -- is **absent** from its parent (a record field the writer's schema didn't have
+        -- yet): `Nothing` = required, absence is a `MissingField` error (the default for
+        -- every leaf/container); `Just v` = absence reads as `v` (set by `optional` /
+        -- `withDefault`, so an added field is non-breaking on old documents). Consulted
+        -- only by `field`; absence is meaningless for a top-level read or a dict/list
+        -- element (which are simply not present in the collection).
+        , whenAbsent : Maybe a
         }
 
 
@@ -190,7 +201,8 @@ with value (Crdt c) =
 primReg : (Prim -> Result Error a) -> (a -> Prim) -> Prim -> Crdt Settable a
 primReg fromPrim toPrim emptyPrim =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 case Node.asPrim node of
                     Just p ->
@@ -292,6 +304,132 @@ lww =
 
 
 
+-- SCHEMA EVOLUTION -----------------------------------------------------------
+--
+-- Read-time tolerance so a document written by one schema version reads sensibly under
+-- another (see docs/13). These evolve the *decoder*, never the data: the Node tree
+-- already syncs unknown fields losslessly (merge is schema-blind), so the only place
+-- drift bites is read, and these make read tolerant. All are pure read policy — they
+-- never gate a write or a merge, so convergence is untouched.
+
+
+{-| Make a schema **optional**: reads `Nothing` when the value is a null sentinel or the
+field is absent (a document that predates the field), and `Just v` when present, instead
+of failing. Seeding `Nothing` writes a null register; `Just v` seeds the inner value.
+
+    -- adding `priority` to an existing record is non-breaking:
+    |> field "priority" .priority (S.optional prioritySchema)
+
+`Maybe` is represented **uniformly as a map** `{ "just" : <inner> }`: `Nothing` is the
+empty map, `Just v` has the `"just"` key present. This keeps the node shape constant (a
+`Map`) whether present or not, so the edit/diff engine transitions between `Nothing` and
+`Just` by flipping one key's presence — the same machinery dicts use — rather than
+swapping node kinds (which the diff engine leaves untouched). The empty base is the empty
+map, so a newer peer that adds this field, then merges an older peer's document, reads
+`Nothing`; the map key's presence stamps are minted at write time, so a real `Just`
+write outranks the base by LWW.
+
+-}
+optional : Crdt kind a -> Crdt kind (Maybe a)
+optional (Crdt inner) =
+    let
+        justKey =
+            "just"
+    in
+    Crdt
+        { whenAbsent = Just Nothing
+        , decode =
+            \node ->
+                case Node.asMap node of
+                    Just entries ->
+                        case Dict.get justKey entries of
+                            Just e ->
+                                if e.present then
+                                    inner.decode e.value |> Result.map Just
+
+                                else
+                                    Ok Nothing
+
+                            Nothing ->
+                                Ok Nothing
+
+                    Nothing ->
+                        -- tolerate a legacy/foreign non-map node by reading it as the
+                        -- inner value (so an older doc that stored the bare value still
+                        -- reads as `Just`).
+                        inner.decode node |> Result.map Just
+        , empty = \ctx -> ( Node.mapFromEntries Dict.empty, ctx )
+        , seed =
+            \value ctx ->
+                case value of
+                    Nothing ->
+                        ( Node.mapFromEntries Dict.empty, ctx )
+
+                    Just v ->
+                        let
+                            ( innerNode, ctx1 ) =
+                                inner.seed v ctx
+
+                            ( stamp, ctx2 ) =
+                                Id.nextId ctx1
+                        in
+                        ( Node.mapFromEntries (Dict.singleton justKey (Node.entry stamp True innerNode)), ctx2 )
+        }
+
+
+{-| Give a schema a **default** read when its field is absent (an older document that
+predates the field): the field reads `default` instead of `MissingField`. Unlike
+`optional` the value type is unchanged, so it drops into an existing schema without
+rewrapping the record in `Maybe`. This is Cambria's "add field with default" as a pure
+read rule — the default is what old data reads as, and the real value is minted on first
+write.
+
+    |> field "priority" .priority (S.withDefault Medium prioritySchema)
+
+**How this works across peers** (see docs/13): the empty base **seeds the `default`
+value**, not the inner leaf's arbitrary empty (`0`/`False`/`""`). Since every replica
+builds its own base from its own schema, a newer peer that adds this field seeds it as
+`default`; when it merges an older peer's document (which lacks the field), the field is
+already present _as the default_ — so it reads `default`, exactly as absence should. And
+it stays convergent: a base seed's stamp is minted at `init` (a low Lamport counter),
+so any real write outranks it by LWW — the default is only ever the pre-write value, and
+two peers both showing the unwritten default agree because the _value_ agrees.
+
+A present-but-**undecodable** node still surfaces its decode error (drift within a value
+is not the same as an absent field); use `map` to coerce a changed value shape.
+
+-}
+withDefault : a -> Crdt kind a -> Crdt kind a
+withDefault default (Crdt inner) =
+    Crdt
+        { whenAbsent = Just default
+        , decode = inner.decode
+        , empty = \ctx -> inner.seed default ctx
+        , seed = inner.seed
+        }
+
+
+{-| Transform the value a schema reads/seeds, in **both directions** (`to` on read,
+`from` on seed). Covers value-shape evolution — re-spelling an enum, int↔string, a unit
+change — while keeping the stored `Node` unchanged. Both directions are required (unlike
+Cambria's one-way `convert`) so seeding round-trips coherently; a non-invertible change
+(two fields folded into one) is not a `map` — that would be a Layer-4 lens (docs/13).
+
+    -- store an enum as a string, read it as a custom type:
+    S.map statusFromString statusToString S.string
+
+-}
+map : (a -> b) -> (b -> a) -> Crdt kind a -> Crdt kind b
+map to from (Crdt inner) =
+    Crdt
+        { whenAbsent = Maybe.map to inner.whenAbsent
+        , decode = \node -> inner.decode node |> Result.map to
+        , empty = inner.empty
+        , seed = \value ctx -> inner.seed (from value) ctx
+        }
+
+
+
 -- COUNTER --------------------------------------------------------------------
 
 
@@ -303,7 +441,8 @@ from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.Edit.increme
 counter : Crdt Counter Int
 counter =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 case Node.asCounter node of
                     Just n ->
@@ -336,7 +475,8 @@ concurrent edits merge character-wise.
 text : Crdt Settable String
 text =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 case Node.asTxt node of
                     Just rga ->
@@ -362,7 +502,8 @@ edited by text insert/delete plus `mark`/`unmark` (see `Crdt.Ref`).
 richText : Crdt RichK (List Span)
 richText =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 case Node.asRich node of
                     Just r ->
@@ -391,7 +532,8 @@ replicas all survive and converge to a deterministic order.
 list : Crdt ek a -> Crdt (ListK Fixed ek a) (List a)
 list (Crdt elem) =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 case Node.asSeq node of
                     Just rga ->
@@ -435,7 +577,8 @@ moved item). Backed by `Crdt.MoveList`. Reads as a plain `List a` in order.
 movableList : Crdt ek a -> Crdt (ListK Movable ek a) (List a)
 movableList (Crdt elem) =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 case Node.asMov node of
                     Just ml ->
@@ -480,7 +623,8 @@ A fresh tree is empty; nodes are added by ref, not seeded, so `seed` yields empt
 tree : Crdt ek a -> Crdt (TreeK ek a) (Tree.Forest a)
 tree (Crdt elem) =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 case Node.asTree node of
                     Just t ->
@@ -540,7 +684,8 @@ set/remove resolves by stamp. Reads back as a standard `Dict`, omitting removed
 dict : Crdt vk a -> Crdt (DictK vk a) (Dict String a)
 dict (Crdt val) =
     Crdt
-        { decode =
+        { whenAbsent = Nothing
+        , decode =
             \node ->
                 Node.presentEntries node
                     |> List.map (\( k, v ) -> val.decode v |> Result.map (Tuple.pair k))
@@ -605,22 +750,49 @@ record ctor =
 field's own schema.
 -}
 field : String -> (full -> a) -> Crdt fk a -> RecordBuilder full (a -> b) -> RecordBuilder full b
-field name getter (Crdt fieldSchema) (RecordBuilder rb) =
+field name getter schema rb =
+    aliasedField name [] getter schema rb
+
+
+{-| Add a field that also reads from **older names** (`aliases`), in order, when the
+current `name` is absent — a schema-evolution rename (see docs/13). Reads always prefer
+`name`; writes/seeds always go to `name`, so once a value is written the old key becomes
+inert (a tolerated extra key). A v1 peer (which only knows the old name) and a v2 peer
+(new name + alias) converge on the same `Node` and each reads it through its own names.
+
+    -- renamed "complete" -> "done":
+    |> aliasedField "done" [ "complete" ] .done S.bool
+
+-}
+aliasedField : String -> List String -> (full -> a) -> Crdt fk a -> RecordBuilder full (a -> b) -> RecordBuilder full b
+aliasedField name aliases getter (Crdt fieldSchema) (RecordBuilder rb) =
+    let
+        -- Read whichever of the names (canonical + aliases) carries the HIGHEST-stamped
+        -- entry — LWW across the rename. This is what makes a rename converge safely
+        -- even though every replica base-seeds its own canonical name: a base seed is
+        -- minted at `init` (a low stamp), so a real write to *any* name — old or new —
+        -- outranks the seed, and the latest write across names wins (see docs/13).
+        -- Falls back to the schema's `whenAbsent` (a `withDefault`/`optional` rename is
+        -- tolerant on all sides), else `MissingField`.
+        readField entries =
+            case highestStamped (name :: aliases) entries of
+                Just e ->
+                    fieldSchema.decode e.value
+
+                Nothing ->
+                    case fieldSchema.whenAbsent of
+                        Just fallback ->
+                            Ok fallback
+
+                        Nothing ->
+                            Err (MissingField name)
+    in
     RecordBuilder
         { decode =
             \node ->
                 case Node.asMap node of
                     Just entries ->
-                        let
-                            fieldResult =
-                                case Dict.get name entries of
-                                    Just e ->
-                                        fieldSchema.decode e.value
-
-                                    Nothing ->
-                                        Err (MissingField name)
-                        in
-                        Result.map2 (\f a -> f a) (rb.decode node) fieldResult
+                        Result.map2 (\f a -> f a) (rb.decode node) (readField entries)
 
                     Nothing ->
                         Err (TypeMismatch ("expected record for field " ++ name))
@@ -629,11 +801,24 @@ field name getter (Crdt fieldSchema) (RecordBuilder rb) =
                 let
                     ( accValues, ctx1 ) =
                         rb.empty ctx acc
-
-                    ( fieldNode, ctx2 ) =
-                        fieldSchema.empty ctx1
                 in
-                ( ( name, fieldNode ) :: accValues, ctx2 )
+                -- An ALIASED field (a rename) or an absence-tolerant field
+                -- (`optional`/`withDefault`) is left OUT of the empty base. For a rename
+                -- this is essential: if the base seeded the canonical name, its stamp
+                -- could TIE a peer's write to the old name on counter and win the
+                -- replica-id tiebreak, masking the real value — so only real writes may
+                -- carry a stamp for these names. A tolerant field reads its fallback
+                -- until written. Required, non-aliased fields are still seeded so a fresh
+                -- document satisfies its own reader. See docs/13.
+                if not (List.isEmpty aliases) || fieldSchema.whenAbsent /= Nothing then
+                    ( accValues, ctx1 )
+
+                else
+                    let
+                        ( fieldNode, ctx2 ) =
+                            fieldSchema.empty ctx1
+                    in
+                    ( ( name, fieldNode ) :: accValues, ctx2 )
         , seed =
             \full ctx acc ->
                 let
@@ -647,12 +832,48 @@ field name getter (Crdt fieldSchema) (RecordBuilder rb) =
         }
 
 
+{-| Among `names`, the present entry with the highest stamp (LWW across a rename's old
+and new names), or `Nothing` if none is present. A base seed's stamp is minted low at
+`init`, so a real write to any name outranks it; the latest real write wins.
+-}
+highestStamped : List String -> Dict String Node.Entry -> Maybe Node.Entry
+highestStamped names entries =
+    names
+        |> List.filterMap (\n -> Dict.get n entries |> Maybe.andThen keepPresent)
+        |> List.foldl
+            (\e acc ->
+                case acc of
+                    Just best ->
+                        if Id.compareOpId e.stamp best.stamp == GT then
+                            Just e
+
+                        else
+                            acc
+
+                    Nothing ->
+                        Just e
+            )
+            Nothing
+
+
+{-| An entry if it is present (not tombstoned), else `Nothing`.
+-}
+keepPresent : Node.Entry -> Maybe Node.Entry
+keepPresent e =
+    if e.present then
+        Just e
+
+    else
+        Nothing
+
+
 {-| Finish a record schema.
 -}
 build : RecordBuilder a a -> Crdt Nested a
 build (RecordBuilder rb) =
     Crdt
-        { decode = rb.decode
+        { whenAbsent = Nothing
+        , decode = rb.decode
         , empty = \ctx -> rb.empty ctx [] |> stampEntries
         , seed = \value ctx -> rb.seed value ctx [] |> stampEntries
         }
@@ -722,6 +943,13 @@ type CustomBuilder match value
         { match : match
         , decoders : Dict String (Node -> Result Error value)
         , default : Maybe VariantSeed
+
+        -- Schema-evolution fallback (see docs/13): how to read a `$tag` that names no
+        -- declared variant — the forward-compatibility case where a peer on a newer
+        -- schema wrote a variant this (older) schema doesn't know. `Nothing` = unknown
+        -- tags are a `BadValue` error (the default); `Just f` = read them as `f tag`
+        -- (set by `catchAll`), so an added variant doesn't break old peers.
+        , catchAll : Maybe (String -> value)
         }
 
 
@@ -754,7 +982,52 @@ The first variant declared is the **default** (used to build a fresh document).
 -}
 custom : match -> CustomBuilder match value
 custom match =
-    CustomBuilder { match = match, decoders = Dict.empty, default = Nothing }
+    CustomBuilder { match = match, decoders = Dict.empty, default = Nothing, catchAll = Nothing }
+
+
+{-| Declare a **catch-all variant** for schema evolution (see `docs/13`): a variant of
+your Elm type, carrying the raw `$tag` string, that unknown tags decode to instead of
+failing the read with `BadValue`. This makes adding a variant **forward-compatible** — a
+peer on an older schema reads a newer peer's variant as `Unknown "the-tag"` rather than
+erroring.
+
+Like `variant1`, it consumes one dispatcher handler (`String -> VariantSeed`) — the
+catch-all is a real variant of your type, so `match` must handle it. Declare it once:
+
+    custom
+        (\active done unknown v ->
+            case v of
+                Active ->
+                    active
+
+                Done note ->
+                    done note
+
+                Unknown tag ->
+                    unknown tag
+        )
+        |> variant0 "active" Active
+        |> variant1 "done" Done text
+        |> catchAll "unknown" Unknown
+        |> buildCustom
+
+`ctor` is your constructor (`Unknown : String -> value`). Seeding/switching to
+`Unknown t` writes `$tag = t` with **no payload** — so the tag is _preserved_ on the
+wire and a newer peer still reads its real variant. (Conservation caveat: an old peer
+that switches away from an unknown value can't reproduce its payload — documented in
+`docs/13`. Merely holding the value loses nothing, since it isn't rewritten.) The
+`placeholderTag` is used only for the fresh-document default if the catch-all happens to
+be the first variant, which is unusual.
+
+-}
+catchAll : String -> (String -> value) -> CustomBuilder ((String -> VariantSeed) -> b) value -> CustomBuilder b value
+catchAll placeholderTag ctor (CustomBuilder cb) =
+    CustomBuilder
+        { match = cb.match (\tag -> seedCustomNode tag [])
+        , decoders = cb.decoders
+        , default = keepFirst cb.default (seedCustomNode placeholderTag [])
+        , catchAll = Just ctor
+        }
 
 
 {-| A nullary variant: its tag and its Elm value (e.g. `Active`).
@@ -765,6 +1038,7 @@ variant0 name ctorValue (CustomBuilder cb) =
         { match = cb.match (seedCustomNode name [])
         , decoders = Dict.insert name (\_ -> Ok ctorValue) cb.decoders
         , default = keepFirst cb.default (seedCustomNode name [])
+        , catchAll = cb.catchAll
         }
 
 
@@ -781,6 +1055,7 @@ variant1 name ctor (Crdt s1) (CustomBuilder cb) =
         { match = cb.match (\a1 -> seedCustomNode name [ s1.seed a1 ])
         , decoders = Dict.insert name (\p -> Result.map ctor (arg 0 s1 p)) cb.decoders
         , default = keepFirst cb.default (seedCustomNode name [ s1.empty ])
+        , catchAll = cb.catchAll
         }
 
 
@@ -798,6 +1073,7 @@ variant2 name ctor (Crdt s1) (Crdt s2) (CustomBuilder cb) =
         { match = cb.match (\a1 a2 -> seedCustomNode name [ s1.seed a1, s2.seed a2 ])
         , decoders = Dict.insert name (\p -> Result.map2 ctor (arg 0 s1 p) (arg 1 s2 p)) cb.decoders
         , default = keepFirst cb.default (seedCustomNode name [ s1.empty, s2.empty ])
+        , catchAll = cb.catchAll
         }
 
 
@@ -819,6 +1095,7 @@ variant3 name ctor (Crdt s1) (Crdt s2) (Crdt s3) (CustomBuilder cb) =
                 (\p -> Result.map3 ctor (arg 0 s1 p) (arg 1 s2 p) (arg 2 s3 p))
                 cb.decoders
         , default = keepFirst cb.default (seedCustomNode name [ s1.empty, s2.empty, s3.empty ])
+        , catchAll = cb.catchAll
         }
 
 
@@ -827,7 +1104,8 @@ variant3 name ctor (Crdt s1) (Crdt s2) (Crdt s3) (CustomBuilder cb) =
 buildCustom : CustomBuilder (value -> VariantSeed) value -> Crdt (Variants value) value
 buildCustom (CustomBuilder cb) =
     Crdt
-        { decode = decodeCustom cb.decoders
+        { whenAbsent = Nothing
+        , decode = decodeCustom cb.decoders cb.catchAll
         , empty =
             case cb.default of
                 Just vs ->
@@ -937,10 +1215,12 @@ seedCustomNodeRaw name argSeeders ctx =
 
 
 {-| Decode a custom-type node: read `$tag`, dispatch to that variant's decoder,
-handing it the variant's payload map (an empty map for a nullary variant).
+handing it the variant's payload map (an empty map for a nullary variant). An unknown
+tag routes to the `catchAll` fallback if the schema declared one, else it is a
+`BadValue` error (see `docs/13`).
 -}
-decodeCustom : Dict String (Node -> Result Error value) -> Node -> Result Error value
-decodeCustom decoders node =
+decodeCustom : Dict String (Node -> Result Error value) -> Maybe (String -> value) -> Node -> Result Error value
+decodeCustom decoders fallback node =
     case Node.asMap node of
         Nothing ->
             Err (TypeMismatch "expected custom-type map")
@@ -961,7 +1241,12 @@ decodeCustom decoders node =
                                         |> dec
 
                                 Nothing ->
-                                    Err (BadValue ("unknown variant: " ++ name))
+                                    case fallback of
+                                        Just toValue ->
+                                            Ok (toValue name)
+
+                                        Nothing ->
+                                            Err (BadValue ("unknown variant: " ++ name))
 
                         _ ->
                             Err (BadValue "custom $tag is not a string")

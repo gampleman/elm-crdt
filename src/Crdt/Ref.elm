@@ -9,8 +9,8 @@ module Crdt.Ref exposing
     , treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
     , cursorAt, cursorOffset
     , touched, origins
-    , RecordRefs, record, field, build
-    , CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
+    , RecordRefs, record, field, aliasedField, build
+    , CustomRefs, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
     )
 
 {-| **Type-safe writes.** A `Ref r kind a` is a write-only optic — a typed pointer
@@ -47,8 +47,8 @@ existing op-log runtime — no new merge semantics.
 @docs treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
 @docs cursorAt, cursorOffset
 @docs touched, origins
-@docs RecordRefs, record, field, build
-@docs CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
+@docs RecordRefs, record, field, aliasedField, build
+@docs CustomRefs, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
 
 -}
 
@@ -512,6 +512,31 @@ field name getter schema (RecordRefsBuilder rb) =
         }
 
 
+{-| Add a field that also reads from **older names** (`aliases`) when `name` is absent —
+a schema-evolution rename (see `docs/13`). Reads prefer `name`, then each alias in order;
+writes and the field's `Ref` always target `name`, so once written the old key becomes an
+inert extra key. Peers on the old and new schema converge on the same document and each
+reads it through its own names.
+
+    record Todo TodoRefs
+        |> aliasedField "done" [ "complete" ] .done S.bool
+        |> ...
+
+-}
+aliasedField :
+    String
+    -> List String
+    -> (full -> f)
+    -> Crdt kind f
+    -> RecordRefsBuilder r full (f -> b) (Ref r kind f -> rest)
+    -> RecordRefsBuilder r full b rest
+aliasedField name aliases getter schema (RecordRefsBuilder rb) =
+    RecordRefsBuilder
+        { builder = SI.aliasedField name aliases getter schema rb.builder
+        , refs = rb.refs (Ref { path = Path.root |> Path.field name, schema = schema })
+        }
+
+
 {-| Finish: returns `{ schema, refs }`.
 -}
 build : RecordRefsBuilder r a a refs -> RecordRefs a refs
@@ -633,6 +658,30 @@ variant3 name ctor s1 s2 s3 (CustomRefsBuilder cb) =
     CustomRefsBuilder
         { builder = SI.variant3 name ctor s1 s2 s3 cb.builder
         , refs = cb.refs (variantPayload name 0 s1) (variantPayload name 1 s2) (variantPayload name 2 s3)
+        }
+
+
+{-| A **catch-all variant** for schema evolution: unknown `$tag`s (a variant a newer
+peer added) decode to `ctor tag` instead of failing the read (see `docs/13`). Consumes
+one dispatcher handler (`String -> SI.VariantSeed`) like a variant but threads **no**
+payload ref — the raw tag isn't an editable payload — so the refs assembler is unchanged.
+
+    custom (\active done unknown v -> ...) Refs
+        |> variant0 "active" Active
+        |> variant1 "done" Done S.text
+        |> catchAll "unknown" Unknown
+        |> buildCustom
+
+-}
+catchAll :
+    String
+    -> (String -> value)
+    -> CustomRefsBuilder value ((String -> SI.VariantSeed) -> b) refs
+    -> CustomRefsBuilder value b refs
+catchAll placeholderTag ctor (CustomRefsBuilder cb) =
+    CustomRefsBuilder
+        { builder = SI.catchAll placeholderTag ctor cb.builder
+        , refs = cb.refs
         }
 
 

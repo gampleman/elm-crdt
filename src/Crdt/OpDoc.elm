@@ -3407,16 +3407,16 @@ collaborative text still merges by character. Used by `Crdt.Ref`'s `set`.
 -}
 seedNodeAt : Path -> Seed -> OpDoc a -> Result Error (OpDoc a)
 seedNodeAt path seed doc =
-    resolve path doc
-        |> Result.map
-            (\( target, current ) ->
-                let
-                    ( seeded, ctx1 ) =
-                        I.runSeed seed (ctxOf doc)
+    case resolve path doc of
+        Ok ( target, current ) ->
+            let
+                ( seeded, ctx1 ) =
+                    I.runSeed seed (ctxOf doc)
 
-                    doc1 =
-                        withCtx ctx1 doc
-                in
+                doc1 =
+                    withCtx ctx1 doc
+            in
+            Ok <|
                 case ( current, seeded ) of
                     ( Node.Txt rga, Node.Txt _ ) ->
                         -- preserve character-wise merge for text leaves
@@ -3426,7 +3426,94 @@ seedNodeAt path seed doc =
                         -- general case: emit the diff ops (registers, counters,
                         -- maps/records, sum-type $tag switches, sequences)
                         restoreNode target seeded current doc1
-            )
+
+        Err err ->
+            -- The path didn't resolve. If it's a record/dict field that is simply ABSENT
+            -- (an `optional`/`withDefault`/aliased field not seeded into the base — see
+            -- docs/13), create it: resolve the PARENT map and emit a `SetPresence` that
+            -- adds the key with the seeded value. This is the same op dicts use for a
+            -- new key; it's what lets `Ref.set` write a field the base never seeded.
+            case seedAbsentField path seed doc of
+                Just doc1 ->
+                    Ok doc1
+
+                Nothing ->
+                    Err err
+
+
+{-| If `path` ends in a field/key whose parent map resolves but the key is absent, emit
+a `SetPresence` creating it with the seeded value; else `Nothing` (the caller keeps the
+original resolve error). Enables writing an unseeded (migration-tolerant) field.
+-}
+seedAbsentField : Path -> Seed -> OpDoc a -> Maybe (OpDoc a)
+seedAbsentField path seed doc =
+    case List.reverse (Path.segments path) of
+        (Path.Field name) :: revParent ->
+            createKeyAt (pathOfSegments (List.reverse revParent)) name seed doc
+
+        (Path.Key name) :: revParent ->
+            createKeyAt (pathOfSegments (List.reverse revParent)) name seed doc
+
+        _ ->
+            Nothing
+
+
+{-| Rebuild a `Path` from a segment list (via the `Path` builders).
+-}
+pathOfSegments : List Path.Seg -> Path
+pathOfSegments segs =
+    List.foldl
+        (\seg p ->
+            case seg of
+                Path.Field n ->
+                    Path.field n p
+
+                Path.Key n ->
+                    Path.key n p
+
+                Path.Index i ->
+                    Path.index i p
+
+                Path.NodeId id ->
+                    Path.node id p
+        )
+        Path.root
+        segs
+
+
+{-| Resolve `parentPath` to a map and emit a `SetPresence` adding `name` with `seed`.
+`Nothing` if the parent doesn't resolve to a map or the key already exists (then the
+normal path should have handled it).
+-}
+createKeyAt : Path -> String -> Seed -> OpDoc a -> Maybe (OpDoc a)
+createKeyAt parentPath name seed doc =
+    case resolve parentPath doc of
+        Ok ( parentTarget, parentNode ) ->
+            case Node.asMap parentNode of
+                Just entries ->
+                    if Dict.member name entries then
+                        -- key present (possibly tombstoned) — let the normal diff path
+                        -- handle it rather than a blind create.
+                        Nothing
+
+                    else
+                        let
+                            ( seeded, ctx1 ) =
+                                I.runSeed seed (ctxOf doc)
+
+                            doc1 =
+                                withCtx ctx1 doc
+
+                            ( id, doc2 ) =
+                                mint doc1
+                        in
+                        Just (commit [ op id (frontierOf doc2) (SetPresence { target = parentTarget ++ [ IntoKey name ], present = True, seed = seeded }) ] doc2)
+
+                Nothing ->
+                    Nothing
+
+        Err _ ->
+            Nothing
 
 
 {-| Read the typed value at `path` through a sub-schema. `Crdt.Ref`'s `over` uses
