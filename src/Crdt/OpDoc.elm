@@ -5,6 +5,7 @@ module Crdt.OpDoc exposing
     , setText, setBool, setInt, setString, increment
     , listAppend, listRemove, listMove
     , setKey, removeKey
+    , contribute, retract
     , opCount, cacheConsistent
     , cursorAt, cursorOffset, cursorRange
     , Version, version, readAt
@@ -38,6 +39,7 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs setText, setBool, setInt, setString, increment
 @docs listAppend, listRemove, listMove
 @docs setKey, removeKey
+@docs contribute, retract
 @docs opCount, cacheConsistent
 @docs cursorAt, cursorOffset, cursorRange
 @docs Version, version, readAt
@@ -3374,6 +3376,62 @@ removeKey path k doc =
                 in
                 commit
                     [ op id (frontierOf doc1) (SetPresence { target = target ++ [ IntoKey k ], present = False, seed = emptyMap }) ]
+                    doc1
+            )
+
+
+{-| Add a **contribution** to a user-defined op-set CRDT (`Crdt.Schema.opSet`): write the
+seeded contribution node under a freshly-minted **op-id key**, so every contribution has a
+unique identity and concurrent contributions from any replicas all survive a merge (they
+union by distinct key). This is `setKey` with the key being the op's own id — the one new
+primitive extensibility needs, reusing the existing presence op. Returns the contribution's
+key (its op-id string) so a caller can later `retract` exactly it.
+-}
+contribute : Path -> Seed -> OpDoc a -> Result Error ( String, OpDoc a )
+contribute path seed doc =
+    resolve path doc
+        |> Result.map
+            (\( target, _ ) ->
+                let
+                    (OpDoc d) =
+                        doc
+
+                    ( id, ctx1 ) =
+                        Id.nextId d.ctx
+
+                    key =
+                        Id.opIdToString id
+
+                    ( seedNode, ctx2 ) =
+                        I.runSeed seed ctx1
+
+                    doc1 =
+                        OpDoc { d | ctx = ctx2 }
+                in
+                ( key
+                , commit
+                    [ op id (frontierOf doc1) (SetPresence { target = target ++ [ IntoKey key ], present = True, seed = seedNode }) ]
+                    doc1
+                )
+            )
+
+
+{-| Tombstone a single contribution of an op-set (by its `key`, the op-id string
+`contribute` returned) — an LWW presence flip, so a removed contribution no longer folds
+into the read. Turns a grow-only op-set into a two-phase / removable one. No-op if the key
+is unknown (nothing to remove).
+-}
+retract : Path -> String -> OpDoc a -> Result Error (OpDoc a)
+retract path key doc =
+    resolve path doc
+        |> Result.map
+            (\( target, _ ) ->
+                let
+                    ( id, doc1 ) =
+                        mint doc
+                in
+                commit
+                    [ op id (frontierOf doc1) (SetPresence { target = target ++ [ IntoKey key ], present = False, seed = emptyMap }) ]
                     doc1
             )
 

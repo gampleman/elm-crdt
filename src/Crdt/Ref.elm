@@ -6,6 +6,7 @@ module Crdt.Ref exposing
     , setBlockText, splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock
     , append, remove, move
     , setKey, removeKey
+    , contribute, retract
     , treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
     , cursorAt, cursorOffset
     , touched, origins
@@ -44,6 +45,7 @@ existing op-log runtime — no new merge semantics.
 @docs setBlockText, splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock
 @docs append, remove, move
 @docs setKey, removeKey
+@docs contribute, retract
 @docs treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
 @docs cursorAt, cursorOffset
 @docs touched, origins
@@ -382,6 +384,34 @@ setKey valSchema k value (Ref r) doc =
 removeKey : String -> Ref r (S.DictK vk v) dictType -> OpDoc doc -> Result Error (OpDoc doc)
 removeKey k (Ref r) doc =
     OpDoc.removeKey r.path k doc
+
+
+
+-- OP-SET (user-defined CRDT) --------------------------------------------------
+
+
+{-| Add a **contribution** to a user-defined op-set CRDT (`Crdt.Schema.opSet`). Only
+compiles for an `OpSetK` ref. Pass the same `contribution` schema you gave `opSet` and a
+contribution value; it is written under a fresh op-id, so concurrent contributions from
+any replicas all survive and the op-set's `fold` sees them all. Returns the contribution's
+key (its op-id string), which you can keep to `retract` exactly that contribution later.
+
+    ( key, doc1 ) =
+        Ref.contribute S.int 42 board.refs.highScore doc
+
+-}
+contribute : Crdt ck c -> c -> Ref r (S.OpSetK c) a -> OpDoc doc -> Result Error ( String, OpDoc doc )
+contribute contributionSchema value (Ref r) doc =
+    OpDoc.contribute r.path (S.with value contributionSchema) doc
+
+
+{-| Remove a single contribution from an op-set by its `key` (the op-id string
+`contribute` returned) — an LWW presence flip, so it no longer folds into the value. Turns
+a grow-only op-set into a removable one. No-op for an unknown key.
+-}
+retract : String -> Ref r (S.OpSetK c) a -> OpDoc doc -> Result Error (OpDoc doc)
+retract contributionKey (Ref r) doc =
+    OpDoc.retract r.path contributionKey doc
 
 
 

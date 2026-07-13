@@ -1,9 +1,9 @@
 module Crdt.Schema exposing
     ( Crdt, Error, Seed
-    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
+    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
     , int, float, string, bool, text, counter, lww
     , optional, withDefault, map
-    , list, movableList, dict, tree, richText
+    , list, movableList, dict, tree, richText, opSet
     , with, decodeNode, emptyNode, errorToString
     )
 
@@ -25,10 +25,10 @@ records how the value may be edited, so `Crdt.Ref` can reject nonsensical edits 
 compile time; it never affects reads or merge.
 
 @docs Crdt, Error, Seed
-@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
+@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
 @docs int, float, string, bool, text, counter, lww
 @docs optional, withDefault, map
-@docs list, movableList, dict, tree, richText
+@docs list, movableList, dict, tree, richText, opSet
 @docs with, decodeNode, emptyNode, errorToString
 
 -}
@@ -119,6 +119,13 @@ type alias TreeK ek a =
 -}
 type alias RichK =
     I.RichK
+
+
+{-| Kind marker: a user-defined **op-set** CRDT over contribution type `c` (see `opSet`);
+edited only via `Crdt.Ref.contribute`/`retract`.
+-}
+type alias OpSetK c =
+    I.OpSetK c
 
 
 {-| An integer LWW register.
@@ -245,6 +252,22 @@ plus `mark`/`unmark`).
 richText : Crdt RichK (List RichText.Span)
 richText =
     I.richText
+
+
+{-| Define your **own CRDT type** as an operation-based set: contributions (each written
+under its own op-id via `Crdt.Ref.contribute`) folded into a value at read. Convergence
+is free (merge unions contributions); the semantics is your `fold`, which must be a pure,
+order-independent function of the contribution set. See `docs/14`.
+
+    -- a grow-only max register
+    maxRegister : Crdt (OpSetK Int) Int
+    maxRegister =
+        S.opSet { contribution = S.int, fold = List.maximum >> Maybe.withDefault 0 }
+
+-}
+opSet : { contribution : Crdt ck c, fold : List c -> a } -> Crdt (OpSetK c) a
+opSet =
+    I.opSet
 
 
 {-| Seed a node from a value, producing an opaque `Seed` the edit APIs consume.

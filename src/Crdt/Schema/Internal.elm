@@ -1,9 +1,9 @@
 module Crdt.Schema.Internal exposing
     ( Crdt, Error(..), Seed
-    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
+    , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
     , int, float, string, bool, text, counter, lww
     , optional, withDefault, map
-    , list, movableList, dict, tree, richText
+    , list, movableList, dict, tree, richText, opSet
     , record, field, aliasedField, build, RecordBuilder
     , CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
     , variantArgKey
@@ -26,10 +26,10 @@ state — that is the hard diff problem. All in-place mutation goes through
 `Crdt.Edit`, which is decoupled from this layer.
 
 @docs Crdt, Error, Seed
-@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK
+@docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
 @docs int, float, string, bool, text, counter, lww
 @docs optional, withDefault, map
-@docs list, movableList, dict, tree, richText
+@docs list, movableList, dict, tree, richText, opSet
 @docs record, field, aliasedField, build, RecordBuilder
 @docs CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
 @docs variantArgKey
@@ -140,6 +140,14 @@ type TreeK ek a
 -}
 type RichK
     = RichK Never
+
+
+{-| Kind marker: a user-defined **op-set** CRDT over contribution type `c` (see
+`opSet` / `docs/14`). Its only edit verbs are `Crdt.Ref.contribute`/`retract` — it
+is not `set`/`increment`-able — so the phantom carries `c` to type those verbs.
+-}
+type OpSetK c
+    = OpSetK Never
 
 
 {-| What can go wrong reading a `Node` through a schema.
@@ -711,6 +719,58 @@ dict (Crdt val) =
                             values
                 in
                 ( Node.mapFromEntries entries, ctx1 )
+        }
+
+
+
+-- OP-SET (user-defined CRDT) -------------------------------------------------
+
+
+{-| A **user-defined operation-based CRDT** (see `docs/14`): a grow-only/removable set of
+**contributions**, each written under its own op-id key, read by folding the present
+contributions into a value. Convergence is free — merge is `Dict.union` of the keys, so
+concurrent contributions from any replicas all survive — and the semantics is entirely
+your `fold`. This is the shape of the built-in counter (op-keyed deltas, summed) opened up.
+
+    -- a grow-only maximum register:
+    maxReg : Crdt (OpSetK Int) Int
+    maxReg =
+        opSet { contribution = int, fold = List.maximum >> Maybe.withDefault 0 }
+
+    -- a multi-value register (keeps all concurrent values):
+    mvReg : Crdt (OpSetK a) (List a)
+    mvReg =
+        opSet { contribution = mySchema, fold = identity }
+
+Edited only through `Crdt.Ref.contribute` (add a contribution) and `retract` (tombstone
+one); it is not `set`-able, since its value is derived, not stored.
+
+**Law:** `fold` must be a pure function of the _set_ of contributions — order-independent
+and idempotent-friendly — or the read won't converge. `List.maximum`, `Set.fromList`,
+`List.sum` are fine; anything depending on contribution order (e.g. "take the first") is
+not. The node is a `Map`; contributions are its present entries.
+
+-}
+opSet : { contribution : Crdt ck c, fold : List c -> a } -> Crdt (OpSetK c) a
+opSet config =
+    let
+        (Crdt contrib) =
+            config.contribution
+    in
+    Crdt
+        { whenAbsent = Nothing
+        , decode =
+            \node ->
+                Node.presentEntries node
+                    |> List.map (\( _, v ) -> contrib.decode v)
+                    |> combine
+                    |> Result.map config.fold
+        , empty = \ctx -> ( Node.mapFromEntries Dict.empty, ctx )
+
+        -- No wholesale seed: the value is derived from contributions, which can't be
+        -- inverted from a folded `a`. A fresh op-set is empty; you build it with
+        -- `contribute`. (Matches how `counter` seeds empty.)
+        , seed = \_ ctx -> ( Node.mapFromEntries Dict.empty, ctx )
         }
 
 
