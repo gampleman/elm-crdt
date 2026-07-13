@@ -58,17 +58,14 @@ test.describe("multi client — convergence over the relay", () => {
     await expectBlocks(b.page, expected);
   });
 
-  // KNOWN LIMITATION (binding, not the CRDT). Two peers pressing Enter at the SAME
-  // position and typing into the new block simultaneously can diverge in the editor,
-  // even though the underlying `splitBlock`/`setBlockText` primitives converge (proven
-  // by the Elm ConvergenceTests + a focused concurrent-end-split test). The gap is in
-  // the TipTap binding: `diffStructural` classifies a native Enter into a `split`
-  // intent relative to `_pendingBlocks`, and that baseline lags while a peer's split is
-  // arriving, so the two clients can emit split intents against different block indices.
-  // Fixing it means reconciling the editor against the CRDT's authoritative structure
-  // on every remote update (or moving split detection off the lagging baseline).
-  // Tracked as future work; the single-client and non-colliding concurrent paths pass.
-  test.fixme("concurrent typing into the same file converges (both texts survive)", async ({ browser }) => {
+  // Two peers pressing Enter at the SAME position and typing into the new block
+  // simultaneously. This once diverged because `diffStructural` diffed against the
+  // lagging `_pendingBlocks` (only updated on Elm re-renders): after a local split with
+  // no re-render, the next keystroke saw a block-count mismatch and fell back to a
+  // non-commuting `reconcile`. Fixed by diffing against a running `_baseline` refreshed
+  // after every transaction, so a split + typing classifies as the commutative
+  // `split` + `text` primitives (which the Elm ConvergenceTests prove converge).
+  test("concurrent typing into the same file converges (both texts survive)", async ({ browser }) => {
     const a = await openClient(browser);
     await createFile(a.page, "typing");
     await type(a.page, "start");

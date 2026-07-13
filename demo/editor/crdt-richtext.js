@@ -90,6 +90,16 @@ class CrdtRichText extends HTMLElement {
     super();
     this.editor = null;
     this._pendingBlocks = null;
+    // The block snapshot we diff the NEXT user transaction against, to derive intents.
+    // It must track the editor's state as of the last thing we told Elm — NOT just the
+    // last blocks Elm pushed down (`_pendingBlocks`). A local structural edit (Enter/
+    // Backspace) changes the editor without any re-render, so if we diffed against
+    // `_pendingBlocks` the baseline would go stale: the next keystroke would then see a
+    // block-count mismatch and fall back to a non-commuting `reconcile` (which broke
+    // concurrent editing). We refresh `_baseline` after every emit and every applied
+    // remote change, so each transaction is diffed against the immediately prior state
+    // and classifies as the precise, commutative op (split/merge/text).
+    this._baseline = null;
     // Where to place the caret after the NEXT block re-render, as a block-relative
     // {blockIndex, charOffset}. Set when we emit a local structural intent (split /
     // merge / indent / setType) whose result Elm pushes back — because that rebuild
@@ -122,6 +132,9 @@ class CrdtRichText extends HTMLElement {
         this._emitTransaction(editor, transaction);
       },
     });
+
+    // seed the diff baseline with the initial content (before any user edit)
+    this._baseline = currentEditorBlocks(this.editor);
 
     // block/format keyboard behavior (Enter split, Backspace merge, Tab indent) is
     // installed via a plain DOM keydown handler so we control the exact intents.
@@ -161,11 +174,21 @@ class CrdtRichText extends HTMLElement {
       // nothing to re-render; drop any pending caret target so it can't leak into a
       // later, unrelated re-render.
       this._desiredCaret = null;
+      // still refresh the diff baseline — the editor now matches these blocks.
+      this._baseline = currentEditorBlocks(this.editor);
       return;
     }
 
     const { state, view } = this.editor;
-    const caret = this._desiredCaret || this._currentBlockCaret();
+    // Only restore/steal the caret when THIS editor is the one being edited — i.e. it
+    // has focus (a local structural edit round-tripping through Elm), or we have an
+    // explicit `_desiredCaret` from such an edit. For a purely REMOTE update on an
+    // unfocused editor we must NOT touch focus or selection: forcing focus + a default
+    // block-0 caret onto a peer stole focus and left ProseMirror's internal selection
+    // at block 0, so the user's next click didn't take and their Enter split the wrong
+    // block (deterministic, even without a race).
+    const active = this._desiredCaret != null || view.hasFocus();
+    const caret = active ? this._desiredCaret || this._currentBlockCaret() : null;
     this._desiredCaret = null;
 
     const tr = state.tr.setMeta(FROM_ELM, true);
@@ -178,7 +201,13 @@ class CrdtRichText extends HTMLElement {
     }
     view.dispatch(tr);
 
-    // keep focus so the caret is actually visible after a structural edit
+    // the editor now reflects `blocks`; that's the baseline the next user edit diffs
+    // against (this FROM_ELM transaction is skipped by onTransaction, so it won't set
+    // the baseline itself).
+    this._baseline = currentEditorBlocks(this.editor);
+
+    // keep focus so the caret is visible after OUR OWN structural edit; never grab
+    // focus for a remote update.
     if (caret && !view.hasFocus()) view.focus();
   }
 
@@ -218,10 +247,11 @@ class CrdtRichText extends HTMLElement {
 
     // Enter (split) and Backspace-at-block-start (merge) are handled NATIVELY by
     // ProseMirror — we do not intercept them. The resulting block-count change is
-    // detected in `_emitTransaction`, which emits a `reconcile` carrying the full new
-    // block structure; Elm transforms the CRDT to match. Letting PM own the DOM edit
-    // (rather than preventDefault + re-render from Elm) avoids a race where a re-render
-    // carrying a pre-edit snapshot wiped text typed immediately after a split.
+    // detected in `_emitTransaction`, which classifies it (via `diffStructural` against
+    // the running baseline) into the CRDT's commutative `split`/`merge` primitive, or a
+    // `reconcile` for complex edits. Letting PM own the DOM edit (rather than
+    // preventDefault + re-render from Elm) avoids a race where a re-render carrying a
+    // pre-edit snapshot wiped text typed immediately after a split.
     //
     // Only indent/outdent are intercepted, since ProseMirror has no native notion of
     // our flat depth attribute.
@@ -274,7 +304,11 @@ class CrdtRichText extends HTMLElement {
 
     if (textChanged) {
       const current = currentEditorBlocks(editor);
-      const prev = this._pendingBlocks || [];
+      // Diff against the running `_baseline` (the editor state as of our last emit),
+      // NOT `_pendingBlocks` — see the constructor note. This keeps a local split
+      // followed by typing classified as `split` + `text` rather than a stale-baseline
+      // `reconcile`.
+      const prev = this._baseline || this._pendingBlocks || [];
 
       if (current.length === prev.length) {
         // same block count: per-block text diff (typing within blocks).
@@ -309,6 +343,9 @@ class CrdtRichText extends HTMLElement {
       }
     }
     for (const intent of markIntents) this._emit(intent);
+
+    // The editor's post-transaction blocks are now the baseline for the NEXT user edit.
+    this._baseline = currentEditorBlocks(editor);
   }
 
   // PM position → document-wide character offset (chars in all blocks before it +
@@ -453,44 +490,46 @@ function blockText(block) {
 
 // Classify a block-count change between two block lists as a single `split` or `merge`
 // when it cleanly is one, else null (→ the caller falls back to a full reconcile).
-// Text is compared per block; a split at block i means prev[i] === cur[i] + cur[i+1]
-// with every other block unchanged (a merge is the inverse). Returns the block-relative
-// position so Elm can call the commutative `splitBlock`/`mergeBlock` primitive.
+// A split at block i means prev[i] === cur[i] + cur[i+1] with the blocks before i and
+// after the pair unchanged; a merge is the inverse. We scan every candidate index
+// rather than "find the first divergence", because an END-of-block split leaves block i
+// itself unchanged (cur[i] === prev[i], cur[i+1] === "") — the divergence heuristic
+// overshot it and mis-fired a reconcile (which doesn't commute, breaking concurrent
+// editing). Returns the block-relative position for the commutative primitive.
 function diffStructural(prev, cur) {
   const pt = prev.map(blockTextOf);
   const ct = cur.map(blockTextOf);
 
   if (ct.length === pt.length + 1) {
-    // find the first index where they diverge; that's the split point
-    let i = 0;
-    while (i < pt.length && pt[i] === ct[i]) i++;
-    // prev[i] must equal cur[i] + cur[i+1], and the tails must line up
-    if (i < pt.length && pt[i] === ct[i] + ct[i + 1] && tailsMatch(pt, ct, i + 1, i + 2)) {
-      return { kind: "split", blockIndex: i, charOffset: ct[i].length };
+    for (let i = 0; i < pt.length; i++) {
+      if (
+        arrEq(pt.slice(0, i), ct.slice(0, i)) &&
+        ct[i] + ct[i + 1] === pt[i] &&
+        arrEq(pt.slice(i + 1), ct.slice(i + 2))
+      ) {
+        return { kind: "split", blockIndex: i, charOffset: ct[i].length };
+      }
     }
   } else if (ct.length === pt.length - 1) {
-    // merge: the inverse — cur[i] === prev[i] + prev[i+1]
-    let i = 0;
-    while (i < ct.length && ct[i] === pt[i]) i++;
-    if (i < ct.length && ct[i] === pt[i] + pt[i + 1] && tailsMatch(ct, pt, i + 1, i + 2)) {
-      // merging block (i+1) into block i
-      return { kind: "merge", blockIndex: i + 1 };
+    for (let i = 0; i < ct.length; i++) {
+      if (
+        arrEq(ct.slice(0, i), pt.slice(0, i)) &&
+        ct[i] === pt[i] + pt[i + 1] &&
+        arrEq(ct.slice(i + 1), pt.slice(i + 2))
+      ) {
+        return { kind: "merge", blockIndex: i + 1 };
+      }
     }
   }
   return null;
 }
 
-function blockTextOf(b) {
-  return typeof b.text === "string" ? b.text : blockText(b);
+function arrEq(a, b) {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
-// Do a[ai..] and b[bi..] contain the same texts to the end (same remaining length)?
-function tailsMatch(a, b, ai, bi) {
-  if (a.length - ai !== b.length - bi) return false;
-  for (let k = 0; ai + k < a.length; k++) {
-    if (a[ai + k] !== b[bi + k]) return false;
-  }
-  return true;
+function blockTextOf(b) {
+  return typeof b.text === "string" ? b.text : blockText(b);
 }
 
 function sameMarkObj(a, b) {
