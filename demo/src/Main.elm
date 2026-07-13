@@ -31,6 +31,7 @@ import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
 import Html.Attributes as A exposing (class, placeholder, value)
 import Html.Events exposing (on, onBlur, onClick, onFocus, onInput, preventDefaultOn)
 import Html.Keyed
+import Html.Lazy
 import Json.Decode as JD
 import Json.Encode as JE
 import Ports
@@ -303,6 +304,14 @@ type alias Model =
     -- delta sync: the version up to which peers already have our ops, so each
     -- broadcast ships only `encodeSince lastSent` instead of the whole log.
     , lastSent : Version
+
+    -- A referentially-STABLE decoded slice of the todos, refreshed only when a
+    -- doc change actually touched `refs.todos` (via the merge/ingest `Diff`). Held
+    -- separately from the live `read` so an `Html.Lazy` view over it keeps the same
+    -- reference — and skips re-rendering — when an unrelated part of the tree changed.
+    -- This is the demonstration of the referential-stability + diff work (docs/12);
+    -- see `viewTodoSummary` (lazy, with a Debug.log render marker).
+    , todosSlice : List Todo
     }
 
 
@@ -392,6 +401,7 @@ init flags =
       , viewing = Nothing
       , connected = False
       , lastSent = OpDoc.version doc
+      , todosSlice = OpDoc.read doc |> Result.map .todos |> Result.withDefault []
       }
     , broadcastPresence presence
     )
@@ -544,11 +554,14 @@ update msg model =
                         -- reorder live as the row is dragged over a new slot, so
                         -- the move converges through the same op path as any edit
                         let
+                            before =
+                                OpDoc.version model.doc
+
                             doc1 =
                                 Ref.move from target refs.todos model.doc
                                     |> orKeep model.doc
                         in
-                        pushDoc { model | doc = doc1, dragging = Just target }
+                        pushDoc (refreshSlices before { model | doc = doc1, dragging = Just target })
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -778,12 +791,26 @@ update msg model =
                 Ok (DocMsg incomingJson) ->
                     -- decodeInto merges the peer's ops into our log (idempotent).
                     -- These ops were broadcast to everyone, so advance `lastSent`
-                    -- to avoid echoing them back on our next delta.
-                    case OpDoc.decodeInto incomingJson model.doc of
-                        Ok doc1 ->
+                    -- to avoid echoing them back on our next delta. `decodeWithDiff`
+                    -- also hands back WHAT the peer changed, so we refresh only the
+                    -- touched slices (keeping the rest referentially stable for lazy).
+                    case OpDoc.decodeWithDiff incomingJson model.doc of
+                        Ok ( doc1, diff ) ->
+                            let
+                                m1 =
+                                    { model | doc = doc1, lastSent = OpDoc.version doc1 }
+
+                                m2 =
+                                    case Ref.touched refs.todos doc1 diff of
+                                        Just _ ->
+                                            { m1 | todosSlice = OpDoc.read doc1 |> Result.map .todos |> Result.withDefault m1.todosSlice }
+
+                                        Nothing ->
+                                            m1
+                            in
                             -- a remote edit may have changed the open file; push the
                             -- new spans to the editor so ProseMirror reconciles.
-                            ( { model | doc = doc1, lastSent = OpDoc.version doc1 }
+                            ( m2
                             , renderEditorIfChanged model.selectedFile model.doc doc1
                             )
 
@@ -894,7 +921,27 @@ todo/note action so each is one Ctrl-Z step.
 -}
 recordPush : Version -> Model -> ( Model, Cmd Msg )
 recordPush before model =
-    pushDoc { model | doc = OpDoc.recordEdit before model.doc }
+    pushDoc (refreshSlices before { model | doc = OpDoc.recordEdit before model.doc })
+
+
+{-| Refresh the referentially-stable decoded slices held in the model, but ONLY the
+ones a change since `before` actually touched (asking the `Diff` with the same typed
+refs used to write). An untouched slice keeps its previous reference, so an
+`Html.Lazy` view over it skips re-rendering. This is the demo-side payoff of the
+merge/ingest diff (docs/12): local edits and remote merges alike flow through here.
+-}
+refreshSlices : Version -> Model -> Model
+refreshSlices before model =
+    let
+        diff =
+            OpDoc.diffSince before model.doc
+    in
+    case Ref.touched refs.todos model.doc diff of
+        Just _ ->
+            { model | todosSlice = OpDoc.read model.doc |> Result.map .todos |> Result.withDefault model.todosSlice }
+
+        Nothing ->
+            model
 
 
 {-| Apply one outline (tree) edit, record it as a single undo step, and broadcast.
@@ -933,7 +980,7 @@ pushDocRerendering : OpDoc Board -> Model -> ( Model, Cmd Msg )
 pushDocRerendering old model =
     let
         ( m1, syncCmd ) =
-            pushDoc model
+            pushDoc (refreshSlices (OpDoc.version old) model)
     in
     ( m1, Cmd.batch [ syncCmd, renderEditorIfChanged model.selectedFile old model.doc ] )
 
@@ -1761,6 +1808,14 @@ viewTodos : Bool -> Model -> Board -> Html Msg
 viewTodos readOnly model board =
     div []
         [ h2 [] [ text "Todos" ]
+
+        -- Referential-stability demo: a summary rendered by `Html.Lazy` from the
+        -- STABLE `model.todosSlice` (refreshed only when a change actually touched the
+        -- todos — see `refreshSlices`). Because an unrelated edit (title, a file, the
+        -- counter, a peer's settings change) leaves `todosSlice` referentially
+        -- unchanged, `lazy` skips this view entirely — visible as the ABSENCE of a
+        -- "render:todo-summary" line in the console. Editing the todos DOES re-run it.
+        , Html.Lazy.lazy viewTodoSummary model.todosSlice
         , ul [ class "todos" ] (List.indexedMap (viewTodo readOnly model) board.todos)
         , if readOnly then
             text ""
@@ -1777,6 +1832,25 @@ viewTodos readOnly model board =
                 , button [ onClick AddTodo ] [ text "add" ]
                 ]
         ]
+
+
+{-| A pure summary of the todos, wrapped in `Html.Lazy` by the caller over the stable
+`model.todosSlice`. The `Debug.log` fires ONLY when this actually re-renders — i.e. only
+when the todos slice changed reference. Watch the console: editing the title / a file /
+the counter, or a peer editing settings, does NOT log here (lazy skips it); editing a
+todo does. That absence is the referential-stability win made visible.
+-}
+viewTodoSummary : List Todo -> Html Msg
+viewTodoSummary todos =
+    let
+        _ =
+            Debug.log "render:todo-summary" (List.length todos)
+
+        doneCount =
+            List.filter .done todos |> List.length
+    in
+    div [ class "todo-summary" ]
+        [ text (String.fromInt doneCount ++ " / " ++ String.fromInt (List.length todos) ++ " done") ]
 
 
 {-| The Settings tab: the board title, its status (a sum type), and a likes counter.

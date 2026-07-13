@@ -1,6 +1,7 @@
 module Crdt.OpDoc exposing
     ( OpDoc, Error(..)
     , init, read, merge
+    , Diff, Origin(..), mergeWithDiff, decodeWithDiff, diffSince, diffOrigins, diffTouches
     , setText, setBool, setInt, setString, increment
     , listAppend, listRemove, listMove
     , setKey, removeKey
@@ -33,6 +34,7 @@ both coexist during the migration (see `docs/02-oplog.md`).
 
 @docs OpDoc, Error
 @docs init, read, merge
+@docs Diff, Origin, mergeWithDiff, decodeWithDiff, diffSince, diffOrigins, diffTouches
 @docs setText, setBool, setInt, setString, increment
 @docs listAppend, listRemove, listMove
 @docs setKey, removeKey
@@ -227,28 +229,317 @@ read ((OpDoc d) as doc) =
 advanced past everything seen so future ids never collide.
 -}
 merge : OpDoc a -> OpDoc a -> OpDoc a
-merge (OpDoc local) (OpDoc incoming) =
+merge local incoming =
+    mergeWithDiff local incoming |> Tuple.first
+
+
+{-| Merge, and return **what changed** as a `Diff` you can query with your typed refs
+(`Crdt.Ref.touched` / `origins`). The document result is identical to `merge`; the diff
+is derived at no extra cost from the ops this merge actually applied (the incoming ops
+not already present), each tagged with its `Origin` (which replica authored it, relative
+to _this_ document's own replica). Use it to re-read only the changed slices — keeping
+untouched slices referentially stable so `Html.Lazy` views over them don't re-render —
+and to drive provenance-aware effects.
+-}
+mergeWithDiff : OpDoc a -> OpDoc a -> ( OpDoc a, Diff )
+mergeWithDiff (OpDoc local) (OpDoc incoming) =
     let
         store =
             OpLog.merge local.store incoming.store
 
+        -- the ops this merge adds, in causal order — both the incremental fold input AND
+        -- the raw material for the diff.
+        added =
+            OpLog.addedOpsInOrder local.store store
+
+        -- INCREMENTAL merge: `local.cached` already reflects `local.store`, so fold only
+        -- the added ops onto that cache — rather than re-materializing the whole tree
+        -- from `base`. Correct because every `Action` is a commutative, idempotent
+        -- function of the op *set* with resolution deferred to read (see
+        -- `OpLog.addedOpsInOrder`), and it PRESERVES REFERENTIAL IDENTITY: containers no
+        -- incoming op touched keep their exact previous reference (structural sharing),
+        -- so `Html.Lazy` views over them don't re-render. The `cacheConsistent` invariant
+        -- (== full re-materialize) is tested to still hold.
         cached =
-            OpLog.materialize local.base store
+            OpLog.applyOps local.cached added
     in
-    -- a merge can interleave ops causally anywhere, so re-materialize from base;
-    -- a peer's concurrent append may now sit after our cached last id, so the
-    -- append fast-path is invalidated. The clock must advance past EVERY stamp,
-    -- including register stamps buried in insert-op seeds (which carry counters
-    -- higher than the insert op's own id) — otherwise a later local edit to a
-    -- peer-created register could mint a losing LWW stamp. `Node.maxCounter`
-    -- walks all of them.
-    OpDoc
+    -- a peer's concurrent append may now sit after our cached last id, so the append
+    -- fast-path is invalidated. The clock must advance past EVERY stamp, including
+    -- register stamps buried in insert-op seeds (which carry counters higher than the
+    -- insert op's own id) — otherwise a later local edit to a peer-created register
+    -- could mint a losing LWW stamp. `Node.maxCounter` walks all of them.
+    ( OpDoc
         { local
             | store = store
             , ctx = Id.observe (Node.maxCounter cached) local.ctx
             , cached = cached
             , lastAppend = Nothing
         }
+    , diffFromOps (Id.ctxReplica local.ctx) added
+    )
+
+
+
+-- DIFF -----------------------------------------------------------------------
+
+
+{-| What a merge/ingest changed: an opaque set of touched locations, each tagged with
+the `Origin` that authored the change. Query it with the typed refs you already hold
+(`Crdt.Ref.touched ref`, `Crdt.Ref.origins`) — it never exposes an untyped path. Built
+from the ops a `mergeWithDiff` / `decodeWithDiff` applied; empty if nothing changed
+(e.g. re-merging a peer you already have).
+-}
+type Diff
+    = Diff (List DiffEntry)
+
+
+{-| One changed location: the identity-addressed container/target an applied op touched,
+plus who authored it. Internal — `Target` never leaves the module.
+-}
+type alias DiffEntry =
+    { target : Target, origin : Origin }
+
+
+{-| Who authored a change: this document's own replica (`Local`), or a specific remote
+replica (`Remote`).
+-}
+type Origin
+    = Local
+    | Remote ReplicaId
+
+
+{-| Build a diff from applied ops: each op's container/target + an `Origin` derived from
+its id's replica relative to `me` (this doc's own replica). Character-level text runs on
+the same container collapse to one entry per (target, origin), so a 100-char paste is one
+changed location, not 100.
+-}
+diffFromOps : ReplicaId -> List Op -> Diff
+diffFromOps me appliedOps =
+    let
+        originOf theOp =
+            let
+                r =
+                    Id.opIdReplica theOp.id
+            in
+            if Id.toString r == Id.toString me then
+                Local
+
+            else
+                Remote r
+
+        entryOf theOp =
+            { target = targetOfAction theOp.action, origin = originOf theOp }
+
+        -- dedupe by (target, origin) so a run of char ops on one container is one entry
+        key entry =
+            targetKey entry.target ++ "|" ++ originKey entry.origin
+
+        deduped =
+            List.foldl
+                (\theOp acc ->
+                    let
+                        e =
+                            entryOf theOp
+                    in
+                    if Dict.member (key e) acc then
+                        acc
+
+                    else
+                        Dict.insert (key e) e acc
+                )
+                Dict.empty
+                appliedOps
+    in
+    Diff (Dict.values deduped)
+
+
+targetKey : Target -> String
+targetKey target =
+    target
+        |> List.map
+            (\step ->
+                case step of
+                    IntoKey k ->
+                        "k:" ++ k
+
+                    IntoElem id ->
+                        "e:" ++ Id.opIdToString id
+            )
+        |> String.join "/"
+
+
+originKey : Origin -> String
+originKey origin =
+    case origin of
+        Local ->
+            "L"
+
+        Remote r ->
+            "R:" ++ Id.toString r
+
+
+{-| The container/target an action addresses — where in the document it changed.
+-}
+targetOfAction : Action -> Target
+targetOfAction action =
+    case action of
+        SetReg target _ ->
+            target
+
+        SetPresence { target } ->
+            target
+
+        InsertElem { container } ->
+            container
+
+        DeleteElem { container } ->
+            container
+
+        MoveElem { container } ->
+            container
+
+        Increment { target } ->
+            target
+
+        TreeMove { container } ->
+            container
+
+        AddMark { container } ->
+            container
+
+
+{-| Every distinct `Origin` that contributed a change — quick "was there any remote edit,
+and whose?" without threading refs. `[]` for an empty diff.
+-}
+diffOrigins : Diff -> List Origin
+diffOrigins (Diff entries) =
+    entries
+        |> List.map .origin
+        |> List.foldl
+            (\o acc ->
+                if List.member o acc then
+                    acc
+
+                else
+                    o :: acc
+            )
+            []
+
+
+{-| Did the spot at `path` — or anything **under** it, or an **ancestor** container of it
+— change in this diff, and if so by whom? `path` is resolved against `doc` to its
+identity-addressed target, then compared to each changed target by prefix (either
+direction: a change under `path`, or to a container `path` lives in, both count). When
+several origins touched it, a `Remote` wins over `Local` (a peer's change is the
+interesting one for "did someone else edit this?"). `Crdt.Ref.touched` is the typed front
+door; `Path` never appears in a public signature.
+-}
+diffTouches : Path -> OpDoc a -> Diff -> Maybe Origin
+diffTouches path doc (Diff entries) =
+    case resolve path doc of
+        Ok ( refTarget, _ ) ->
+            entries
+                |> List.filter (\e -> targetsOverlap refTarget e.target)
+                |> List.map .origin
+                |> pickOrigin
+
+        Err _ ->
+            -- the ref doesn't resolve in the current state (e.g. its container was
+            -- concurrently removed) — treat as "changed by whoever touched a prefix".
+            let
+                refTarget =
+                    targetOfPath path doc
+            in
+            entries
+                |> List.filter (\e -> targetsOverlap refTarget e.target)
+                |> List.map .origin
+                |> pickOrigin
+
+
+{-| Best-effort `Path` → `Target` even when the path no longer fully resolves: resolve
+as far as the current state allows (used only as a fallback in `diffTouches`).
+-}
+targetOfPath : Path -> OpDoc a -> Target
+targetOfPath path doc =
+    case resolve path doc of
+        Ok ( target, _ ) ->
+            target
+
+        Err _ ->
+            []
+
+
+{-| Two targets overlap if one is a prefix of the other (a change at `a`, under `a`, or
+at an ancestor of `a` all count as touching `a`).
+-}
+targetsOverlap : Target -> Target -> Bool
+targetsOverlap a b =
+    isPrefixOf a b || isPrefixOf b a
+
+
+isPrefixOf : Target -> Target -> Bool
+isPrefixOf short long =
+    case ( short, long ) of
+        ( [], _ ) ->
+            True
+
+        ( x :: xs, y :: ys ) ->
+            targetStepEq x y && isPrefixOf xs ys
+
+        ( _ :: _, [] ) ->
+            False
+
+
+targetStepEq : TargetStep -> TargetStep -> Bool
+targetStepEq a b =
+    case ( a, b ) of
+        ( IntoKey x, IntoKey y ) ->
+            x == y
+
+        ( IntoElem x, IntoElem y ) ->
+            Id.opIdToString x == Id.opIdToString y
+
+        _ ->
+            False
+
+
+{-| Prefer a `Remote` origin over `Local` when a spot was touched by both. `Nothing` if
+untouched.
+-}
+pickOrigin : List Origin -> Maybe Origin
+pickOrigin origins =
+    case List.filter isRemote origins of
+        first :: _ ->
+            Just first
+
+        [] ->
+            case origins of
+                first :: _ ->
+                    Just first
+
+                [] ->
+                    Nothing
+
+
+isRemote : Origin -> Bool
+isRemote origin =
+    case origin of
+        Local ->
+            False
+
+        Remote _ ->
+            True
+
+
+{-| The diff of everything that changed **since** `version` — all ops added after that
+frontier, tagged with origin. Works uniformly for local edits and merges (capture the
+version before an edit, then `diffSince` after), so a UI can refresh only the touched
+slices no matter how the change arrived. `mergeWithDiff` / `decodeWithDiff` give the
+same information for the network path without needing a captured version.
+-}
+diffSince : Version -> OpDoc a -> Diff
+diffSince (Version known) (OpDoc d) =
+    diffFromOps (Id.ctxReplica d.ctx) (OpLog.opsAfter known d.store)
 
 
 {-| How many operations the document holds. Useful to reason about transport
@@ -349,7 +640,18 @@ The cache is re-materialized and the clock advanced past everything seen.
 
 -}
 decodeInto : JE.Value -> OpDoc a -> Result String (OpDoc a)
-decodeInto value (OpDoc d) =
+decodeInto value doc =
+    decodeWithDiff value doc |> Result.map Tuple.first
+
+
+{-| Ingest a wire payload (`encode`/`encodeSince` from a peer) and return **what
+changed** as a `Diff`, alongside the updated document — the network counterpart of
+`mergeWithDiff`. This is the demo's real incoming-message path; the diff lets it re-read
+only the changed slices (keeping the rest referentially stable for `Html.Lazy`) and
+attribute the change to the peer that sent it. Same result document as `decodeInto`.
+-}
+decodeWithDiff : JE.Value -> OpDoc a -> Result String ( OpDoc a, Diff )
+decodeWithDiff value (OpDoc d) =
     JD.decodeValue payloadDecoder value
         |> Result.mapError JD.errorToString
         |> Result.map (\payload -> applyPayload payload (OpDoc d))
@@ -380,11 +682,13 @@ payloadDecoder =
             )
 
 
-applyPayload : Payload -> OpDoc a -> OpDoc a
+applyPayload : Payload -> OpDoc a -> ( OpDoc a, Diff )
 applyPayload payload (OpDoc d) =
     case payload of
         OpsPayload incomingOps ->
-            rebuild (List.foldl OpLog.insert d.store incomingOps) d.base d.baseFrontier (OpDoc d)
+            -- base unchanged → INCREMENTAL: fold only the added ops onto the existing
+            -- cache (preserving referential identity), like `merge`.
+            rebuildIncremental (List.foldl OpLog.insert d.store incomingOps) (OpDoc d)
 
         SnapshotPayload snapBase snapFrontier tailOps ->
             if frontierCovers snapFrontier d.baseFrontier && not (frontierCovers d.baseFrontier snapFrontier) then
@@ -397,22 +701,31 @@ applyPayload payload (OpDoc d) =
                     store1 =
                         List.foldl OpLog.insert OpLog.empty (keptOps ++ tailOps)
                 in
+                -- a NEW base is a different fold origin, so re-materialize fully. This is
+                -- the rare catch-up path; correctness over identity here.
                 rebuild store1 snapBase snapFrontier (OpDoc d)
 
             else
                 -- we're at/ahead of the snapshot's base: ignore it, take the tail
-                rebuild (List.foldl OpLog.insert d.store tailOps) d.base d.baseFrontier (OpDoc d)
+                -- incrementally (base unchanged).
+                rebuildIncremental (List.foldl OpLog.insert d.store tailOps) (OpDoc d)
 
 
-{-| Re-materialize from a (possibly new) base + store and advance the clock.
+{-| Re-materialize from a (possibly new) base + store and advance the clock. Used when
+`base` changes (snapshot adoption), where the fold origin differs from the current cache.
+Its diff covers every added op (a snapshot catch-up conservatively reports the whole
+delta as changed).
 -}
-rebuild : OpStore -> Node -> OpLog.Frontier -> OpDoc a -> OpDoc a
+rebuild : OpStore -> Node -> OpLog.Frontier -> OpDoc a -> ( OpDoc a, Diff )
 rebuild store base baseFrontier (OpDoc d) =
     let
         cached =
             OpLog.materialize base store
+
+        added =
+            OpLog.addedOpsInOrder d.store store
     in
-    OpDoc
+    ( OpDoc
         { d
             | store = store
             , base = base
@@ -421,6 +734,33 @@ rebuild store base baseFrontier (OpDoc d) =
             , ctx = Id.observe (Node.maxCounter cached) d.ctx
             , lastAppend = Nothing
         }
+    , diffFromOps (Id.ctxReplica d.ctx) added
+    )
+
+
+{-| Ingest `store` (a superset of the current store on the SAME base) by folding only
+the added ops onto the existing cache — the incremental, identity-preserving counterpart
+of `rebuild`, mirroring `merge`. `base`/`baseFrontier` are unchanged. Returns the diff of
+the added ops.
+-}
+rebuildIncremental : OpStore -> OpDoc a -> ( OpDoc a, Diff )
+rebuildIncremental store (OpDoc d) =
+    let
+        added =
+            OpLog.addedOpsInOrder d.store store
+
+        cached =
+            OpLog.applyOps d.cached added
+    in
+    ( OpDoc
+        { d
+            | store = store
+            , cached = cached
+            , ctx = Id.observe (Node.maxCounter cached) d.ctx
+            , lastAppend = Nothing
+        }
+    , diffFromOps (Id.ctxReplica d.ctx) added
+    )
 
 
 

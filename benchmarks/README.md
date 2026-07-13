@@ -59,6 +59,26 @@ wire bloat is an **algorithmic** bug, not a format one — sequence-insert ops c
 entire causal frontier as `deps` (979 deps/op measured), which belongs in the
 optimization pass, not a codec.
 
+## Merge-timing benchmark (`run-merge.js`)
+
+Measures how long `OpDoc.merge` takes to integrate a small remote delta into a size-`n`
+document — the every-incoming-message path in a live app. `Headless` `mode:"merge"` runs
+`ITERS` identical merges internally and returns a forced checksum; the runner times the
+batch.
+
+```sh
+node run-merge.js    # env: SIZES, WORKLOADS, ITERS
+```
+
+**Finding (see `docs/12`):** this is the before/after gate for **incremental merge**.
+Before, `merge` re-materialized the whole tree from base on every merge, so cost scaled
+with the *document* (superlinear: ~13–19 ms at n=400, ~78–120 ms at n=1000). After
+applying only the added ops (sorted among themselves, not the whole store), cost scales
+with the *delta*: **text n=1000 dropped 77.8 → 2.1 ms (37×), dict 82.5 → 6.1 ms (14×),
+list/tree ~4×.** The residual list/tree cost is their read-time move-set re-fold, not the
+merge. The same change preserves referential identity of untouched subtrees, which is
+what lets the demo's `Html.Lazy` views skip re-rendering.
+
 ## Read-path benchmark (the Phase 2 go/no-go gate)
 
 > **Note:** `run.js` is the original read-path gate and expects `OpDoc.cachedState`/

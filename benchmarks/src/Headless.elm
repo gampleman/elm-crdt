@@ -284,7 +284,7 @@ the JS harness gets a real absolute heap figure for the live document — the do
 itself never crosses the port, so it must be retained on the Elm side.
 -}
 type alias Command =
-    { workload : String, n : Int, retain : Bool, reset : Bool, roundtrip : Bool, mode : String }
+    { workload : String, n : Int, retain : Bool, reset : Bool, roundtrip : Bool, mode : String, iters : Int }
 
 
 type alias Model =
@@ -327,13 +327,81 @@ received doc =
         |> Result.withDefault doc
 
 
+{-| Merge-timing setup for a workload at size `n`: a `local` doc, and a `peer` doc
+that shares `local`'s history plus one extra edit on a DIFFERENT part of the tree — so
+the merge integrates a small remote delta into a large doc. This is the exact shape the
+demo hits on every incoming message, and the case incremental merge should speed up
+(and where referential stability matters — the untouched containers should survive).
+-}
+mergeSetup : String -> Int -> ( OpDoc Board, OpDoc Board )
+mergeSetup workload n =
+    let
+        local =
+            build workload n
+
+        -- a peer at the same history, then one edit to the TITLE (a container the
+        -- workload's bulk did not touch), so most of the tree is unchanged by the merge.
+        peer =
+            OpDoc.decodeInto (OpDoc.encode local) (OpDoc.init (Id.replica "peer") boardDoc.schema)
+                |> Result.withDefault local
+                |> (\d -> Ref.set refs.title "peer edit" d |> ok d)
+    in
+    ( local, peer )
+
+
+{-| Merge `peer` into `local` `iters` times (each from the same immutable inputs, so the
+work is identical and repeatable) and return a checksum that FORCES each merge's
+materialization (`opCount` reads the store; `encodedBytes` walks the merged tree). JS
+times the whole batch. Higher `iters` amortizes port overhead.
+-}
+mergeBench : String -> Int -> Int -> Int
+mergeBench workload n iters =
+    let
+        ( local, peer ) =
+            mergeSetup workload n
+
+        once acc =
+            let
+                merged =
+                    OpDoc.merge local peer
+            in
+            -- Elm is eager, so `merge` fully computes the merged doc's `cached` (it walks
+            -- it via `Node.maxCounter`); `opCount` just reads the store so the result
+            -- can't be elided. NOT `encodedBytes` — a full JSON encode per iteration
+            -- would swamp the merge cost we're trying to measure.
+            acc + OpDoc.opCount merged
+    in
+    List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
+
+
 main : Program () Model Command
 main =
     Platform.worker
         { init = \_ -> ( { retained = [] }, Cmd.none )
         , update =
             \cmd model ->
-                if cmd.mode == "wire" then
+                if cmd.mode == "merge" then
+                    -- merge-timing mode: run `iters` merges of a small remote delta into
+                    -- a size-`n` doc and return a forced checksum. JS times the batch.
+                    let
+                        iters =
+                            max 1 cmd.iters
+
+                        checksum =
+                            mergeBench cmd.workload cmd.n iters
+                    in
+                    ( model
+                    , done
+                        (JE.object
+                            [ ( "workload", JE.string cmd.workload )
+                            , ( "n", JE.int cmd.n )
+                            , ( "iters", JE.int iters )
+                            , ( "checksum", JE.int checksum )
+                            ]
+                        )
+                    )
+
+                else if cmd.mode == "wire" then
                     -- wire-size mode: hand back the JSON strings for JS to gzip. No
                     -- retention; this measures serialized size, not heap.
                     let

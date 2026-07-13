@@ -8,6 +8,7 @@ module Crdt.Ref exposing
     , setKey, removeKey
     , treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
     , cursorAt, cursorOffset
+    , touched, origins
     , RecordRefs, record, field, build
     , CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
     )
@@ -45,6 +46,7 @@ existing op-log runtime — no new merge semantics.
 @docs setKey, removeKey
 @docs treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
 @docs cursorAt, cursorOffset
+@docs touched, origins
 @docs RecordRefs, record, field, build
 @docs CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
 
@@ -293,6 +295,39 @@ markPrim value =
 
         RichText.Value s ->
             Node.PString s
+
+
+{-| Did the spot this `ref` points at — or anything under it, or a container it lives in
+— change in `diff`, and if so by whom? The typed front door to a merge/ingest `Diff`
+(`OpDoc.mergeWithDiff` / `decodeWithDiff`): you ask with the same refs you write through,
+and no untyped path is ever exposed. `doc` is the post-merge document (used to resolve
+the ref to its identity-addressed location).
+
+    ( doc1, diff ) =
+        OpDoc.mergeWithDiff model.doc incoming
+
+    -- only re-read todos if they actually changed (else keep the old reference so a
+    -- `lazy` view over them doesn't re-render)
+    todos =
+        case Ref.touched board.refs.todos doc1 diff of
+            Just _ ->
+                Ref.readList ...
+
+            Nothing ->
+                model.todos
+
+-}
+touched : Ref r kind a -> OpDoc doc -> OpDoc.Diff -> Maybe OpDoc.Origin
+touched (Ref r) doc diff =
+    OpDoc.diffTouches r.path doc diff
+
+
+{-| Every `Origin` that contributed a change to `diff` — a quick "was there any remote
+edit, and whose?" without threading refs.
+-}
+origins : OpDoc.Diff -> List OpDoc.Origin
+origins diff =
+    OpDoc.diffOrigins diff
 
 
 {-| The underlying path of a ref (used internally).

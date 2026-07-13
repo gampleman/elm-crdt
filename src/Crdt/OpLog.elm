@@ -1,7 +1,7 @@
 module Crdt.OpLog exposing
     ( Op, Action(..), Target, TargetStep(..), Frontier
     , OpStore, empty, insert, ops, member, merge
-    , causalOrder, applyOps, materialize, checkout
+    , causalOrder, applyOps, materialize, addedOpsInOrder, checkout
     , frontier, opsAfter, compact, ancestorKeys
     )
 
@@ -25,7 +25,7 @@ materialize + checkout. It is not yet wired into the public `Crdt` module.
 
 @docs Op, Action, Target, TargetStep, Frontier
 @docs OpStore, empty, insert, ops, member, merge
-@docs causalOrder, applyOps, materialize, checkout
+@docs causalOrder, applyOps, materialize, addedOpsInOrder, checkout
 @docs frontier, opsAfter, compact, ancestorKeys
 
 -}
@@ -250,6 +250,41 @@ folding in causal order.
 materialize : Node -> OpStore -> Node
 materialize base store =
     applyOps base (causalOrder store)
+
+
+{-| The ops present in `merged` but **not** in `prior`, in `merged`'s causal order.
+
+This is what lets a merge apply **incrementally**: a document whose cache already
+reflects `prior` can fold just these added ops onto that cache instead of
+re-materializing the whole store from base — the result is identical because every
+`Action` is a commutative, idempotent function of the op _set_ with resolution deferred
+to read (LWW-by-stamp, RGA/Fugue order, accretive counters/marks, tree/move re-fold).
+
+They are causally ordered among **themselves only** — we sort a store of just the added
+ops, not the whole merged store. `causalOrder` treats a dep absent from the store it is
+sorting as already satisfied; the deps we drop this way are exactly the `prior` ops that
+are already folded into the cache, so the order is valid **relative to that cache**.
+Sorting only the added ops keeps a steady-state merge O(k²) in the small delta `k`
+rather than O(n²) in the whole document — the difference between "merge cost scales with
+the delta" and "with the doc".
+
+-}
+addedOpsInOrder : OpStore -> OpStore -> List Op
+addedOpsInOrder prior (OpStore merged) =
+    let
+        added =
+            Dict.foldl
+                (\key op acc ->
+                    if member op.id prior then
+                        acc
+
+                    else
+                        Dict.insert key op acc
+                )
+                Dict.empty
+                merged
+    in
+    causalOrder (OpStore added)
 
 
 {-| Materialize the state as of a `Frontier`: only ops that are causal ancestors
