@@ -1,0 +1,74 @@
+name: Deploy demo to Pages
+
+# Builds the collaborative demo and publishes it to GitHub Pages on every push to main.
+# The demo's WebSocket relay is hosted separately (see render.yaml); its URL is injected
+# at build time from the `RELAY_URL` repository variable (Settings > Secrets and variables
+# > Actions > Variables), e.g. wss://elm-crdt-relay.onrender.com. If unset, the demo falls
+# back to same-host:8080 (so multiplayer just shows disconnected on Pages, single-tab
+# still works fully).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Allow the deploy-pages step to publish; only one Pages deploy at a time.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache ~/.elm
+        uses: actions/cache@v4
+        with:
+          path: ~/.elm
+          key: elm-${{ hashFiles('demo/elm.json') }}
+          restore-keys: elm-
+
+      - name: Install demo deps
+        working-directory: demo
+        run: npm ci
+
+      - name: Build demo (inject relay URL)
+        working-directory: demo
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL }}
+        run: npm run build:pages
+
+      - name: Stage static site
+        working-directory: demo
+        run: |
+          mkdir -p ../_site
+          cp index.html elm.js bundle.js ../_site/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

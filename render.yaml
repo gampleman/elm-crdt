@@ -1,0 +1,20 @@
+# Render Blueprint: deploys the demo's WebSocket relay (demo/server/relay.js) as a free
+# Node web service. The demo's GitHub Pages build points its WebSocket at this service's
+# URL (set RELAY_URL in the Pages workflow to wss://<this-service>.onrender.com).
+#
+# One-time setup: on https://render.com, "New > Blueprint", point it at this repo. Render
+# reads this file, provisions the service, and redeploys on every push to `main`.
+#
+# Caveat: the free tier spins the service down after ~15 min of inactivity, so the first
+# connection after idle cold-starts (~30s). The demo auto-reconnects and CRDT merge makes
+# catch-up safe, so it self-heals — fine for a demo, not for production.
+services:
+  - type: web
+    name: elm-crdt-relay
+    runtime: node
+    plan: free
+    rootDir: demo/server
+    buildCommand: npm install
+    startCommand: node relay.js
+    # relay.js binds process.env.PORT (Render injects it) and serves a WebSocket.
+    healthCheckPath: /

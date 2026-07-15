@@ -6,15 +6,25 @@
 // registers the <crdt-richtext> custom element (TipTap/ProseMirror editor)
 import "./editor/crdt-richtext.js";
 
-// Relay port defaults to 8080 but can be overridden with `?relayPort=NNNN` — used by
-// the e2e tests to run an isolated relay that stray tabs on the default port can't
-// reach (so a leftover tab's document never leaks into a test replica).
-const RELAY_PORT = new URLSearchParams(location.search).get("relayPort") || "8080";
-const RELAY_URL =
+// Where the WebSocket relay lives. Resolution order:
+//   1. `?relayPort=NNNN` in the URL — always wins (the e2e tests spin up an isolated
+//      relay on a random port so a stray tab on the default port can't leak into a test).
+//   2. A relay URL baked in at build time via esbuild
+//      `--define:RELAY_URL_BUILD='"wss://…"'` — this is how the GitHub Pages build points
+//      at the hosted (Render) relay, since Pages is static and can't run the relay itself.
+//   3. Same host, port 8080 (local dev: `npm start` runs the relay there).
+// `RELAY_URL_BUILD` defaults to "" so the reference resolves when esbuild doesn't define it.
+const buildRelayUrl = typeof RELAY_URL_BUILD === "string" ? RELAY_URL_BUILD : "";
+
+const relayPortOverride = new URLSearchParams(location.search).get("relayPort");
+const sameHostRelay = (port) =>
   (location.protocol === "https:" ? "wss://" : "ws://") +
   (location.hostname || "localhost") +
   ":" +
-  RELAY_PORT;
+  port;
+const relayUrl = relayPortOverride
+  ? sameHostRelay(relayPortOverride)
+  : buildRelayUrl || sameHostRelay("8080");
 
 const COLORS = ["#e84393", "#0984e3", "#00b894", "#fdcb6e", "#6c5ce7", "#e17055"];
 const ANIMALS = ["otter", "lynx", "heron", "marten", "shrike", "vole"];
@@ -72,7 +82,7 @@ let socket = null;
 let reconnectTimer = null;
 
 function connect() {
-  socket = new WebSocket(RELAY_URL);
+  socket = new WebSocket(relayUrl);
 
   socket.addEventListener("open", () => {
     app.ports.connection.send(true);

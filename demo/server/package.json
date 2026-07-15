@@ -1,0 +1,13 @@
+{
+  "name": "elm-crdt-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny WebSocket broadcast relay for the elm-crdt demo.",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

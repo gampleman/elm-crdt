@@ -11,6 +11,9 @@
     "build": "run-s build:elm build:js",
     "build:elm": "elm make src/Main.elm --output=elm.js",
     "build:js": "esbuild index.js --bundle --outfile=bundle.js --format=iife",
+    "build:pages": "run-s build:pages:elm build:pages:js",
+    "build:pages:elm": "elm make src/Main.elm --output=elm.js",
+    "build:pages:js": "esbuild index.js --bundle --outfile=bundle.js --format=iife --minify --define:RELAY_URL_BUILD=\"\\\"$RELAY_URL\\\"\"",
     "test:e2e": "playwright test"
   },
   "devDependencies": {
