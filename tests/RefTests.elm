@@ -5,15 +5,14 @@ the _compile-time_ guarantees (e.g. `increment` only on a counter ref) are asser
 by the fact that this module compiles at all, plus the notes in `docs/07-optics.md`.
 
 Covered: field refs from the builder, `set`/`over`/`increment`, composition with
-`at` into a nested record, `switch` on a sum type, and `variantPayload` editing a
-variant's payload (applies iff active, silent no-op otherwise).
+`at` into a nested record, `switch` on a sum type, and editing a variant's payload
+through a builder-provided ref (applies iff active, silent no-op otherwise).
 
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
-import Crdt.Ref as Ref exposing (Ref)
-import Crdt.Schema as S
 import Expect
 import Test exposing (Test, describe, test)
 
@@ -54,14 +53,14 @@ type alias Board =
 refs back (`status.refs.snoozed`, `status.refs.done`).
 -}
 type alias StatusRefs =
-    { snoozed : Ref Status S.Settable Int
-    , done : Ref Status S.Settable String
+    { snoozed : Ref Status C.Settable Int
+    , done : Ref Status C.Settable String
     }
 
 
-status : Ref.CustomRefs Status StatusRefs
+status : C.CustomRefs Status StatusRefs
 status =
-    Ref.custom
+    C.custom
         (\active snoozed done v ->
             case v of
                 Active ->
@@ -74,60 +73,60 @@ status =
                     done s
         )
         StatusRefs
-        |> Ref.variant0 "active" Active
-        |> Ref.variant1 "snoozed" Snoozed S.int
-        |> Ref.variant1 "done" Done S.text
-        |> Ref.buildCustom
+        |> C.variant0 "active" Active
+        |> C.variant1 "snoozed" Snoozed C.int
+        |> C.variant1 "done" Done C.text
+        |> C.buildCustom
 
 
 type alias SettingsRefs =
-    { theme : Ref Settings S.Settable String
-    , size : Ref Settings S.Settable Int
+    { theme : Ref Settings C.Settable String
+    , size : Ref Settings C.Settable Int
     }
 
 
-settings : Ref.RecordRefs Settings SettingsRefs
+settings : C.RecordRefs Settings SettingsRefs
 settings =
-    Ref.record Settings SettingsRefs
-        |> Ref.field "theme" .theme S.text
-        |> Ref.field "size" .size S.int
-        |> Ref.build
+    C.record Settings SettingsRefs
+        |> C.field "theme" .theme C.text
+        |> C.field "size" .size C.int
+        |> C.build
 
 
 type alias TodoRefs =
-    { text : Ref Todo S.Settable String
-    , done : Ref Todo S.Settable Bool
+    { text : Ref Todo C.Settable String
+    , done : Ref Todo C.Settable Bool
     }
 
 
-todo : Ref.RecordRefs Todo TodoRefs
+todo : C.RecordRefs Todo TodoRefs
 todo =
-    Ref.record Todo TodoRefs
-        |> Ref.field "text" .text S.text
-        |> Ref.field "done" .done S.bool
-        |> Ref.build
+    C.record Todo TodoRefs
+        |> C.field "text" .text C.text
+        |> C.field "done" .done C.bool
+        |> C.build
 
 
 type alias BoardRefs =
-    { title : Ref Board S.Settable String
-    , votes : Ref Board S.Counter Int
-    , status : Ref Board (S.Variants Status) Status
-    , settings : Ref Board S.Nested Settings
-    , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
-    , tags : Ref Board (S.ListK S.Fixed S.Settable String) (List String)
+    { title : Ref Board C.Settable String
+    , votes : Ref Board C.Counter Int
+    , status : Ref Board (C.Variants Status) Status
+    , settings : Ref Board C.Nested Settings
+    , todos : Ref Board (C.ListK C.Movable C.Nested Todo) (List Todo)
+    , tags : Ref Board (C.ListK C.Fixed C.Settable String) (List String)
     }
 
 
-board : Ref.RecordRefs Board BoardRefs
+board : C.RecordRefs Board BoardRefs
 board =
-    Ref.record Board BoardRefs
-        |> Ref.field "title" .title S.text
-        |> Ref.field "votes" .votes S.counter
-        |> Ref.field "status" .status status.schema
-        |> Ref.field "settings" .settings settings.schema
-        |> Ref.field "todos" .todos (S.movableList todo.schema)
-        |> Ref.field "tags" .tags (S.list S.text)
-        |> Ref.build
+    C.record Board BoardRefs
+        |> C.field "title" .title C.text
+        |> C.field "votes" .votes C.counter
+        |> C.field "status" .status status.schema
+        |> C.field "settings" .settings settings.schema
+        |> C.field "todos" .todos (C.movableList todo.schema)
+        |> C.field "tags" .tags (C.list C.text)
+        |> C.build
 
 
 r : BoardRefs
@@ -135,26 +134,26 @@ r =
     board.refs
 
 
-doc0 : OpDoc Board
+doc0 : Doc Board
 doc0 =
-    OpDoc.init (Id.replica "alice") board.schema
+    C.init (Id.replica "alice") board.schema
 
 
-ok : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
+ok : Doc Board -> Result C.EditError (Doc Board) -> Doc Board
 ok fallback =
     Result.withDefault fallback
 
 
-read : OpDoc Board -> Result S.Error Board
+read : Doc Board -> Result C.ReadError Board
 read =
-    OpDoc.read
+    C.read
 
 
 {-| Append a todo to `r.todos` (arg order: schema, value, listRef, doc).
 -}
-addTodo : String -> OpDoc Board -> OpDoc Board
+addTodo : String -> Doc Board -> Doc Board
 addTodo t doc =
-    Ref.append todo.schema (Todo t False) r.todos doc |> ok doc
+    C.append todo.schema (Todo t False) r.todos doc |> ok doc
 
 
 
@@ -167,23 +166,23 @@ suite =
         [ describe "leaf refs"
             [ test "set a text field" <|
                 \_ ->
-                    Ref.set r.title "Trip" doc0
+                    C.set r.title "Trip" doc0
                         |> ok doc0
                         |> read
                         |> Result.map .title
                         |> Expect.equal (Ok "Trip")
             , test "over transforms the current value" <|
                 \_ ->
-                    (Ref.set r.title "trip" doc0 |> ok doc0)
-                        |> Ref.over r.title String.toUpper
+                    (C.set r.title "trip" doc0 |> ok doc0)
+                        |> C.over r.title String.toUpper
                         |> ok doc0
                         |> read
                         |> Result.map .title
                         |> Expect.equal (Ok "TRIP")
             , test "increment a counter ref" <|
                 \_ ->
-                    (Ref.increment r.votes 3 doc0 |> ok doc0)
-                        |> Ref.increment r.votes 4
+                    (C.increment r.votes 3 doc0 |> ok doc0)
+                        |> C.increment r.votes 4
                         |> ok doc0
                         |> read
                         |> Result.map .votes
@@ -192,14 +191,14 @@ suite =
         , describe "composition with at (nested record)"
             [ test "set a field of a nested record" <|
                 \_ ->
-                    Ref.set (r.settings |> Ref.at settings.refs.theme) "dark" doc0
+                    C.set (r.settings |> C.at settings.refs.theme) "dark" doc0
                         |> ok doc0
                         |> read
                         |> Result.map (.settings >> .theme)
                         |> Expect.equal (Ok "dark")
             , test "increment is available through composition too (size is Settable, theme text)" <|
                 \_ ->
-                    Ref.set (r.settings |> Ref.at settings.refs.size) 12 doc0
+                    C.set (r.settings |> C.at settings.refs.size) 12 doc0
                         |> ok doc0
                         |> read
                         |> Result.map (.settings >> .size)
@@ -211,7 +210,7 @@ suite =
                     read doc0 |> Result.map .status |> Expect.equal (Ok Active)
             , test "switch changes the active variant" <|
                 \_ ->
-                    Ref.switch r.status (Done "shipped") doc0
+                    C.switch r.status (Done "shipped") doc0
                         |> ok doc0
                         |> read
                         |> Result.map .status
@@ -220,31 +219,31 @@ suite =
                 \_ ->
                     let
                         d1 =
-                            Ref.switch r.status (Done "draft") doc0 |> ok doc0
+                            C.switch r.status (Done "draft") doc0 |> ok doc0
 
                         d2 =
-                            Ref.set (r.status |> Ref.at status.refs.done) "final" d1 |> ok d1
+                            C.set (r.status |> C.at status.refs.done) "final" d1 |> ok d1
                     in
                     read d2 |> Result.map .status |> Expect.equal (Ok (Done "final"))
             , test "editing a variant payload when a DIFFERENT variant is active is a no-op" <|
                 \_ ->
                     let
                         d1 =
-                            Ref.switch r.status (Snoozed 5) doc0 |> ok doc0
+                            C.switch r.status (Snoozed 5) doc0 |> ok doc0
 
                         -- status is Snoozed, not Done; editing the Done note does nothing
                         d2 =
-                            Ref.set (r.status |> Ref.at status.refs.done) "ignored" d1 |> ok d1
+                            C.set (r.status |> C.at status.refs.done) "ignored" d1 |> ok d1
                     in
                     read d2 |> Result.map .status |> Expect.equal (Ok (Snoozed 5))
             , test "over the snoozed payload via the builder's ref" <|
                 \_ ->
                     let
                         d1 =
-                            Ref.switch r.status (Snoozed 10) doc0 |> ok doc0
+                            C.switch r.status (Snoozed 10) doc0 |> ok doc0
 
                         d2 =
-                            Ref.over (r.status |> Ref.at status.refs.snoozed) (\n -> n + 5) d1 |> ok d1
+                            C.over (r.status |> C.at status.refs.snoozed) (\n -> n + 5) d1 |> ok d1
                     in
                     read d2 |> Result.map .status |> Expect.equal (Ok (Snoozed 15))
             ]
@@ -262,7 +261,7 @@ suite =
                             doc0 |> addTodo "a"
 
                         d2 =
-                            Ref.set (r.todos |> Ref.index 0 todo.schema |> Ref.at todo.refs.done) True d1 |> ok d1
+                            C.set (r.todos |> C.index 0 todo.schema |> C.at todo.refs.done) True d1 |> ok d1
                     in
                     read d2 |> Result.map (.todos >> List.map .done) |> Expect.equal (Ok [ True ])
             , test "move reorders a movable list" <|
@@ -272,7 +271,7 @@ suite =
                             doc0 |> addTodo "a" |> addTodo "b" |> addTodo "c"
 
                         d2 =
-                            Ref.move 0 2 r.todos d1 |> ok d1
+                            C.move 0 2 r.todos d1 |> ok d1
                     in
                     read d2 |> Result.map (.todos >> List.map .text) |> Expect.equal (Ok [ "b", "c", "a" ])
             , test "remove drops an element" <|
@@ -282,19 +281,19 @@ suite =
                             doc0 |> addTodo "a" |> addTodo "b"
 
                         d2 =
-                            Ref.remove 0 r.todos d1 |> ok d1
+                            C.remove 0 r.todos d1 |> ok d1
                     in
                     read d2 |> Result.map (.todos >> List.map .text) |> Expect.equal (Ok [ "b" ])
             , test "set a leaf list element directly (tags is List String)" <|
                 \_ ->
                     let
                         d1 =
-                            (Ref.append S.text "urgent" r.tags doc0 |> ok doc0)
-                                |> Ref.append S.text "later" r.tags
+                            (C.append C.text "urgent" r.tags doc0 |> ok doc0)
+                                |> C.append C.text "later" r.tags
                                 |> ok doc0
 
                         d2 =
-                            Ref.set (r.tags |> Ref.index 1 S.text) "soon" d1 |> ok d1
+                            C.set (r.tags |> C.index 1 C.text) "soon" d1 |> ok d1
                     in
                     read d2 |> Result.map .tags |> Expect.equal (Ok [ "urgent", "soon" ])
             ]

@@ -14,7 +14,7 @@ The properties that matter:
 
 -}
 
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.MoveList as ML exposing (MoveList)
 import Expect
 import Test exposing (Test, describe, test)

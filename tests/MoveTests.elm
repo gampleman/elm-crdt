@@ -1,20 +1,20 @@
 module MoveTests exposing (suite)
 
 {-| Movable lists through the **public** API (`Schema.movableList` +
-`OpDoc.listMove`). The correctness core is proven in `MoveListTests`; here we
+`Doc.listMove`). The correctness core is proven in `MoveListTests`; here we
 check it works end-to-end through a schema and the op-log: reorder, identity
 preservation, convergence, JSON, and that a plain `list` rejects moves.
 -}
 
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
 import Crdt.Schema.Internal as S exposing (Crdt)
 import Expect
 import Test exposing (Test, describe, test)
 
 
-type alias Doc =
+type alias Sample =
     { todos : List Todo }
 
 
@@ -22,9 +22,9 @@ type alias Todo =
     { text : String }
 
 
-schema : Crdt S.Nested Doc
+schema : Crdt S.Nested Sample
 schema =
-    S.record Doc
+    S.record Sample
         |> S.field "todos" .todos (S.movableList todoSchema)
         |> S.build
 
@@ -39,27 +39,27 @@ todosPath =
     Path.root |> Path.field "todos"
 
 
-initDoc : String -> OpDoc Doc
+initDoc : String -> Doc Sample
 initDoc name =
-    OpDoc.init (Id.replica name) schema
+    Doc.init (Id.replica name) schema
 
 
-ok : OpDoc Doc -> Result OpDoc.Error (OpDoc Doc) -> OpDoc Doc
+ok : Doc Sample -> Result Doc.Error (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
-add : String -> OpDoc Doc -> OpDoc Doc
+add : String -> Doc Sample -> Doc Sample
 add label doc =
-    OpDoc.listAppend todosPath (todoSchema |> S.with (Todo label)) doc |> ok doc
+    Doc.listAppend todosPath (todoSchema |> S.with (Todo label)) doc |> ok doc
 
 
-texts : OpDoc Doc -> Result S.Error (List String)
+texts : Doc Sample -> Result S.Error (List String)
 texts doc =
-    OpDoc.read doc |> Result.map (.todos >> List.map .text)
+    Doc.read doc |> Result.map (.todos >> List.map .text)
 
 
-abc : OpDoc Doc
+abc : Doc Sample
 abc =
     initDoc "alice" |> add "a" |> add "b" |> add "c"
 
@@ -74,14 +74,14 @@ suite =
             \_ ->
                 let
                     moved =
-                        OpDoc.listMove todosPath 0 2 abc |> ok abc
+                        Doc.listMove todosPath 0 2 abc |> ok abc
                 in
                 texts moved |> Expect.equal (Ok [ "b", "c", "a" ])
         , test "move to the head" <|
             \_ ->
                 let
                     moved =
-                        OpDoc.listMove todosPath 2 0 abc |> ok abc
+                        Doc.listMove todosPath 2 0 abc |> ok abc
                 in
                 texts moved |> Expect.equal (Ok [ "c", "a", "b" ])
         , test "a moved item keeps its identity: edit its text, then move it" <|
@@ -92,8 +92,8 @@ suite =
 
                     doc =
                         abc
-                            |> (\d -> OpDoc.setText textPath0 "AAA" d |> ok d)
-                            |> (\d -> OpDoc.listMove todosPath 0 2 d |> ok d)
+                            |> (\d -> Doc.setText textPath0 "AAA" d |> ok d)
+                            |> (\d -> Doc.listMove todosPath 0 2 d |> ok d)
                 in
                 -- "a" (now "AAA") moved to the end, text preserved
                 texts doc |> Expect.equal (Ok [ "b", "c", "AAA" ])
@@ -101,7 +101,7 @@ suite =
             \_ ->
                 let
                     moved =
-                        OpDoc.listMove todosPath 1 0 abc |> ok abc
+                        Doc.listMove todosPath 1 0 abc |> ok abc
                 in
                 texts moved |> Result.map List.length |> Expect.equal (Ok 3)
         , test "concurrent moves of the same item converge (both merge orders equal)" <|
@@ -109,20 +109,20 @@ suite =
                 let
                     bob =
                         initDoc "bob"
-                            |> OpDoc.decodeInto (OpDoc.encode abc)
+                            |> Doc.decodeInto (Doc.encode abc)
                             |> Result.withDefault (initDoc "bob")
 
                     aliceMove =
-                        OpDoc.listMove todosPath 0 2 abc |> ok abc
+                        Doc.listMove todosPath 0 2 abc |> ok abc
 
                     bobMove =
-                        OpDoc.listMove todosPath 0 1 bob |> ok bob
+                        Doc.listMove todosPath 0 1 bob |> ok bob
 
                     ab =
-                        aliceMove |> OpDoc.decodeInto (OpDoc.encode bobMove) |> Result.withDefault aliceMove
+                        aliceMove |> Doc.decodeInto (Doc.encode bobMove) |> Result.withDefault aliceMove
 
                     ba =
-                        bobMove |> OpDoc.decodeInto (OpDoc.encode aliceMove) |> Result.withDefault bobMove
+                        bobMove |> Doc.decodeInto (Doc.encode aliceMove) |> Result.withDefault bobMove
                 in
                 Expect.equal (texts ab) (texts ba)
         , test "concurrent move + insert converge" <|
@@ -130,31 +130,31 @@ suite =
                 let
                     bob =
                         initDoc "bob"
-                            |> OpDoc.decodeInto (OpDoc.encode abc)
+                            |> Doc.decodeInto (Doc.encode abc)
                             |> Result.withDefault (initDoc "bob")
 
                     aliceMove =
-                        OpDoc.listMove todosPath 2 0 abc |> ok abc
+                        Doc.listMove todosPath 2 0 abc |> ok abc
 
                     bobAdd =
                         add "d" bob
 
                     ab =
-                        aliceMove |> OpDoc.decodeInto (OpDoc.encode bobAdd) |> Result.withDefault aliceMove
+                        aliceMove |> Doc.decodeInto (Doc.encode bobAdd) |> Result.withDefault aliceMove
 
                     ba =
-                        bobAdd |> OpDoc.decodeInto (OpDoc.encode aliceMove) |> Result.withDefault bobAdd
+                        bobAdd |> Doc.decodeInto (Doc.encode aliceMove) |> Result.withDefault bobAdd
                 in
                 Expect.equal (texts ab) (texts ba)
         , test "moves survive the JSON wire round-trip" <|
             \_ ->
                 let
                     moved =
-                        OpDoc.listMove todosPath 0 2 abc |> ok abc
+                        Doc.listMove todosPath 0 2 abc |> ok abc
 
                     bob =
                         initDoc "bob"
-                            |> OpDoc.decodeInto (OpDoc.encode moved)
+                            |> Doc.decodeInto (Doc.encode moved)
                             |> Result.withDefault (initDoc "bob")
                 in
                 Expect.equal (texts moved) (texts bob)
@@ -162,9 +162,9 @@ suite =
             \_ ->
                 let
                     moved =
-                        OpDoc.listMove todosPath 0 2 abc |> ok abc
+                        Doc.listMove todosPath 0 2 abc |> ok abc
                 in
-                OpDoc.read moved
+                Doc.read moved
                     |> Result.map .todos
                     |> Expect.equal (Ok [ Todo "b", Todo "c", Todo "a" ])
         ]

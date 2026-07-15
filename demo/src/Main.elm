@@ -6,9 +6,9 @@ module Main exposing (main)
 counter). The active tab is local view state but is broadcast on the presence
 channel, so peers can see where everyone is.
 
-Runs on the **op-log** core (`Crdt.OpDoc`): the document is an operation log,
+Runs on the **op-log** core (`Crdt.Doc`): the document is an operation log,
 edits emit ops, sync ships ops over a WebSocket, and history is collaborative
-time-travel over the op DAG (`OpDoc.version` / `OpDoc.readAt`).
+time-travel over the op DAG (`Doc.version` / `C.readAt`).
 
 It exercises the full JSON-like schema (record + movable list + dict + text + rich
 text + tree + sum type + counter + LWW), real WebSocket networking, live
@@ -18,13 +18,12 @@ checkpoints + time-travel preview).
 -}
 
 import Browser
+import Crdt as C exposing (Ref)
 import Crdt.Cursor as Cursor exposing (Cursor)
+import Crdt.Doc as Doc exposing (Checkpoint, Doc, Version)
 import Crdt.Id exposing (OpId, ReplicaId)
-import Crdt.OpDoc as OpDoc exposing (Checkpoint, OpDoc, Version)
 import Crdt.Presence as Presence exposing (Presence)
-import Crdt.Ref as Ref exposing (Ref)
 import Crdt.RichText as RichText exposing (Block, Span)
-import Crdt.Schema as S exposing (Crdt)
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
 import Html exposing (Html, button, div, h1, h2, input, li, span, text, ul)
@@ -54,7 +53,7 @@ type alias Board =
     }
 
 
-{-| A node in the collaborative **outline** — a movable tree (`S.tree`). Each node
+{-| A node in the collaborative **outline** — a movable tree (`C.tree`). Each node
 carries editable text; nodes can be nested under one another and re-parented, and
 concurrent re-parents that would form a cycle converge safely.
 -}
@@ -62,7 +61,7 @@ type alias Node =
     { text : String }
 
 
-{-| A board-level lifecycle status — a **sum type**, showcasing `S.custom`. The
+{-| A board-level lifecycle status — a **sum type**, showcasing `C.custom`. The
 `Archived` variant carries a reason (collaborative text), so concurrent edits to
 the reason merge character-wise while the active variant itself is LWW.
 -}
@@ -79,33 +78,33 @@ type alias Todo =
 
 
 {-| The schema and its **typed refs**, built together with the ref-emitting
-builders. `boardDoc.schema` is the `Crdt` for `OpDoc.init`; `boardDoc.refs` holds a
+builders. `boardDoc.schema` is the `Crdt` for `C.init`; `boardDoc.refs` holds a
 compile-checked `Ref` per field — every edit in `update` goes through these instead
 of a stringly-typed `Path`.
 -}
 type alias BoardRefs =
-    { title : Ref Board S.Settable String
-    , status : Ref Board (S.Variants Status) Status
-    , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
-    , files : Ref Board (S.DictK S.RichK (List Span)) (Dict String (List Span))
-    , outline : Ref Board (S.TreeK S.Nested Node) (Tree.Forest Node)
-    , likes : Ref Board S.Counter Int
+    { title : Ref Board C.Settable String
+    , status : Ref Board (C.Variants Status) Status
+    , todos : Ref Board (C.ListK C.Movable C.Nested Todo) (List Todo)
+    , files : Ref Board (C.DictK C.RichK (List Span)) (Dict String (List Span))
+    , outline : Ref Board (C.TreeK C.Nested Node) (Tree.Forest Node)
+    , likes : Ref Board C.Counter Int
     }
 
 
-boardDoc : Ref.RecordRefs Board BoardRefs
+boardDoc : C.RecordRefs Board BoardRefs
 boardDoc =
-    Ref.record Board BoardRefs
-        |> Ref.field "title" .title S.text
-        |> Ref.field "status" .status statusDoc.schema
-        |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
-        |> Ref.field "files" .files (S.dict S.richText)
-        |> Ref.field "outline" .outline (S.tree nodeDoc.schema)
-        |> Ref.field "likes" .likes S.counter
-        |> Ref.build
+    C.record Board BoardRefs
+        |> C.field "title" .title C.text
+        |> C.field "status" .status statusDoc.schema
+        |> C.field "todos" .todos (C.movableList todoDoc.schema)
+        |> C.field "files" .files (C.dict C.richText)
+        |> C.field "outline" .outline (C.tree nodeDoc.schema)
+        |> C.field "likes" .likes C.counter
+        |> C.build
 
 
-schema : Crdt S.Nested Board
+schema : C.Schema C.Nested Board
 schema =
     boardDoc.schema
 
@@ -116,12 +115,12 @@ refs =
 
 
 type alias StatusRefs =
-    { archived : Ref Status S.Settable String }
+    { archived : Ref Status C.Settable String }
 
 
-statusDoc : Ref.CustomRefs Status StatusRefs
+statusDoc : C.CustomRefs Status StatusRefs
 statusDoc =
-    Ref.custom
+    C.custom
         (\planning active archived value ->
             case value of
                 Planning ->
@@ -134,59 +133,59 @@ statusDoc =
                     archived reason
         )
         StatusRefs
-        |> Ref.variant0 "planning" Planning
-        |> Ref.variant0 "active" Active
-        |> Ref.variant1 "archived" Archived S.text
-        |> Ref.buildCustom
+        |> C.variant0 "planning" Planning
+        |> C.variant0 "active" Active
+        |> C.variant1 "archived" Archived C.text
+        |> C.buildCustom
 
 
 {-| The reason text inside the `Archived` variant. Editing it applies only while the
 board is actually `Archived` (silent no-op otherwise).
 -}
-archivedReasonRef : Ref Board S.Settable String
+archivedReasonRef : Ref Board C.Settable String
 archivedReasonRef =
-    refs.status |> Ref.at statusDoc.refs.archived
+    refs.status |> C.at statusDoc.refs.archived
 
 
 type alias TodoRefs =
-    { text : Ref Todo S.Settable String
-    , done : Ref Todo S.Settable Bool
+    { text : Ref Todo C.Settable String
+    , done : Ref Todo C.Settable Bool
     }
 
 
-todoDoc : Ref.RecordRefs Todo TodoRefs
+todoDoc : C.RecordRefs Todo TodoRefs
 todoDoc =
-    Ref.record Todo TodoRefs
-        |> Ref.field "text" .text S.text
-        |> Ref.field "done" .done S.bool
-        |> Ref.build
+    C.record Todo TodoRefs
+        |> C.field "text" .text C.text
+        |> C.field "done" .done C.bool
+        |> C.build
 
 
 {-| A text ref into todo `i`'s `text` field — `todos[i].text`, composed from the
 list ref, an element ref, and the field ref. Drives that todo's text input + caret.
 -}
-todoTextRef : Int -> Ref Board S.Settable String
+todoTextRef : Int -> Ref Board C.Settable String
 todoTextRef i =
-    refs.todos |> Ref.index i todoDoc.schema |> Ref.at todoDoc.refs.text
+    refs.todos |> C.index i todoDoc.schema |> C.at todoDoc.refs.text
 
 
 type alias NodeRefs =
-    { text : Ref Node S.Settable String }
+    { text : Ref Node C.Settable String }
 
 
-nodeDoc : Ref.RecordRefs Node NodeRefs
+nodeDoc : C.RecordRefs Node NodeRefs
 nodeDoc =
-    Ref.record Node NodeRefs
-        |> Ref.field "text" .text S.text
-        |> Ref.build
+    C.record Node NodeRefs
+        |> C.field "text" .text C.text
+        |> C.build
 
 
 {-| A text ref into outline node `id`'s `text` field, composed from the tree ref, a
 node ref (by stable id), and the field ref. Drives that node's text input + caret.
 -}
-outlineTextRef : OpId -> Ref Board S.Settable String
+outlineTextRef : OpId -> Ref Board C.Settable String
 outlineTextRef id =
-    refs.outline |> Ref.treeNode id nodeDoc.schema |> Ref.at nodeDoc.refs.text
+    refs.outline |> C.treeNode id nodeDoc.schema |> C.at nodeDoc.refs.text
 
 
 {-| Per-peer ephemeral state. Never merged into the document — it lives on the
@@ -210,7 +209,7 @@ peerCodec =
         |> Presence.field "color" .color Presence.string
         |> Presence.field "tab" .tab Presence.string
         |> Presence.optional "editing" .editing Presence.string
-        |> Presence.optional "caret" .caret (Presence.custom Cursor.encode Cursor.decoder)
+        |> Presence.optional "caret" .caret Presence.cursor
         |> Presence.buildCodec
 
 
@@ -220,17 +219,17 @@ peerCodec =
 -- wrong field name or wrong-kind op is a compile error, not a runtime one.
 
 
-todoDoneRef : Int -> Ref Board S.Settable Bool
+todoDoneRef : Int -> Ref Board C.Settable Bool
 todoDoneRef i =
-    refs.todos |> Ref.index i todoDoc.schema |> Ref.at todoDoc.refs.done
+    refs.todos |> C.index i todoDoc.schema |> C.at todoDoc.refs.done
 
 
 {-| A rich-text ref into file `k`'s contents (a dict of rich text). Drives the
 TipTap editor and mark commands for the open file.
 -}
-fileRef : String -> Ref Board S.RichK (List Span)
+fileRef : String -> Ref Board C.RichK (List Span)
 fileRef k =
-    refs.files |> Ref.key k S.richText
+    refs.files |> C.key k C.richText
 
 
 
@@ -267,7 +266,7 @@ outlineField id =
 
 type alias Model =
     { me : ReplicaId
-    , doc : OpDoc Board
+    , doc : Doc Board
     , presence : Presence Peer
     , peers : Presence Peer -- merged view of everyone (incl. self)
 
@@ -384,7 +383,7 @@ init flags =
                     { name = flags.name, color = flags.color, tab = tabId TodosTab, editing = Nothing, caret = Nothing }
 
         doc =
-            OpDoc.init me schema
+            C.init me schema
     in
     ( { me = me
       , doc = doc
@@ -400,8 +399,8 @@ init flags =
       , checkpointMsg = ""
       , viewing = Nothing
       , connected = False
-      , lastSent = OpDoc.version doc
-      , todosSlice = OpDoc.read doc |> Result.map .todos |> Result.withDefault []
+      , lastSent = Doc.version doc
+      , todosSlice = C.read doc |> Result.map .todos |> Result.withDefault []
       }
     , broadcastPresence presence
     )
@@ -414,8 +413,8 @@ init flags =
 type Msg
     = -- any collaborative text field: carries a typed text `Ref` + the new value +
       -- the real DOM caret offset, so the broadcast caret is exact for that field
-      TextEdited (Ref Board S.Settable String) String Int
-    | CaretMoved (Ref Board S.Settable String) Int
+      TextEdited (Ref Board C.Settable String) String Int
+    | CaretMoved (Ref Board C.Settable String) Int
       -- todos
     | NewTodoChanged String
     | AddTodo
@@ -484,11 +483,11 @@ update msg model =
             else
                 let
                     before =
-                        OpDoc.version model.doc
+                        Doc.version model.doc
 
                     -- append a fresh todo at the end of the list
                     doc1 =
-                        Ref.append todoDoc.schema (Todo model.newTodo False) refs.todos model.doc
+                        C.append todoDoc.schema (Todo model.newTodo False) refs.todos model.doc
                             |> orKeep model.doc
                 in
                 recordPush before { model | doc = doc1, newTodo = "" }
@@ -496,27 +495,27 @@ update msg model =
         ToggleTodo i ->
             let
                 before =
-                    OpDoc.version model.doc
+                    Doc.version model.doc
 
                 current =
-                    OpDoc.read model.doc
+                    C.read model.doc
                         |> Result.toMaybe
                         |> Maybe.andThen (\b -> List.drop i b.todos |> List.head)
                         |> Maybe.map .done
                         |> Maybe.withDefault False
 
                 doc1 =
-                    Ref.set (todoDoneRef i) (not current) model.doc |> orKeep model.doc
+                    C.set (todoDoneRef i) (not current) model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
 
         RemoveTodo i ->
             let
                 before =
-                    OpDoc.version model.doc
+                    Doc.version model.doc
 
                 doc1 =
-                    Ref.remove i refs.todos model.doc |> orKeep model.doc
+                    C.remove i refs.todos model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
 
@@ -524,10 +523,10 @@ update msg model =
             -- switch the board's status variant through the typed Ref API
             let
                 before =
-                    OpDoc.version model.doc
+                    Doc.version model.doc
 
                 doc1 =
-                    Ref.switch refs.status newStatus model.doc |> orKeep model.doc
+                    C.switch refs.status newStatus model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
 
@@ -536,13 +535,13 @@ update msg model =
             -- (Character-wise merge is preserved because it's a text leaf.)
             let
                 doc1 =
-                    Ref.set archivedReasonRef s model.doc |> orKeep model.doc
+                    C.set archivedReasonRef s model.doc |> orKeep model.doc
             in
             pushDoc { model | doc = doc1 }
 
         DragStart i ->
             -- capture the version now so the whole drag undoes as one step
-            ( { model | dragging = Just i, dragStartVersion = Just (OpDoc.version model.doc) }, Cmd.none )
+            ( { model | dragging = Just i, dragStartVersion = Just (Doc.version model.doc) }, Cmd.none )
 
         DragOver target ->
             case model.dragging of
@@ -555,10 +554,10 @@ update msg model =
                         -- the move converges through the same op path as any edit
                         let
                             before =
-                                OpDoc.version model.doc
+                                Doc.version model.doc
 
                             doc1 =
-                                Ref.move from target refs.todos model.doc
+                                C.move from target refs.todos model.doc
                                     |> orKeep model.doc
                         in
                         pushDoc (refreshSlices before { model | doc = doc1, dragging = Just target })
@@ -573,7 +572,7 @@ update msg model =
                     ( { model
                         | dragging = Nothing
                         , dragStartVersion = Nothing
-                        , doc = OpDoc.recordEdit before model.doc
+                        , doc = Doc.recordEdit before model.doc
                       }
                     , Cmd.none
                     )
@@ -584,10 +583,10 @@ update msg model =
         AddLike ->
             let
                 before =
-                    OpDoc.version model.doc
+                    Doc.version model.doc
 
                 doc1 =
-                    Ref.increment refs.likes 1 model.doc |> orKeep model.doc
+                    C.increment refs.likes 1 model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
 
@@ -605,11 +604,11 @@ update msg model =
             else
                 let
                     before =
-                        OpDoc.version model.doc
+                        Doc.version model.doc
 
                     -- seed an empty rich-text file at this key, then open it
                     doc1 =
-                        Ref.setKey S.richText name [] refs.files model.doc
+                        C.setKey C.richText name [] refs.files model.doc
                             |> orKeep model.doc
                 in
                 recordPush before
@@ -629,10 +628,10 @@ update msg model =
         RemoveFile k ->
             let
                 before =
-                    OpDoc.version model.doc
+                    Doc.version model.doc
 
                 doc1 =
-                    Ref.removeKey k refs.files model.doc |> orKeep model.doc
+                    C.removeKey k refs.files model.doc |> orKeep model.doc
 
                 -- close the file if it was the open one
                 selected =
@@ -645,30 +644,30 @@ update msg model =
             recordPush before { model | doc = doc1, selectedFile = selected }
 
         AddOutlineRoot ->
-            outlineEdit (Ref.addChild nodeDoc.schema (Node "") Nothing refs.outline) model
+            outlineEdit (C.addChild nodeDoc.schema (Node "") Nothing refs.outline) model
 
         AddOutlineChild parent ->
-            outlineEdit (Ref.addChild nodeDoc.schema (Node "") (Just parent) refs.outline) model
+            outlineEdit (C.addChild nodeDoc.schema (Node "") (Just parent) refs.outline) model
 
         IndentNode node maybePrev ->
             -- nest under the preceding sibling (Nothing = no previous sibling; no-op)
             case maybePrev of
                 Just prev ->
-                    outlineEdit (Ref.moveInto node (Just prev) refs.outline) model
+                    outlineEdit (C.moveInto node (Just prev) refs.outline) model
 
                 Nothing ->
                     ( model, Cmd.none )
 
         OutdentNode node maybeGrandparent ->
             -- promote to sit under the parent's parent (Nothing = already a root)
-            outlineEdit (Ref.moveInto node maybeGrandparent refs.outline) model
+            outlineEdit (C.moveInto node maybeGrandparent refs.outline) model
 
         RemoveNode node ->
-            outlineEdit (Ref.removeNode node refs.outline) model
+            outlineEdit (C.removeNode node refs.outline) model
 
         FocusField fieldName ->
             -- mark the start of a typing session so it undoes as one step
-            setEditing (Just fieldName) { model | editStartVersion = Just (OpDoc.version model.doc) }
+            setEditing (Just fieldName) { model | editStartVersion = Just (Doc.version model.doc) }
 
         BlurField ->
             -- close the typing session: record everything typed since focus as one
@@ -677,7 +676,7 @@ update msg model =
                 model1 =
                     case model.editStartVersion of
                         Just before ->
-                            { model | doc = OpDoc.recordEdit before model.doc, editStartVersion = Nothing }
+                            { model | doc = Doc.recordEdit before model.doc, editStartVersion = Nothing }
 
                         Nothing ->
                             model
@@ -685,15 +684,15 @@ update msg model =
             setEditing Nothing model1
 
         Undo ->
-            if OpDoc.canUndo model.doc then
-                pushDocRerendering model.doc { model | doc = OpDoc.undo model.doc, viewing = Nothing }
+            if Doc.canUndo model.doc then
+                pushDocRerendering model.doc { model | doc = Doc.undo model.doc, viewing = Nothing }
 
             else
                 ( model, Cmd.none )
 
         Redo ->
-            if OpDoc.canRedo model.doc then
-                pushDocRerendering model.doc { model | doc = OpDoc.redo model.doc, viewing = Nothing }
+            if Doc.canRedo model.doc then
+                pushDocRerendering model.doc { model | doc = Doc.redo model.doc, viewing = Nothing }
 
             else
                 ( model, Cmd.none )
@@ -711,7 +710,7 @@ update msg model =
                     else
                         model.checkpointMsg
             in
-            ( { model | doc = OpDoc.checkpoint label model.doc, checkpointMsg = "" }
+            ( { model | doc = Doc.checkpoint label model.doc, checkpointMsg = "" }
             , Cmd.none
             )
 
@@ -724,18 +723,18 @@ update msg model =
         Scrub n ->
             -- scrubbing previews the version after the first `n` ops; dragging to
             -- the end (n == historyLength) drops back to the live document
-            if n >= OpDoc.historyLength model.doc then
+            if n >= Doc.historyLength model.doc then
                 ( { model | viewing = Nothing }, Cmd.none )
 
             else
-                ( { model | viewing = Just (OpDoc.versionAt n model.doc) }, Cmd.none )
+                ( { model | viewing = Just (Doc.versionAt n model.doc) }, Cmd.none )
 
         RestoreHere ->
             case model.viewing of
                 Just v ->
                     -- restore emits fresh winning ops, so it syncs like any edit;
                     -- leave the preview and broadcast the revert
-                    pushDocRerendering model.doc { model | doc = OpDoc.restoreTo v model.doc, viewing = Nothing }
+                    pushDocRerendering model.doc { model | doc = Doc.restoreTo v model.doc, viewing = Nothing }
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -765,7 +764,7 @@ update msg model =
                 ( Just file, Ok intent ) ->
                     let
                         before =
-                            OpDoc.version model.doc
+                            Doc.version model.doc
 
                         doc1 =
                             applyRichTextIntent file intent model.doc |> orKeep model.doc
@@ -794,16 +793,16 @@ update msg model =
                     -- to avoid echoing them back on our next delta. `decodeWithDiff`
                     -- also hands back WHAT the peer changed, so we refresh only the
                     -- touched slices (keeping the rest referentially stable for lazy).
-                    case OpDoc.decodeWithDiff incomingJson model.doc of
+                    case Doc.decodeWithDiff incomingJson model.doc of
                         Ok ( doc1, diff ) ->
                             let
                                 m1 =
-                                    { model | doc = doc1, lastSent = OpDoc.version doc1 }
+                                    { model | doc = doc1, lastSent = Doc.version doc1 }
 
                                 m2 =
-                                    case Ref.touched refs.todos doc1 diff of
+                                    case C.touched refs.todos doc1 diff of
                                         Just _ ->
-                                            { m1 | todosSlice = OpDoc.read doc1 |> Result.map .todos |> Result.withDefault m1.todosSlice }
+                                            { m1 | todosSlice = C.read doc1 |> Result.map .todos |> Result.withDefault m1.todosSlice }
 
                                         Nothing ->
                                             m1
@@ -846,7 +845,7 @@ update msg model =
             -- On (re)connect, exchange full state both ways: push our entire op
             -- set (so peers get anything we did offline) and `hello` (so they
             -- push theirs). After this, steady-state edits are deltas again.
-            ( { model | connected = isUp, lastSent = OpDoc.version model.doc }
+            ( { model | connected = isUp, lastSent = Doc.version model.doc }
             , if isUp then
                 Cmd.batch
                     [ broadcastFull model.doc
@@ -864,20 +863,20 @@ update msg model =
 
 
 {-| Edit any collaborative text field + publish the caret in one step: apply the
-text change (`Ref.set` on a text ref diffs old→new into minimal insert/delete ops so
+text change (`C.set` on a text ref diffs old→new into minimal insert/delete ops so
 concurrent typing merges character-wise), then publish a **stable caret** at the
 real DOM offset within that ref. Because the caret is a `Crdt.Cursor`, it tracks the
 right character on every viewer even as they make their own concurrent edits.
 -}
-editText : Ref Board S.Settable String -> String -> Int -> Model -> ( Model, Cmd Msg )
+editText : Ref Board C.Settable String -> String -> Int -> Model -> ( Model, Cmd Msg )
 editText textRef newValue caretOffset model =
     let
         doc1 =
-            Ref.set textRef newValue model.doc
+            C.set textRef newValue model.doc
                 |> orKeep model.doc
 
         caret =
-            Ref.cursorAt textRef caretOffset doc1 |> Result.toMaybe
+            C.cursorAt textRef caretOffset doc1 |> Result.toMaybe
 
         presence1 =
             Presence.updateLocal (\c -> { c | caret = caret }) model.presence
@@ -895,11 +894,11 @@ editText textRef newValue caretOffset model =
 
 {-| Re-publish our caret at a new offset within a text ref (caret moved, no edit).
 -}
-publishCaret : Ref Board S.Settable String -> Int -> Model -> ( Model, Cmd Msg )
+publishCaret : Ref Board C.Settable String -> Int -> Model -> ( Model, Cmd Msg )
 publishCaret textRef caretOffset model =
     let
         caret =
-            Ref.cursorAt textRef caretOffset model.doc |> Result.toMaybe
+            C.cursorAt textRef caretOffset model.doc |> Result.toMaybe
 
         presence1 =
             Presence.updateLocal (\c -> { c | caret = caret }) model.presence
@@ -909,7 +908,7 @@ publishCaret textRef caretOffset model =
     )
 
 
-orKeep : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
+orKeep : Doc Board -> Result C.EditError (Doc Board) -> Doc Board
 orKeep fallback result =
     Result.withDefault fallback result
 
@@ -921,7 +920,7 @@ todo/note action so each is one Ctrl-Z step.
 -}
 recordPush : Version -> Model -> ( Model, Cmd Msg )
 recordPush before model =
-    pushDoc (refreshSlices before { model | doc = OpDoc.recordEdit before model.doc })
+    pushDoc (refreshSlices before { model | doc = Doc.recordEdit before model.doc })
 
 
 {-| Refresh the referentially-stable decoded slices held in the model, but ONLY the
@@ -934,11 +933,11 @@ refreshSlices : Version -> Model -> Model
 refreshSlices before model =
     let
         diff =
-            OpDoc.diffSince before model.doc
+            Doc.diffSince before model.doc
     in
-    case Ref.touched refs.todos model.doc diff of
+    case C.touched refs.todos model.doc diff of
         Just _ ->
-            { model | todosSlice = OpDoc.read model.doc |> Result.map .todos |> Result.withDefault model.todosSlice }
+            { model | todosSlice = C.read model.doc |> Result.map .todos |> Result.withDefault model.todosSlice }
 
         Nothing ->
             model
@@ -946,11 +945,11 @@ refreshSlices before model =
 
 {-| Apply one outline (tree) edit, record it as a single undo step, and broadcast.
 -}
-outlineEdit : (OpDoc Board -> Result OpDoc.Error (OpDoc Board)) -> Model -> ( Model, Cmd Msg )
+outlineEdit : (Doc Board -> Result C.EditError (Doc Board)) -> Model -> ( Model, Cmd Msg )
 outlineEdit edit model =
     let
         before =
-            OpDoc.version model.doc
+            Doc.version model.doc
     in
     recordPush before { model | doc = edit model.doc |> orKeep model.doc }
 
@@ -965,10 +964,10 @@ pushDoc : Model -> ( Model, Cmd Msg )
 pushDoc model =
     let
         now =
-            OpDoc.version model.doc
+            Doc.version model.doc
     in
     ( { model | lastSent = now }
-    , Ports.outgoing (envelope "doc" (OpDoc.encodeSince model.lastSent model.doc))
+    , Ports.outgoing (envelope "doc" (Doc.encodeSince model.lastSent model.doc))
     )
 
 
@@ -976,11 +975,11 @@ pushDoc model =
 changed (used by undo/redo/restore, which can rewrite the doc under the editor's
 feet). `old` is the pre-change doc for the diff.
 -}
-pushDocRerendering : OpDoc Board -> Model -> ( Model, Cmd Msg )
+pushDocRerendering : Doc Board -> Model -> ( Model, Cmd Msg )
 pushDocRerendering old model =
     let
         ( m1, syncCmd ) =
-            pushDoc (refreshSlices (OpDoc.version old) model)
+            pushDoc (refreshSlices (Doc.version old) model)
     in
     ( m1, Cmd.batch [ syncCmd, renderEditorIfChanged model.selectedFile old model.doc ] )
 
@@ -988,7 +987,7 @@ pushDocRerendering old model =
 {-| Chain an editor re-render for file `k` onto an existing `(model, cmd)` (used
 after `CreateFile`, which opens the new file).
 -}
-andRenderEditor : OpDoc Board -> ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
+andRenderEditor : Doc Board -> ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
 andRenderEditor doc ( model, cmd ) =
     ( model
     , Cmd.batch
@@ -1005,7 +1004,7 @@ andRenderEditor doc ( model, cmd ) =
 
 {-| Push file `k`'s current blocks to the ProseMirror editor.
 -}
-renderEditorFor : String -> OpDoc Board -> Cmd Msg
+renderEditorFor : String -> Doc Board -> Cmd Msg
 renderEditorFor k doc =
     Ports.renderRichText (encodeBlocks (fileBlocks k doc))
 
@@ -1013,7 +1012,7 @@ renderEditorFor k doc =
 {-| Re-render the editor only if the **open file's** contents changed between `old`
 and `new` — avoids churning ProseMirror (and its caret) on unrelated edits.
 -}
-renderEditorIfChanged : Maybe String -> OpDoc Board -> OpDoc Board -> Cmd Msg
+renderEditorIfChanged : Maybe String -> Doc Board -> Doc Board -> Cmd Msg
 renderEditorIfChanged selected old new =
     case selected of
         Just k ->
@@ -1029,17 +1028,17 @@ renderEditorIfChanged selected old new =
 
 {-| File `k`'s current blocks (empty if the file or doc read is absent).
 -}
-fileBlocks : String -> OpDoc Board -> List Block
+fileBlocks : String -> Doc Board -> List Block
 fileBlocks k doc =
-    Ref.readBlocks (fileRef k) doc |> Result.withDefault []
+    C.readBlocks (fileRef k) doc |> Result.withDefault []
 
 
 {-| Broadcast our entire op set — used for catch-up (connect / answering a
 `hello`), the one place full state is needed.
 -}
-broadcastFull : OpDoc Board -> Cmd Msg
+broadcastFull : Doc Board -> Cmd Msg
 broadcastFull doc =
-    Ports.outgoing (envelope "doc" (OpDoc.encode doc))
+    Ports.outgoing (envelope "doc" (Doc.encode doc))
 
 
 {-| Announce ourselves so already-present peers send us their full state.
@@ -1131,7 +1130,7 @@ decodeEnvelope =
 {-| An edit intent from the ProseMirror editor. Text/mark intents carry document-wide
 character offsets (over the flattened text of all blocks); block intents identify a
 block by its index (0 = leading block) — Elm resolves the index to a marker `OpId` via
-`OpDoc.readBlocks` before calling the block edits, which are marker-addressed.
+`Doc.readBlocks` before calling the block edits, which are marker-addressed.
 
 The editor sends a mark intent's `value` as `true` for a boolean mark being set, a
 string for a value mark (link href), or `null` to clear — so set-vs-clear turns on
@@ -1284,7 +1283,7 @@ block-structure edits are **block-relative** — the editor reports a block inde
 library resolves it internally (text diffs are scoped to that block so typed text can't
 leak across a block boundary; block edits address their marker by index).
 -}
-applyRichTextIntent : String -> RichTextIntent -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+applyRichTextIntent : String -> RichTextIntent -> Doc Board -> Result C.EditError (Doc Board)
 applyRichTextIntent file intent doc =
     let
         ref =
@@ -1292,28 +1291,28 @@ applyRichTextIntent file intent doc =
     in
     case intent of
         TextIntent { blockIndex, text } ->
-            Ref.setBlockText ref blockIndex text doc
+            C.setBlockText ref blockIndex text doc
 
         SetMark { type_, value, from, to } ->
-            Ref.mark ref from to type_ value doc
+            C.mark ref from to type_ value doc
 
         ClearMark { type_, from, to } ->
-            Ref.unmark ref from to type_ doc
+            C.unmark ref from to type_ doc
 
         Split { blockIndex, charOffset } ->
-            Ref.splitBlock ref blockIndex charOffset doc
+            C.splitBlock ref blockIndex charOffset doc
 
         Merge { blockIndex } ->
-            Ref.mergeBlock ref blockIndex doc
+            C.mergeBlock ref blockIndex doc
 
         SetType { blockIndex, type_ } ->
-            Ref.setBlockType ref blockIndex type_ doc
+            C.setBlockType ref blockIndex type_ doc
 
         Indent { blockIndex } ->
-            Ref.indentBlock ref blockIndex doc
+            C.indentBlock ref blockIndex doc
 
         Outdent { blockIndex } ->
-            Ref.outdentBlock ref blockIndex doc
+            C.outdentBlock ref blockIndex doc
 
         Reconcile shapes ->
             reconcileBlocks ref shapes doc
@@ -1327,14 +1326,14 @@ at its end to grow — both no-ops on block 0), then set each block's text, type
 depth via the tested primitives. Marks on surviving characters follow their chars; a
 bulk structural edit carries no mark changes (those ride their own intents).
 -}
-reconcileBlocks : Ref Board S.RichK (List Span) -> List BlockShape -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+reconcileBlocks : Ref Board C.RichK (List Span) -> List BlockShape -> Doc Board -> Result C.EditError (Doc Board)
 reconcileBlocks ref shapes doc =
     let
         desiredCount =
             List.length shapes
 
         blocksOf d =
-            Ref.readBlocks ref d |> Result.withDefault []
+            C.readBlocks ref d |> Result.withDefault []
 
         lastBlockTextLen d =
             blocksOf d
@@ -1348,7 +1347,7 @@ reconcileBlocks ref shapes doc =
             List.range 1 n
                 |> List.foldl
                     (\_ acc ->
-                        acc |> Result.andThen (\dd -> Ref.mergeBlock ref (List.length (blocksOf dd) - 1) dd)
+                        acc |> Result.andThen (\dd -> C.mergeBlock ref (List.length (blocksOf dd) - 1) dd)
                     )
                     (Ok d)
 
@@ -1357,7 +1356,7 @@ reconcileBlocks ref shapes doc =
             List.range 1 n
                 |> List.foldl
                     (\_ acc ->
-                        acc |> Result.andThen (\dd -> Ref.splitBlock ref (List.length (blocksOf dd) - 1) (lastBlockTextLen dd) dd)
+                        acc |> Result.andThen (\dd -> C.splitBlock ref (List.length (blocksOf dd) - 1) (lastBlockTextLen dd) dd)
                     )
                     (Ok d)
 
@@ -1377,7 +1376,7 @@ reconcileBlocks ref shapes doc =
 
         -- set one block's text, then type, then depth to match `shape`
         applyShape i shape d =
-            Ref.setBlockText ref i shape.text d
+            C.setBlockText ref i shape.text d
                 |> Result.andThen (reconcileType ref i shape.type_)
                 |> Result.andThen (reconcileDepth ref i shape.depth)
     in
@@ -1394,11 +1393,11 @@ reconcileBlocks ref shapes doc =
 {-| Set block `i`'s type to match `desired` ("" → clear the mark), only if it differs
 from the current type (so we don't emit a redundant op every reconcile).
 -}
-reconcileType : Ref Board S.RichK (List Span) -> Int -> String -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+reconcileType : Ref Board C.RichK (List Span) -> Int -> String -> Doc Board -> Result C.EditError (Doc Board)
 reconcileType ref i desired doc =
     let
         current =
-            Ref.readBlocks ref doc
+            C.readBlocks ref doc
                 |> Result.withDefault []
                 |> List.drop i
                 |> List.head
@@ -1409,19 +1408,19 @@ reconcileType ref i desired doc =
         Ok doc
 
     else if desired == "" then
-        Ref.setBlockType ref i Nothing doc
+        C.setBlockType ref i Nothing doc
 
     else
-        Ref.setBlockType ref i (Just desired) doc
+        C.setBlockType ref i (Just desired) doc
 
 
 {-| Indent/outdent block `i` until its depth matches `desired`.
 -}
-reconcileDepth : Ref Board S.RichK (List Span) -> Int -> Int -> OpDoc Board -> Result OpDoc.Error (OpDoc Board)
+reconcileDepth : Ref Board C.RichK (List Span) -> Int -> Int -> Doc Board -> Result C.EditError (Doc Board)
 reconcileDepth ref i desired doc =
     let
         current =
-            Ref.readBlocks ref doc
+            C.readBlocks ref doc
                 |> Result.withDefault []
                 |> List.drop i
                 |> List.head
@@ -1432,10 +1431,10 @@ reconcileDepth ref i desired doc =
             List.range 1 n |> List.foldl (\_ acc -> acc |> Result.andThen (op_ ref i)) (Ok d)
     in
     if desired > current then
-        step Ref.indentBlock (desired - current) doc
+        step C.indentBlock (desired - current) doc
 
     else if desired < current then
-        step Ref.outdentBlock (current - desired) doc
+        step C.outdentBlock (current - desired) doc
 
     else
         Ok doc
@@ -1515,7 +1514,7 @@ onEnter msg =
 edits (value + real caret offset) and caret moves (keyup/mouseup) so we broadcast an
 exact caret, plus the focus/blur presence handlers.
 -}
-textFieldAttrs : Ref Board S.Settable String -> List (Html.Attribute Msg)
+textFieldAttrs : Ref Board C.Settable String -> List (Html.Attribute Msg)
 textFieldAttrs textRef =
     [ on "input"
         (JD.map2 (TextEdited textRef)
@@ -1538,13 +1537,12 @@ Horizontal placement uses `ch` units; with the monospace input font 1ch is one
 glyph, so the bar lands exactly on the character.
 
 -}
-viewFieldCarets : Ref Board S.Settable String -> Model -> List (Html Msg)
+viewFieldCarets : Ref Board C.Settable String -> Model -> List (Html Msg)
 viewFieldCarets textRef model =
     let
-        pathTarget =
-            Ref.cursorAt textRef 0 model.doc
+        fieldCursor =
+            C.cursorAt textRef 0 model.doc
                 |> Result.toMaybe
-                |> Maybe.map Cursor.steps
     in
     Presence.peers model.peers
         |> List.filterMap
@@ -1556,10 +1554,13 @@ viewFieldCarets textRef model =
                     peer.caret
                         |> Maybe.andThen
                             (\c ->
-                                -- only this field's carets: the cursor's target
-                                -- path must match the field we're rendering
-                                if Just (Cursor.steps c) == pathTarget then
-                                    OpDoc.cursorOffset c model.doc
+                                -- only this field's carets: the cursor must point
+                                -- into the same container as the field we're rendering
+                                if
+                                    (fieldCursor |> Maybe.map (Cursor.sameContainer c))
+                                        == Just True
+                                then
+                                    C.cursorOffset c model.doc
                                         |> Maybe.map (\offset -> ( peer, offset ))
 
                                 else
@@ -1621,14 +1622,14 @@ fieldAttrs model fieldId =
 
 {-| Read the board to render: the live document, or a past version when previewing.
 -}
-readShown : Model -> Result S.Error Board
+readShown : Model -> Result C.ReadError Board
 readShown model =
     case model.viewing of
         Just v ->
-            OpDoc.readAt v model.doc
+            C.readAt v model.doc
 
         Nothing ->
-            OpDoc.read model.doc
+            C.read model.doc
 
 
 view : Model -> Html Msg
@@ -1652,7 +1653,7 @@ view model =
                 ]
 
         Err err ->
-            div [ class "error" ] [ text ("schema read error: " ++ S.errorToString err) ]
+            div [ class "error" ] [ text ("schema read error: " ++ C.readErrorToString err) ]
 
 
 {-| A short slug for the board status, used to tint the page background subtly.
@@ -1786,7 +1787,7 @@ viewHeader model board =
 the presence highlight + focus reporting, and any remote peers' carets overlaid
 on top — all keyed to this field's text `Ref` and `fieldId`.
 -}
-viewTextInput : Bool -> Model -> Ref Board S.Settable String -> String -> String -> String -> Html Msg
+viewTextInput : Bool -> Model -> Ref Board C.Settable String -> String -> String -> String -> Html Msg
 viewTextInput readOnly model textRef fieldId currentValue placeholderText =
     div [ class "field-wrap", A.style "position" "relative" ]
         (input
@@ -1874,7 +1875,7 @@ viewSettings readOnly model board =
 
 {-| The board status: a sum type rendered as three mutually-exclusive buttons
 (switching the active variant), plus a reason input shown only for `Archived`.
-Demonstrates `S.custom` + the typed `Crdt.Ref` write API end to end.
+Demonstrates `C.custom` + the typed `Crdt` write API end to end.
 -}
 viewStatus : Bool -> Model -> Status -> Html Msg
 viewStatus readOnly model status =
@@ -2211,10 +2212,10 @@ viewHistory model =
         [ h2 [] [ text "History" ]
         , div [ class "undo-row" ]
             [ button
-                [ onClick Undo, A.disabled (not (OpDoc.canUndo model.doc)), A.title "undo your last edit" ]
+                [ onClick Undo, A.disabled (not (Doc.canUndo model.doc)), A.title "undo your last edit" ]
                 [ text "↶ undo" ]
             , button
-                [ onClick Redo, A.disabled (not (OpDoc.canRedo model.doc)), A.title "redo" ]
+                [ onClick Redo, A.disabled (not (Doc.canRedo model.doc)), A.title "redo" ]
                 [ text "↷ redo" ]
             ]
         , viewScrubber model
@@ -2229,7 +2230,7 @@ viewHistory model =
             , button [ onClick SaveCheckpoint ] [ text "save checkpoint" ]
             ]
         , ul [ class "checkpoints" ]
-            (List.map (viewCheckpoint model.viewing) (OpDoc.checkpoints model.doc))
+            (List.map (viewCheckpoint model.viewing) (Doc.checkpoints model.doc))
         , case model.viewing of
             Just _ ->
                 div [ class "preview-banner" ]
@@ -2243,7 +2244,7 @@ viewHistory model =
 
 
 {-| A slider over the document's linear op history. Dragging it previews the state
-at that step (`OpDoc.versionAt`); the slider sits at the far right (live) when not
+at that step (`Doc.versionAt`); the slider sits at the far right (live) when not
 previewing. While parked in the past, a "restore to here" button rewinds the live
 document to that point — as new ops, so the revert syncs to every peer.
 -}
@@ -2251,7 +2252,7 @@ viewScrubber : Model -> Html Msg
 viewScrubber model =
     let
         len =
-            OpDoc.historyLength model.doc
+            Doc.historyLength model.doc
 
         pos =
             scrubPosition model
@@ -2304,7 +2305,7 @@ scrubPosition : Model -> Int
 scrubPosition model =
     let
         len =
-            OpDoc.historyLength model.doc
+            Doc.historyLength model.doc
     in
     case model.viewing of
         Nothing ->
@@ -2312,7 +2313,7 @@ scrubPosition model =
 
         Just v ->
             List.range 0 len
-                |> List.filter (\n -> OpDoc.versionAt n model.doc == v)
+                |> List.filter (\n -> Doc.versionAt n model.doc == v)
                 |> List.head
                 |> Maybe.withDefault len
 
@@ -2321,7 +2322,7 @@ viewCheckpoint : Maybe Version -> Checkpoint -> Html Msg
 viewCheckpoint viewing cp =
     let
         cpVersion =
-            OpDoc.checkpointVersion cp
+            Doc.checkpointVersion cp
 
         isViewing =
             viewing == Just cpVersion
@@ -2335,8 +2336,8 @@ viewCheckpoint viewing cp =
                 "checkpoint"
             )
         ]
-        [ span [ class "cp-msg" ] [ text (OpDoc.checkpointMessage cp) ]
-        , span [ class "cp-author" ] [ text (Crdt.Id.toString (OpDoc.checkpointAuthor cp)) ]
+        [ span [ class "cp-msg" ] [ text (Doc.checkpointMessage cp) ]
+        , span [ class "cp-author" ] [ text (Crdt.Id.toString (Doc.checkpointAuthor cp)) ]
         , button [ onClick (PreviewVersion cpVersion) ] [ text "preview" ]
         ]
 

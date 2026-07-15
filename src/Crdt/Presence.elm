@@ -3,39 +3,101 @@ module Crdt.Presence exposing
     , init, setLocal, updateLocal, local, peers, merge, remove
     , encode, decode
     , codec, field, optional, buildCodec
-    , string, bool, int, custom
+    , string, bool, int, cursor, range, custom
     , FieldCodec
     )
 
-{-| Presence (a.k.a. awareness): ephemeral per-peer state — who is online, their
-display name/color, which field they are editing — kept on a channel **separate**
-from the CRDT document. It is never merged into the document.
+{-| **Presence** is the "who's here and what are they doing" layer of a collaborative
+app — each person's name and colour, whether they are online, where their cursor is —
+as opposed to the document they are editing together.
 
-Each peer owns one slot keyed by its `ReplicaId`. A slot carries a logical
-sequence number; merging keeps the higher-sequence slot per peer (last-write-wins
-per peer). This is a deliberately tiny, self-contained CRDT: a LWW-map keyed by
-replica.
+It is kept deliberately separate from your `Crdt.Doc`, because it behaves differently:
+presence is **throwaway**. You want the newest value and nothing else — when someone
+moves their cursor you only care where it is _now_, and when they close the tab their
+marker should just disappear. There is no history to preserve and nothing to reconcile
+character by character, so presence has its own tiny, self-contained mechanism rather
+than going through the document's CRDT machinery.
 
-State is described by a small `Codec` (a cut-down record codec) so it can be
-serialized to JSON for the wire.
+Each peer owns one slot in a shared table, keyed by its `Crdt.Id.ReplicaId`. When two
+tables merge, the newer value wins for each peer — simple last-writer-wins, per peer.
+
+
+## Describing your presence value
+
+You first describe the shape of one peer's presence with a small `Codec`, so it can be
+sent as JSON. It reads like a compact record builder:
+
+    type alias Peer =
+        { name : String
+        , color : String
+        , caret : Maybe Cursor
+        }
+
+    peerCodec : Presence.Codec Peer
+    peerCodec =
+        Presence.codec Peer
+            |> Presence.field "name" .name Presence.string
+            |> Presence.field "color" .color Presence.string
+            |> Presence.optional "caret" .caret Presence.cursor
+            |> Presence.buildCodec
+
+
+## Using it
+
+Keep one `Presence Peer` in your model alongside your document. Set your own state as it
+changes, broadcast the table to peers exactly as you broadcast document updates, merge
+what comes back, and render everyone with `peers`:
+
+    model.presence
+        |> Presence.setLocal { name = "Alice", color = "#e11", caret = Just cursor }
+        |> Presence.encode
+
+    -- send this JSON to peers
+    -- on receiving a peer's table:
+    case Presence.decode peerCodec json of
+        Ok theirs ->
+            { model | presence = Presence.merge model.presence theirs }
+
+        Err _ ->
+            model
+
+
+# The presence table
 
 @docs Presence, Codec
+
+
+# Setting and reading state
+
 @docs init, setLocal, updateLocal, local, peers, merge, remove
+
+
+# Sending it over the wire
+
 @docs encode, decode
+
+
+# Describing a presence value
+
 @docs codec, field, optional, buildCodec
-@docs string, bool, int, custom
+
+
+# Field types
+
+@docs string, bool, int, cursor, range, custom
 @docs FieldCodec
 
 -}
 
+import Crdt.Cursor as Cursor exposing (Cursor, Range)
 import Crdt.Id as Id exposing (ReplicaId)
 import Dict exposing (Dict)
 import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
 
 
-{-| The awareness table for a peer: its own id + the codec, plus the latest known
-slot for every peer (including itself).
+{-| A table of everyone's presence state: this replica's own id and codec, plus the
+latest known value for every peer (including itself). Opaque — build one with `init`.
 -}
 type Presence a
     = Presence
@@ -55,14 +117,17 @@ type alias Slot a =
 -- LIFECYCLE ------------------------------------------------------------------
 
 
-{-| A fresh, empty presence table for a replica.
+{-| A fresh, empty presence table for a replica. Pass the same `ReplicaId` you gave
+`Crdt.init` and the `Codec` describing your presence value.
 -}
 init : ReplicaId -> Codec a -> Presence a
 init me c =
     Presence { me = me, codec = c, slots = Dict.empty }
 
 
-{-| Set the local peer's state, bumping its sequence number.
+{-| Set this replica's own presence state (replacing any previous value). Call it
+whenever your local state changes — the user renamed themselves, moved their cursor —
+and then broadcast the table.
 -}
 setLocal : a -> Presence a -> Presence a
 setLocal value (Presence p) =
@@ -76,7 +141,11 @@ setLocal value (Presence p) =
     Presence { p | slots = Dict.insert key { seq = seq, value = value } p.slots }
 
 
-{-| Update the local peer's state, if any, bumping its sequence number.
+{-| Update this replica's own state with a function, if it has been set. Handy for
+changing one part — moving the cursor while keeping name and colour:
+
+    Presence.updateLocal (\me -> { me | caret = Just cursor }) model.presence
+
 -}
 updateLocal : (a -> a) -> Presence a -> Presence a
 updateLocal f pres =
@@ -88,14 +157,16 @@ updateLocal f pres =
             pres
 
 
-{-| The local peer's current state, if set.
+{-| This replica's own current state, if it has been set.
 -}
 local : Presence a -> Maybe a
 local (Presence p) =
     Dict.get (Id.toString p.me) p.slots |> Maybe.map .value
 
 
-{-| Every known peer and its state (including self), in replica-id order.
+{-| Every known peer and its state, including yourself, ordered by replica id. This is
+what you fold over to render collaborators (filter out your own id if you don't want to
+draw yourself).
 -}
 peers : Presence a -> List ( ReplicaId, a )
 peers (Presence p) =
@@ -103,8 +174,9 @@ peers (Presence p) =
         |> List.map (\( k, slot ) -> ( Id.replica k, slot.value ))
 
 
-{-| Merge another peer's awareness table into this one: per replica, keep the
-slot with the higher sequence number (LWW per peer).
+{-| Merge a table received from a peer into this one, keeping the newer value for each
+replica. Like document `merge`, the result is the same no matter what order tables
+arrive in.
 -}
 merge : Presence a -> Presence a -> Presence a
 merge (Presence a) (Presence b) =
@@ -129,9 +201,9 @@ merge (Presence a) (Presence b) =
         }
 
 
-{-| Drop a peer from the table (e.g. on disconnect). Presence is ephemeral, so
-unlike document state there's no tombstone — a removed peer simply disappears,
-and reappears if it broadcasts again.
+{-| Drop a peer from the table, e.g. when they disconnect. Because presence is
+throwaway there is nothing left behind — the peer simply vanishes, and reappears if it
+broadcasts again later.
 -}
 remove : ReplicaId -> Presence a -> Presence a
 remove rid (Presence p) =
@@ -142,7 +214,7 @@ remove rid (Presence p) =
 -- WIRE -----------------------------------------------------------------------
 
 
-{-| Serialize the awareness table to JSON for the wire.
+{-| Serialize the whole presence table to JSON, to broadcast to peers.
 -}
 encode : Presence a -> JE.Value
 encode (Presence p) =
@@ -156,8 +228,8 @@ encode (Presence p) =
         p.slots
 
 
-{-| Decode an awareness table received from a peer. Callers merge the result
-into their own table with `merge`.
+{-| Decode a presence table received from a peer. Merge the result into your own with
+`merge`.
 -}
 decode : Codec a -> JE.Value -> Result String (Presence a)
 decode c value =
@@ -184,7 +256,8 @@ presenceDecoder ((Codec cc) as c) =
 -- CODEC ----------------------------------------------------------------------
 
 
-{-| Describes how a presence value serializes. A cut-down record codec.
+{-| Describes how one peer's presence value is turned into JSON and back. Build one with
+`codec`/`field`/`buildCodec`. Opaque.
 -}
 type Codec a
     = Codec
@@ -193,7 +266,7 @@ type Codec a
         }
 
 
-{-| A single field's codec.
+{-| Describes one field of a presence value (see `string`/`bool`/`int`/`custom`).
 -}
 type FieldCodec a
     = FieldCodec
@@ -202,7 +275,8 @@ type FieldCodec a
         }
 
 
-{-| In-progress presence codec.
+{-| A presence codec under construction, between `codec` and `buildCodec`. You won't
+name this type directly.
 -}
 type CodecBuilder full a
     = CodecBuilder
@@ -216,7 +290,9 @@ encodeValue (Codec c) value =
     JE.object (c.encoder value)
 
 
-{-| Begin a presence codec from a constructor.
+{-| Start describing a presence value, given the constructor of your record (just like
+`Crdt.record`). Follow it with a `field`/`optional` per record field and finish with
+`buildCodec`.
 -}
 codec : (a -> b) -> CodecBuilder full (a -> b)
 codec ctor =
@@ -226,7 +302,7 @@ codec ctor =
         }
 
 
-{-| A required field.
+{-| Add a required field: its JSON name, a getter, and its field type.
 -}
 field : String -> (full -> a) -> FieldCodec a -> CodecBuilder full (a -> b) -> CodecBuilder full b
 field name getter (FieldCodec fc) (CodecBuilder cb) =
@@ -236,7 +312,8 @@ field name getter (FieldCodec fc) (CodecBuilder cb) =
         }
 
 
-{-| An optional field (encoded as null when absent).
+{-| Add an optional field, read as a `Maybe` and sent as `null` when absent — good for
+things not always present, like a cursor only shown while editing.
 -}
 optional : String -> (full -> Maybe a) -> FieldCodec a -> CodecBuilder full (Maybe a -> b) -> CodecBuilder full b
 optional name getter (FieldCodec fc) (CodecBuilder cb) =
@@ -256,7 +333,7 @@ optional name getter (FieldCodec fc) (CodecBuilder cb) =
         }
 
 
-{-| Finish a presence codec.
+{-| Finish building a presence codec.
 -}
 buildCodec : CodecBuilder a a -> Codec a
 buildCodec (CodecBuilder cb) =
@@ -274,22 +351,46 @@ string =
     FieldCodec { encode = JE.string, decode = JD.string }
 
 
-{-| A bool field.
+{-| A boolean field.
 -}
 bool : FieldCodec Bool
 bool =
     FieldCodec { encode = JE.bool, decode = JD.bool }
 
 
-{-| An int field.
+{-| An integer field.
 -}
 int : FieldCodec Int
 int =
     FieldCodec { encode = JE.int, decode = JD.int }
 
 
-{-| A field with a custom JSON encoder/decoder — for richer per-peer state such
-as a serialized `Crdt.Cursor`.
+{-| A `Crdt.Cursor` field — a peer's caret position. The common case for sharing where
+everyone is typing, so it is built in:
+
+    Presence.codec Peer
+        |> Presence.optional "caret" .caret Presence.cursor
+        |> Presence.buildCodec
+
+-}
+cursor : FieldCodec Cursor
+cursor =
+    FieldCodec { encode = Cursor.encode, decode = Cursor.decoder }
+
+
+{-| A `Crdt.Cursor.Range` field — a peer's text **selection** (its two ends). Like
+`cursor`, but for a highlighted range rather than a single caret.
+-}
+range : FieldCodec Range
+range =
+    FieldCodec { encode = Cursor.encodeRange, decode = Cursor.rangeDecoder }
+
+
+{-| A field with your own JSON encoder and decoder — for anything the built-in field
+types don't cover:
+
+    Presence.custom encodeColor colorDecoder
+
 -}
 custom : (a -> JE.Value) -> Decoder a -> FieldCodec a
 custom enc dec =

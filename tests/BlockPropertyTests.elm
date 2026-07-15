@@ -1,6 +1,6 @@
 module BlockPropertyTests exposing (suite)
 
-{-| Property tests over **random sequences of block edits** on a single `S.richText`
+{-| Property tests over **random sequences of block edits** on a single `C.richText`
 field, driven through the public `Crdt.Ref` API exactly as the demo's editor binding
 does. This is the level that the block-structure bugs actually lived at: the flat
 character-sequence ↔ block-index mapping, especially once the **leading marker** exists
@@ -24,12 +24,11 @@ indices by one in the wild.
 
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
-import Crdt.Ref as Ref exposing (Ref)
 import Crdt.RichText exposing (Block, Span)
-import Crdt.Schema as S
 import Expect
 import Fuzz exposing (Fuzzer)
 import Test exposing (Test, describe, fuzz)
@@ -39,19 +38,19 @@ import Test exposing (Test, describe, fuzz)
 -- SCHEMA ---------------------------------------------------------------------
 
 
-type alias Doc =
+type alias Sample =
     { body : List Span }
 
 
 type alias DocRefs =
-    { body : Ref Doc S.RichK (List Span) }
+    { body : Ref Sample C.RichK (List Span) }
 
 
-docDoc : Ref.RecordRefs Doc DocRefs
+docDoc : C.RecordRefs Sample DocRefs
 docDoc =
-    Ref.record Doc DocRefs
-        |> Ref.field "body" .body S.richText
-        |> Ref.build
+    C.record Sample DocRefs
+        |> C.field "body" .body C.richText
+        |> C.build
 
 
 refs : DocRefs
@@ -64,36 +63,36 @@ bodyPath =
     Path.root |> Path.field "body"
 
 
-init : OpDoc Doc
+init : Doc Sample
 init =
-    OpDoc.init (Id.replica "prop") docDoc.schema
+    Doc.init (Id.replica "prop") docDoc.schema
 
 
-ok : OpDoc Doc -> Result OpDoc.Error (OpDoc Doc) -> OpDoc Doc
+ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
-blocks : OpDoc Doc -> List Block
+blocks : Doc Sample -> List Block
 blocks doc =
-    OpDoc.readBlocks bodyPath doc |> Result.withDefault []
+    Doc.readBlocks bodyPath doc |> Result.withDefault []
 
 
-blockCount : OpDoc Doc -> Int
+blockCount : Doc Sample -> Int
 blockCount =
     blocks >> List.length
 
 
 {-| Per-block plain text (concatenated span text), one entry per block.
 -}
-blockTexts : OpDoc Doc -> List String
+blockTexts : Doc Sample -> List String
 blockTexts doc =
     blocks doc |> List.map (\b -> b.spans |> List.map .text |> String.concat)
 
 
 {-| The whole document's plain text (all blocks concatenated, no separators).
 -}
-plainText : OpDoc Doc -> String
+plainText : Doc Sample -> String
 plainText =
     blockTexts >> String.concat
 
@@ -115,7 +114,7 @@ type Edit
 fuzzed index is always in range (mirrors the demo: the editor reports a real index).
 Out-of-range picks wrap into range; unresolvable edits are no-ops.
 -}
-applyEdit : Edit -> OpDoc Doc -> OpDoc Doc
+applyEdit : Edit -> Doc Sample -> Doc Sample
 applyEdit edit doc =
     let
         n =
@@ -144,13 +143,13 @@ applyEdit edit doc =
                     else
                         modBy (blockLen bi + 1) (abs off)
             in
-            Ref.splitBlock refs.body bi charOffset doc |> ok doc
+            C.splitBlock refs.body bi charOffset doc |> ok doc
 
         MergeAt i ->
-            Ref.mergeBlock refs.body (clampIndex i) doc |> ok doc
+            C.mergeBlock refs.body (clampIndex i) doc |> ok doc
 
         SetType i t ->
-            Ref.setBlockType refs.body
+            C.setBlockType refs.body
                 (clampIndex i)
                 (if t == "" then
                     Nothing
@@ -162,33 +161,33 @@ applyEdit edit doc =
                 |> ok doc
 
         Indent i ->
-            Ref.indentBlock refs.body (clampIndex i) doc |> ok doc
+            C.indentBlock refs.body (clampIndex i) doc |> ok doc
 
         Outdent i ->
-            Ref.outdentBlock refs.body (clampIndex i) doc |> ok doc
+            C.outdentBlock refs.body (clampIndex i) doc |> ok doc
 
         SetBlockText i s ->
-            Ref.setBlockText refs.body (clampIndex i) s doc |> ok doc
+            C.setBlockText refs.body (clampIndex i) s doc |> ok doc
 
 
-runFrom : OpDoc Doc -> List Edit -> OpDoc Doc
+runFrom : Doc Sample -> List Edit -> Doc Sample
 runFrom start es =
     List.foldl applyEdit start es
 
 
 {-| A starting doc with some text but no leading marker yet (block 0 unformatted).
 -}
-plainStart : OpDoc Doc
+plainStart : Doc Sample
 plainStart =
-    Ref.setRich refs.body "hello world" init |> ok init
+    C.setRich refs.body "hello world" init |> ok init
 
 
 {-| Same text, but block 0 pre-formatted so the **leading marker** exists — the state
 that shifted split indices by one before the fix.
 -}
-formattedStart : OpDoc Doc
+formattedStart : Doc Sample
 formattedStart =
-    Ref.setBlockType refs.body 0 (Just "h1") plainStart |> ok plainStart
+    C.setBlockType refs.body 0 (Just "h1") plainStart |> ok plainStart
 
 
 
@@ -261,7 +260,7 @@ suite =
 {-| The full invariant battery, parameterized by the starting document (so we run it
 both with and without a pre-existing leading marker).
 -}
-invariants : OpDoc Doc -> List Test
+invariants : Doc Sample -> List Test
 invariants start =
     [ fuzz structuralEdits "always at least one block" <|
         \es ->
@@ -292,7 +291,7 @@ invariants start =
 
                     -- set a sentinel that differs from whatever is there
                     edited =
-                        Ref.setBlockText refs.body target "ZZZ-sentinel" doc |> ok doc
+                        C.setBlockText refs.body target "ZZZ-sentinel" doc |> ok doc
 
                     after =
                         blockTexts edited
@@ -334,11 +333,11 @@ invariants start =
                         modBy (len + 1) (abs rawOffset)
 
                 split =
-                    Ref.splitBlock refs.body bi off start |> ok start
+                    C.splitBlock refs.body bi off start |> ok start
 
                 -- the split created a new block at bi+1; merging it back rejoins them
                 mergedBack =
-                    Ref.mergeBlock refs.body (bi + 1) split |> ok split
+                    C.mergeBlock refs.body (bi + 1) split |> ok split
             in
             plainText mergedBack |> Expect.equal (plainText start)
     ]

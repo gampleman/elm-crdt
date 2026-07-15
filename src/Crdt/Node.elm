@@ -4,7 +4,7 @@ module Crdt.Node exposing
     , reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
     , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
     , merge, maxCounter
-    , restore, reStamp, reStampWithMap
+    , reStamp, reStampWithMap
     , Element, RgaNode
     )
 
@@ -31,16 +31,16 @@ convergence correctness lives here and nowhere else.
 @docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
 @docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
 @docs merge, maxCounter
-@docs restore, reStamp, reStampWithMap
+@docs reStamp, reStampWithMap
 @docs Element, RgaNode
 
 -}
 
 import Crdt.Frac
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.MoveList as MoveList exposing (MoveList)
 import Crdt.Rga as Rga exposing (Rga)
-import Crdt.Tree as Tree exposing (Tree)
+import Crdt.Tree.Internal as Tree exposing (Tree)
 import Dict exposing (Dict)
 
 
@@ -636,7 +636,7 @@ key (not by id), so they are not included.
 Undo/redo needs this map: reviving a deleted subtree mints fresh ids, and a later
 inverse op may still reference an id _inside_ that subtree (e.g. the character a
 follow-up text insert anchored after). Registering the whole mapping — not just the
-subtree root — keeps those references resolvable. See `OpDoc`'s `idRemap`.
+subtree root — keeps those references resolvable. See `Doc`'s `idRemap`.
 
 -}
 reStampWithMap : Id.Ctx -> Node -> ( Node, Id.Ctx, Dict String OpId )

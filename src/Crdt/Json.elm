@@ -27,11 +27,11 @@ and floats survive the roundtrip distinctly.
 -}
 
 import Crdt.Frac as Frac
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Element, Entry, Node, Prim(..))
 import Crdt.Rga as Rga
-import Crdt.Tree as Tree
+import Crdt.Tree.Internal as Tree
 import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
 import Set

@@ -15,8 +15,8 @@ The properties that matter:
 -}
 
 import Crdt.Frac as Frac exposing (Frac)
-import Crdt.Id as Id exposing (OpId)
-import Crdt.Tree as Tree exposing (Tree)
+import Crdt.Id.Internal as Id exposing (OpId)
+import Crdt.Tree.Internal as Tree exposing (Tree)
 import Expect
 import Test exposing (Test, describe, test)
 

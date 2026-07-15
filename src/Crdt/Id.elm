@@ -1,15 +1,19 @@
 module Crdt.Id exposing
     ( ReplicaId, replica, toString
-    , OpId, opId, opIdCounter, opIdReplica, compareOpId, opIdToString
-    , Clock, Ctx, ctx, nextId, observe, ctxClock, ctxReplica
+    , OpId, opIdCounter, opIdReplica, compareOpId, opIdToString
     )
 
-{-| Identity and causality primitives.
+{-| The two identity types the library hands back to you.
 
-Every replica has a stable `ReplicaId` (a user-supplied string). Edits mint
-`OpId`s — a Lamport counter paired with the originating `ReplicaId`. The pair is
-a total order, which we use both to give sequence elements stable identity and
-to break ties in last-write-wins registers.
+Every replica — every independent copy of a document, such as one browser tab — has a
+stable `ReplicaId`, a string you choose (typically a random per-tab token). You pass one
+to `Crdt.init` so the library knows which replica it is editing on behalf of.
+
+Every edit the library records is stamped with an `OpId`, a globally-unique operation
+id. You never mint these yourself, but they surface as **stable handles** to things
+inside a document: the id of an item in a `Crdt.Tree`, or the identity a `Crdt.Cursor`
+is pinned to. An `OpId` can be compared and turned into a string, which is all you need
+to use one as a dictionary key or to look a value up.
 
 
 # Replicas
@@ -19,139 +23,70 @@ to break ties in last-write-wins registers.
 
 # Operation ids
 
-@docs OpId, opId, opIdCounter, opIdReplica, compareOpId, opIdToString
-
-
-# Clocks
-
-@docs Clock, Ctx, ctx, nextId, observe, ctxClock, ctxReplica
+@docs OpId, opIdCounter, opIdReplica, compareOpId, opIdToString
 
 -}
 
+import Crdt.Id.Internal as I
 
-{-| A stable per-replica identifier. Two browser tabs, two `ReplicaId`s.
+
+{-| A stable per-replica identifier. Two browser tabs, two `ReplicaId`s. Build one with
+`replica`.
 -}
-type ReplicaId
-    = ReplicaId String
+type alias ReplicaId =
+    I.ReplicaId
 
 
-{-| Build a `ReplicaId` from a string (e.g. a random per-tab token).
+{-| Build a `ReplicaId` from a string. Use something unique per replica — a random
+per-tab token, a device id, a signed-in user id.
+
+    Crdt.init (Crdt.Id.replica "alice-tab-1") schema
+
 -}
 replica : String -> ReplicaId
 replica =
-    ReplicaId
+    I.replica
 
 
-{-| The underlying string, for display.
+{-| The underlying string of a `ReplicaId`, e.g. to show who made a change.
 -}
 toString : ReplicaId -> String
-toString (ReplicaId s) =
-    s
+toString =
+    I.toString
 
 
-compareReplica : ReplicaId -> ReplicaId -> Order
-compareReplica (ReplicaId a) (ReplicaId b) =
-    compare a b
-
-
-{-| A globally-unique operation id: a Lamport counter plus its replica. Ordered
-lexicographically by `(counter, replica)`.
+{-| A globally-unique id for a single recorded operation. You get these back as handles
+to things inside a document (tree item ids, cursor anchors); the library mints them, you
+read and compare them.
 -}
-type OpId
-    = OpId Int ReplicaId
+type alias OpId =
+    I.OpId
 
 
-{-| Construct an `OpId` from a counter and replica.
--}
-opId : Int -> ReplicaId -> OpId
-opId =
-    OpId
-
-
-{-| The Lamport counter component.
+{-| The counter part of an `OpId`.
 -}
 opIdCounter : OpId -> Int
-opIdCounter (OpId c _) =
-    c
+opIdCounter =
+    I.opIdCounter
 
 
-{-| The replica component.
+{-| The replica that minted an `OpId`.
 -}
 opIdReplica : OpId -> ReplicaId
-opIdReplica (OpId _ r) =
-    r
+opIdReplica =
+    I.opIdReplica
 
 
-{-| Total order on `OpId`s: by counter, then by replica id as a tiebreak. This
-is the LWW winner rule and the RGA sibling-ordering rule.
+{-| A total order on `OpId`s — by counter, then replica as a tiebreak. Handy if you keep
+your own sorted structure keyed by id.
 -}
 compareOpId : OpId -> OpId -> Order
-compareOpId (OpId c1 r1) (OpId c2 r2) =
-    case compare c1 c2 of
-        EQ ->
-            compareReplica r1 r2
-
-        other ->
-            other
+compareOpId =
+    I.compareOpId
 
 
-{-| A stable string form, used as a `Dict` key for collections (so structural
-equality is a sound convergence oracle).
+{-| A stable string form of an `OpId`, suitable as a `Dict` key (`"3@alice"`).
 -}
 opIdToString : OpId -> String
-opIdToString (OpId c (ReplicaId r)) =
-    String.fromInt c ++ "@" ++ r
-
-
-{-| A Lamport clock value.
--}
-type alias Clock =
-    Int
-
-
-{-| The mutable context threaded through constructors and edits: which replica
-we are, and the next counter value to hand out.
--}
-type Ctx
-    = Ctx ReplicaId Clock
-
-
-{-| Build a fresh context for a replica (clock starts at 0).
--}
-ctx : ReplicaId -> Ctx
-ctx r =
-    Ctx r 0
-
-
-{-| The current clock value.
--}
-ctxClock : Ctx -> Clock
-ctxClock (Ctx _ c) =
-    c
-
-
-{-| The replica owning this context.
--}
-ctxReplica : Ctx -> ReplicaId
-ctxReplica (Ctx r _) =
-    r
-
-
-{-| Mint a fresh `OpId` and advance the clock. The new id uses the _incremented_
-counter so ids are strictly increasing per replica.
--}
-nextId : Ctx -> ( OpId, Ctx )
-nextId (Ctx r c) =
-    let
-        next =
-            c + 1
-    in
-    ( OpId next r, Ctx r next )
-
-
-{-| Advance the clock past a counter value seen during a merge, so subsequent
-local edits never collide with ids minted elsewhere. Lamport's rule.
--}
-observe : Int -> Ctx -> Ctx
-observe seen (Ctx r c) =
-    Ctx r (max c seen)
+opIdToString =
+    I.opIdToString

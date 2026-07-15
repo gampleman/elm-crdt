@@ -1,6 +1,6 @@
-module OpDocTests exposing (suite)
+module DocTests exposing (suite)
 
-{-| Phase 1 tail: the op-log driven through its **public** surface (`Crdt.OpDoc`)
+{-| Phase 1 tail: the op-log driven through its **public** surface (`Crdt.Doc`)
 — init, path-addressed edits that emit ops, op-store `merge`, and `read`.
 
 This is the op-model counterpart of the state-based `ConvergenceTests`: the same
@@ -10,8 +10,8 @@ the index-addressed public API and is resolved to position-independent ops.
 
 -}
 
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
 import Crdt.Schema.Internal as S exposing (Crdt)
 import Dict
@@ -79,24 +79,24 @@ notesPath =
     Path.root |> Path.field "notes"
 
 
-initDoc : String -> OpDoc Board
+initDoc : String -> Doc Board
 initDoc name =
-    OpDoc.init (Id.replica name) schema
+    Doc.init (Id.replica name) schema
 
 
-ok : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
+ok : Doc Board -> Result Doc.Error (Doc Board) -> Doc Board
 ok fallback =
     Result.withDefault fallback
 
 
-read : OpDoc Board -> Result S.Error Board
+read : Doc Board -> Result S.Error Board
 read =
-    OpDoc.read
+    Doc.read
 
 
 suite : Test
 suite =
-    describe "OpDoc — op-log through the public API"
+    describe "Doc — op-log through the public API"
         [ test "fresh doc reads as the empty typed value" <|
             \_ ->
                 read (initDoc "alice")
@@ -108,10 +108,10 @@ suite =
                         initDoc "alice"
 
                     a1 =
-                        OpDoc.setInt (Path.root |> Path.field "revision") 7 a |> ok a
+                        Doc.setInt (Path.root |> Path.field "revision") 7 a |> ok a
 
                     a2 =
-                        OpDoc.setString (Path.root |> Path.field "owner") "alice" a1 |> ok a1
+                        Doc.setString (Path.root |> Path.field "owner") "alice" a1 |> ok a1
                 in
                 read a2
                     |> Result.map (\b -> ( b.revision, b.owner ))
@@ -123,7 +123,7 @@ suite =
                         initDoc "alice"
 
                     a1 =
-                        OpDoc.setText titlePath "Trip" a |> ok a
+                        Doc.setText titlePath "Trip" a |> ok a
                 in
                 read a1 |> Result.map .title |> Expect.equal (Ok "Trip")
         , test "incremental text edits accumulate (insert into the middle)" <|
@@ -133,50 +133,50 @@ suite =
                         initDoc "alice"
 
                     a1 =
-                        OpDoc.setText titlePath "Tip" a |> ok a
+                        Doc.setText titlePath "Tip" a |> ok a
 
                     a2 =
-                        OpDoc.setText titlePath "Trip" a1 |> ok a1
+                        Doc.setText titlePath "Trip" a1 |> ok a1
                 in
                 read a2 |> Result.map .title |> Expect.equal (Ok "Trip")
         , test "concurrent title edits from two replicas converge (same both merge orders)" <|
             \_ ->
                 let
                     a =
-                        OpDoc.setText titlePath "Trip plan" (initDoc "alice") |> ok (initDoc "alice")
+                        Doc.setText titlePath "Trip plan" (initDoc "alice") |> ok (initDoc "alice")
 
                     b =
-                        OpDoc.setText titlePath "Trip" (initDoc "bob") |> ok (initDoc "bob")
+                        Doc.setText titlePath "Trip" (initDoc "bob") |> ok (initDoc "bob")
                 in
                 Expect.equal
-                    (read (OpDoc.merge a b))
-                    (read (OpDoc.merge b a))
+                    (read (Doc.merge a b))
+                    (read (Doc.merge b a))
         , test "concurrent list appends: both todos survive" <|
             \_ ->
                 let
                     a =
-                        OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) (initDoc "alice")
+                        Doc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) (initDoc "alice")
                             |> ok (initDoc "alice")
 
                     b =
-                        OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "tickets" False)) (initDoc "bob")
+                        Doc.listAppend todosPath (todoSchema |> S.with (Todo "tickets" False)) (initDoc "bob")
                             |> ok (initDoc "bob")
                 in
-                read (OpDoc.merge a b)
+                read (Doc.merge a b)
                     |> Result.map (.todos >> List.length)
                     |> Expect.equal (Ok 2)
         , test "list append is commutative on the read value" <|
             \_ ->
                 let
                     a =
-                        OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "a" False)) (initDoc "alice")
+                        Doc.listAppend todosPath (todoSchema |> S.with (Todo "a" False)) (initDoc "alice")
                             |> ok (initDoc "alice")
 
                     b =
-                        OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "b" True)) (initDoc "bob")
+                        Doc.listAppend todosPath (todoSchema |> S.with (Todo "b" True)) (initDoc "bob")
                             |> ok (initDoc "bob")
                 in
-                Expect.equal (read (OpDoc.merge a b)) (read (OpDoc.merge b a))
+                Expect.equal (read (Doc.merge a b)) (read (Doc.merge b a))
         , test "append fast-path: a run of appends reads back in append order" <|
             \_ ->
                 let
@@ -186,7 +186,7 @@ suite =
                     doc =
                         List.foldl
                             (\label d ->
-                                OpDoc.listAppend todosPath (todoSchema |> S.with (Todo label False)) d |> ok d
+                                Doc.listAppend todosPath (todoSchema |> S.with (Todo label False)) d |> ok d
                             )
                             (initDoc "alice")
                             labels
@@ -198,10 +198,10 @@ suite =
             \_ ->
                 let
                     titleEdit d =
-                        OpDoc.setText titlePath "x" d |> ok d
+                        Doc.setText titlePath "x" d |> ok d
 
                     appendTodo label d =
-                        OpDoc.listAppend todosPath (todoSchema |> S.with (Todo label False)) d |> ok d
+                        Doc.listAppend todosPath (todoSchema |> S.with (Todo label False)) d |> ok d
 
                     -- interleave a non-append edit between appends, which clears
                     -- the fast-path; order must still be correct
@@ -221,7 +221,7 @@ suite =
             \_ ->
                 let
                     appendTodo label d =
-                        OpDoc.listAppend todosPath (todoSchema |> S.with (Todo label False)) d |> ok d
+                        Doc.listAppend todosPath (todoSchema |> S.with (Todo label False)) d |> ok d
 
                     a =
                         initDoc "alice" |> appendTodo "a1" |> appendTodo "a2"
@@ -232,7 +232,7 @@ suite =
                     -- after merging in bob's op, alice appends again; the new
                     -- item must still read at the tail and both orders converge
                     merged =
-                        OpDoc.merge a b |> appendTodo "a3"
+                        Doc.merge a b |> appendTodo "a3"
                 in
                 Expect.all
                     [ \_ ->
@@ -250,14 +250,14 @@ suite =
             \_ ->
                 let
                     a =
-                        OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "x" False)) (initDoc "alice")
+                        Doc.listAppend todosPath (todoSchema |> S.with (Todo "x" False)) (initDoc "alice")
                             |> ok (initDoc "alice")
 
                     donePath =
                         Path.root |> Path.field "todos" |> Path.index 0 |> Path.field "done"
 
                     a1 =
-                        OpDoc.setBool donePath True a |> ok a
+                        Doc.setBool donePath True a |> ok a
                 in
                 read a1
                     |> Result.map (.todos >> List.map .done)
@@ -267,10 +267,10 @@ suite =
                 let
                     a =
                         initDoc "alice"
-                            |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "x" False)) d |> ok d)
+                            |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "x" False)) d |> ok d)
 
                     a1 =
-                        OpDoc.listRemove todosPath 0 a |> ok a
+                        Doc.listRemove todosPath 0 a |> ok a
                 in
                 read a1 |> Result.map (.todos >> List.length) |> Expect.equal (Ok 0)
         , test "dict setKey / removeKey round-trip with LWW presence" <|
@@ -280,10 +280,10 @@ suite =
                         initDoc "alice"
 
                     withKey =
-                        OpDoc.setKey notesPath "g" (S.text |> S.with "milk") a |> ok a
+                        Doc.setKey notesPath "g" (S.text |> S.with "milk") a |> ok a
 
                     removed =
-                        OpDoc.removeKey notesPath "g" withKey |> ok withKey
+                        Doc.removeKey notesPath "g" withKey |> ok withKey
                 in
                 Expect.all
                     [ \_ -> read withKey |> Result.map (.notes >> Dict.get "g") |> Expect.equal (Ok (Just "milk"))
@@ -294,18 +294,18 @@ suite =
             \_ ->
                 let
                     a =
-                        OpDoc.setText titlePath "Hi" (initDoc "alice") |> ok (initDoc "alice")
+                        Doc.setText titlePath "Hi" (initDoc "alice") |> ok (initDoc "alice")
                 in
                 -- "Hi" => two character-insert ops
-                OpDoc.opCount a |> Expect.equal 2
+                Doc.opCount a |> Expect.equal 2
         , test "edit on a non-existent field reports PathNotFound" <|
             \_ ->
                 let
                     badPath =
                         Path.root |> Path.field "nope"
                 in
-                case OpDoc.setText badPath "x" (initDoc "alice") of
-                    Err (OpDoc.PathNotFound msg) ->
+                case Doc.setText badPath "x" (initDoc "alice") of
+                    Err (Doc.PathNotFound msg) ->
                         Expect.equal True (String.contains "nope" msg)
 
                     _ ->
@@ -317,8 +317,8 @@ suite =
                     listAsText =
                         Path.root |> Path.field "todos"
                 in
-                case OpDoc.setText listAsText "x" (initDoc "alice") of
-                    Err (OpDoc.WrongNodeType msg) ->
+                case Doc.setText listAsText "x" (initDoc "alice") of
+                    Err (Doc.WrongNodeType msg) ->
                         Expect.equal True (String.contains "text" msg)
 
                     _ ->
@@ -331,56 +331,56 @@ suite =
 
                     doc =
                         initDoc "alice"
-                            |> (\d -> OpDoc.setText titlePath "Trip" d |> ok d)
-                            |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) d |> ok d)
-                            |> (\d -> OpDoc.setText titlePath "Trip plan" d |> ok d)
-                            |> (\d -> OpDoc.setBool donePath True d |> ok d)
-                            |> (\d -> OpDoc.setKey notesPath "n" (S.text |> S.with "hi") d |> ok d)
+                            |> (\d -> Doc.setText titlePath "Trip" d |> ok d)
+                            |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) d |> ok d)
+                            |> (\d -> Doc.setText titlePath "Trip plan" d |> ok d)
+                            |> (\d -> Doc.setBool donePath True d |> ok d)
+                            |> (\d -> Doc.setKey notesPath "n" (S.text |> S.with "hi") d |> ok d)
                 in
-                OpDoc.cacheConsistent doc |> Expect.equal True
+                Doc.cacheConsistent doc |> Expect.equal True
         , test "cache invariant: cache equals a full re-fold after a merge" <|
             \_ ->
                 let
                     a =
                         initDoc "alice"
-                            |> (\d -> OpDoc.setText titlePath "Trip" d |> ok d)
-                            |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) d |> ok d)
+                            |> (\d -> Doc.setText titlePath "Trip" d |> ok d)
+                            |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) d |> ok d)
 
                     b =
                         initDoc "bob"
-                            |> (\d -> OpDoc.setText titlePath "Tour" d |> ok d)
-                            |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "map" True)) d |> ok d)
+                            |> (\d -> Doc.setText titlePath "Tour" d |> ok d)
+                            |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "map" True)) d |> ok d)
 
                     merged =
-                        OpDoc.merge a b
+                        Doc.merge a b
                 in
-                OpDoc.cacheConsistent merged |> Expect.equal True
+                Doc.cacheConsistent merged |> Expect.equal True
         , test "cache invariant holds across edit-then-merge-then-edit" <|
             \_ ->
                 let
                     a =
-                        initDoc "alice" |> (\d -> OpDoc.setText titlePath "A" d |> ok d)
+                        initDoc "alice" |> (\d -> Doc.setText titlePath "A" d |> ok d)
 
                     b =
-                        initDoc "bob" |> (\d -> OpDoc.setText titlePath "B" d |> ok d)
+                        initDoc "bob" |> (\d -> Doc.setText titlePath "B" d |> ok d)
 
                     doc =
-                        OpDoc.merge a b
-                            |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "after-merge" False)) d |> ok d)
+                        Doc.merge a b
+                            |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "after-merge" False)) d |> ok d)
                 in
-                OpDoc.cacheConsistent doc |> Expect.equal True
+                Doc.cacheConsistent doc |> Expect.equal True
         , test "concurrent edits to different fields both land after merge" <|
             \_ ->
                 let
                     -- alice edits the title; bob adds a note — fully concurrent
                     a =
-                        OpDoc.setText titlePath "Plan" (initDoc "alice") |> ok (initDoc "alice")
+                        Doc.setText titlePath "Plan" (initDoc "alice") |> ok (initDoc "alice")
 
                     b =
-                        OpDoc.setKey notesPath "n" (S.text |> S.with "hi") (initDoc "bob") |> ok (initDoc "bob")
+                        Doc.setKey notesPath "n" (S.text |> S.with "hi") (initDoc "bob") |> ok (initDoc "bob")
 
                     merged =
-                        OpDoc.merge a b
+                        Doc.merge a b
                 in
                 Expect.all
                     [ \_ -> read merged |> Result.map .title |> Expect.equal (Ok "Plan")
@@ -393,14 +393,14 @@ suite =
                     let
                         alice =
                             initDoc "alice"
-                                |> (\d -> OpDoc.setText titlePath "Trip" d |> ok d)
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) d |> ok d)
-                                |> (\d -> OpDoc.setKey notesPath "n" (S.text |> S.with "hi") d |> ok d)
+                                |> (\d -> Doc.setText titlePath "Trip" d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "pack" False)) d |> ok d)
+                                |> (\d -> Doc.setKey notesPath "n" (S.text |> S.with "hi") d |> ok d)
 
                         -- ship alice's ops to a fresh bob over JSON
                         bob =
                             initDoc "bob"
-                                |> OpDoc.decodeInto (OpDoc.encode alice)
+                                |> Doc.decodeInto (Doc.encode alice)
                                 |> Result.withDefault (initDoc "bob")
                     in
                     Expect.equal (read alice) (read bob)
@@ -409,15 +409,15 @@ suite =
                     let
                         alice =
                             initDoc "alice"
-                                |> (\d -> OpDoc.setText titlePath "x" d |> ok d)
+                                |> (\d -> Doc.setText titlePath "x" d |> ok d)
 
                         json =
-                            OpDoc.encode alice
+                            Doc.encode alice
 
                         bob =
                             initDoc "bob"
-                                |> OpDoc.decodeInto json
-                                |> Result.andThen (OpDoc.decodeInto json)
+                                |> Doc.decodeInto json
+                                |> Result.andThen (Doc.decodeInto json)
                                 |> Result.withDefault (initDoc "bob")
                     in
                     Expect.equal (read alice) (read bob)
@@ -425,16 +425,16 @@ suite =
                 \_ ->
                     let
                         a =
-                            initDoc "alice" |> (\d -> OpDoc.setText titlePath "A" d |> ok d)
+                            initDoc "alice" |> (\d -> Doc.setText titlePath "A" d |> ok d)
 
                         b =
-                            initDoc "bob" |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "b" False)) d |> ok d)
+                            initDoc "bob" |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "b" False)) d |> ok d)
 
                         aGetsB =
-                            a |> OpDoc.decodeInto (OpDoc.encode b) |> Result.withDefault a
+                            a |> Doc.decodeInto (Doc.encode b) |> Result.withDefault a
 
                         bGetsA =
-                            b |> OpDoc.decodeInto (OpDoc.encode a) |> Result.withDefault b
+                            b |> Doc.decodeInto (Doc.encode a) |> Result.withDefault b
                     in
                     Expect.equal (read aGetsB) (read bGetsA)
             , test "B can edit a register inside a todo A created (clock advances past seed stamps)" <|
@@ -445,7 +445,7 @@ suite =
                         -- seed is built after the elemId is minted).
                         a =
                             initDoc "alice"
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "from-alice" False)) d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "from-alice" False)) d |> ok d)
 
                         -- B receives the op and immediately toggles `done`. B's new
                         -- stamp must beat the seeded `done` stamp, or the toggle is
@@ -455,9 +455,9 @@ suite =
 
                         b =
                             initDoc "bob"
-                                |> OpDoc.decodeInto (OpDoc.encode a)
+                                |> Doc.decodeInto (Doc.encode a)
                                 |> Result.withDefault (initDoc "bob")
-                                |> (\d -> OpDoc.setBool donePath True d |> ok d)
+                                |> (\d -> Doc.setBool donePath True d |> ok d)
                     in
                     read b
                         |> Result.map (.todos >> List.map .done)
@@ -469,9 +469,9 @@ suite =
                     let
                         doc =
                             initDoc "alice"
-                                |> (\d -> OpDoc.increment votesPath 1 d |> ok d)
-                                |> (\d -> OpDoc.increment votesPath 1 d |> ok d)
-                                |> (\d -> OpDoc.increment votesPath 3 d |> ok d)
+                                |> (\d -> Doc.increment votesPath 1 d |> ok d)
+                                |> (\d -> Doc.increment votesPath 1 d |> ok d)
+                                |> (\d -> Doc.increment votesPath 3 d |> ok d)
                     in
                     read doc |> Result.map .votes |> Expect.equal (Ok 5)
             , test "decrement with a negative delta" <|
@@ -479,8 +479,8 @@ suite =
                     let
                         doc =
                             initDoc "alice"
-                                |> (\d -> OpDoc.increment votesPath 10 d |> ok d)
-                                |> (\d -> OpDoc.increment votesPath -4 d |> ok d)
+                                |> (\d -> Doc.increment votesPath 10 d |> ok d)
+                                |> (\d -> Doc.increment votesPath -4 d |> ok d)
                     in
                     read doc |> Result.map .votes |> Expect.equal (Ok 6)
             , test "concurrent increments SUM (the whole point — not LWW)" <|
@@ -488,13 +488,13 @@ suite =
                     let
                         -- both start empty, each increments once, concurrently
                         a =
-                            initDoc "alice" |> (\d -> OpDoc.increment votesPath 1 d |> ok d)
+                            initDoc "alice" |> (\d -> Doc.increment votesPath 1 d |> ok d)
 
                         b =
-                            initDoc "bob" |> (\d -> OpDoc.increment votesPath 1 d |> ok d)
+                            initDoc "bob" |> (\d -> Doc.increment votesPath 1 d |> ok d)
 
                         merged =
-                            OpDoc.merge a b
+                            Doc.merge a b
                     in
                     -- an LWW register would read 1 here; a counter reads 2
                     read merged |> Result.map .votes |> Expect.equal (Ok 2)
@@ -502,24 +502,24 @@ suite =
                 \_ ->
                     let
                         a =
-                            initDoc "alice" |> (\d -> OpDoc.increment votesPath 5 d |> ok d)
+                            initDoc "alice" |> (\d -> Doc.increment votesPath 5 d |> ok d)
 
                         b =
-                            initDoc "bob" |> (\d -> OpDoc.increment votesPath 7 d |> ok d)
+                            initDoc "bob" |> (\d -> Doc.increment votesPath 7 d |> ok d)
                     in
                     Expect.equal
-                        (read (OpDoc.merge a b))
-                        (read (OpDoc.merge b a))
+                        (read (Doc.merge a b))
+                        (read (Doc.merge b a))
             , test "counter increments survive the JSON wire round-trip and sum" <|
                 \_ ->
                     let
                         a =
-                            initDoc "alice" |> (\d -> OpDoc.increment votesPath 2 d |> ok d)
+                            initDoc "alice" |> (\d -> Doc.increment votesPath 2 d |> ok d)
 
                         b =
                             initDoc "bob"
-                                |> (\d -> OpDoc.increment votesPath 3 d |> ok d)
-                                |> OpDoc.decodeInto (OpDoc.encode a)
+                                |> (\d -> Doc.increment votesPath 3 d |> ok d)
+                                |> Doc.decodeInto (Doc.encode a)
                                 |> Result.withDefault (initDoc "bob")
                     in
                     read b |> Result.map .votes |> Expect.equal (Ok 5)
@@ -531,26 +531,26 @@ suite =
                         -- bob is at some shared point, captures his version
                         shared =
                             initDoc "alice"
-                                |> (\d -> OpDoc.setText titlePath "shared" d |> ok d)
+                                |> (\d -> Doc.setText titlePath "shared" d |> ok d)
 
                         bob =
                             initDoc "bob"
-                                |> OpDoc.decodeInto (OpDoc.encode shared)
+                                |> Doc.decodeInto (Doc.encode shared)
                                 |> Result.withDefault (initDoc "bob")
 
                         bobVersion =
-                            OpDoc.version bob
+                            Doc.version bob
 
                         -- alice (continuing from shared) makes more edits
                         alice2 =
                             shared
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "x" False)) d |> ok d)
-                                |> (\d -> OpDoc.setText titlePath "shared!" d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "x" False)) d |> ok d)
+                                |> (\d -> Doc.setText titlePath "shared!" d |> ok d)
 
                         -- ship ONLY the delta bob is missing
                         bob2 =
                             bob
-                                |> OpDoc.decodeInto (OpDoc.encodeSince bobVersion alice2)
+                                |> Doc.decodeInto (Doc.encodeSince bobVersion alice2)
                                 |> Result.withDefault bob
                     in
                     Expect.equal (read alice2) (read bob2)
@@ -561,18 +561,18 @@ suite =
                             initDoc "bob"
 
                         bobVersion =
-                            OpDoc.version bob0
+                            Doc.version bob0
 
                         alice =
                             initDoc "alice"
-                                |> (\d -> OpDoc.setText titlePath "T" d |> ok d)
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "t" True)) d |> ok d)
+                                |> (\d -> Doc.setText titlePath "T" d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "t" True)) d |> ok d)
 
                         viaDelta =
-                            bob0 |> OpDoc.decodeInto (OpDoc.encodeSince bobVersion alice) |> Result.withDefault bob0
+                            bob0 |> Doc.decodeInto (Doc.encodeSince bobVersion alice) |> Result.withDefault bob0
 
                         viaFull =
-                            bob0 |> OpDoc.decodeInto (OpDoc.encode alice) |> Result.withDefault bob0
+                            bob0 |> Doc.decodeInto (Doc.encode alice) |> Result.withDefault bob0
                     in
                     Expect.equal (read viaDelta) (read viaFull)
             , test "delta to a fully-caught-up peer is empty (nothing to send)" <|
@@ -580,21 +580,21 @@ suite =
                     let
                         alice =
                             initDoc "alice"
-                                |> (\d -> OpDoc.setText titlePath "done" d |> ok d)
+                                |> (\d -> Doc.setText titlePath "done" d |> ok d)
 
                         -- bob has everything alice has
                         bob =
                             initDoc "bob"
-                                |> OpDoc.decodeInto (OpDoc.encode alice)
+                                |> Doc.decodeInto (Doc.encode alice)
                                 |> Result.withDefault (initDoc "bob")
 
                         -- a delta since alice's own current version carries no ops
                         deltaJson =
-                            OpDoc.encodeSince (OpDoc.version alice) alice
+                            Doc.encodeSince (Doc.version alice) alice
 
                         -- decoding an empty delta changes nothing
                         bob2 =
-                            bob |> OpDoc.decodeInto deltaJson |> Result.withDefault bob
+                            bob |> Doc.decodeInto deltaJson |> Result.withDefault bob
                     in
                     Expect.equal (read bob) (read bob2)
             ]
@@ -604,21 +604,21 @@ suite =
                     let
                         doc =
                             initDoc "alice"
-                                |> (\d -> OpDoc.setText titlePath "v1" d |> ok d)
-                                |> OpDoc.checkpoint "first draft"
-                                |> (\d -> OpDoc.setText titlePath "v2" d |> ok d)
+                                |> (\d -> Doc.setText titlePath "v1" d |> ok d)
+                                |> Doc.checkpoint "first draft"
+                                |> (\d -> Doc.setText titlePath "v2" d |> ok d)
 
                         saved =
-                            OpDoc.checkpoints doc |> List.head
+                            Doc.checkpoints doc |> List.head
                     in
                     case saved of
                         Just cp ->
                             Expect.all
-                                [ \_ -> OpDoc.checkpointMessage cp |> Expect.equal "first draft"
-                                , \_ -> OpDoc.checkpointAuthor cp |> Expect.equal (Id.replica "alice")
+                                [ \_ -> Doc.checkpointMessage cp |> Expect.equal "first draft"
+                                , \_ -> Doc.checkpointAuthor cp |> Expect.equal (Id.replica "alice")
                                 , -- reading at the checkpoint shows the state when it was saved
                                   \_ ->
-                                    OpDoc.readAt (OpDoc.checkpointVersion cp) doc
+                                    Doc.readAt (Doc.checkpointVersion cp) doc
                                         |> Result.map .title
                                         |> Expect.equal (Ok "v1")
                                 , -- the live doc has moved on
@@ -632,22 +632,22 @@ suite =
                 \_ ->
                     let
                         before =
-                            initDoc "alice" |> (\d -> OpDoc.setText titlePath "x" d |> ok d)
+                            initDoc "alice" |> (\d -> Doc.setText titlePath "x" d |> ok d)
 
                         after =
                             before
-                                |> OpDoc.checkpoint "one"
-                                |> OpDoc.checkpoint "two"
+                                |> Doc.checkpoint "one"
+                                |> Doc.checkpoint "two"
                     in
                     Expect.all
                         [ \_ ->
-                            OpDoc.checkpoints after
-                                |> List.map OpDoc.checkpointMessage
+                            Doc.checkpoints after
+                                |> List.map Doc.checkpointMessage
                                 |> Expect.equal [ "two", "one" ]
                         , -- checkpointing emits no ops, so the op count is unchanged
                           \_ ->
-                            OpDoc.opCount after
-                                |> Expect.equal (OpDoc.opCount before)
+                            Doc.opCount after
+                                |> Expect.equal (Doc.opCount before)
                         ]
                         ()
             ]
@@ -656,17 +656,17 @@ suite =
                 \_ ->
                     let
                         v1 =
-                            initDoc "alice" |> (\d -> OpDoc.setText titlePath "draft" d |> ok d)
+                            initDoc "alice" |> (\d -> Doc.setText titlePath "draft" d |> ok d)
 
                         atDraft =
-                            OpDoc.version v1
+                            Doc.version v1
 
                         v2 =
-                            OpDoc.setText titlePath "final" v1 |> ok v1
+                            Doc.setText titlePath "final" v1 |> ok v1
                     in
                     Expect.all
                         [ -- time-travel to the captured version shows the old value
-                          \_ -> OpDoc.readAt atDraft v2 |> Result.map .title |> Expect.equal (Ok "draft")
+                          \_ -> Doc.readAt atDraft v2 |> Result.map .title |> Expect.equal (Ok "draft")
                         , -- the live document still has the latest
                           \_ -> read v2 |> Result.map .title |> Expect.equal (Ok "final")
                         ]
@@ -676,18 +676,18 @@ suite =
                     let
                         base =
                             initDoc "alice"
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "first" False)) d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "first" False)) d |> ok d)
 
                         v =
-                            OpDoc.version base
+                            Doc.version base
 
                         later =
                             base
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "second" False)) d |> ok d)
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "third" False)) d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "second" False)) d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "third" False)) d |> ok d)
                     in
                     Expect.all
-                        [ \_ -> OpDoc.readAt v later |> Result.map (.todos >> List.length) |> Expect.equal (Ok 1)
+                        [ \_ -> Doc.readAt v later |> Result.map (.todos >> List.length) |> Expect.equal (Ok 1)
                         , \_ -> read later |> Result.map (.todos >> List.length) |> Expect.equal (Ok 3)
                         ]
                         ()
@@ -698,24 +698,24 @@ suite =
                         -- arrives by merge and alice keeps editing
                         alice0 =
                             initDoc "alice"
-                                |> (\d -> OpDoc.setText titlePath "shared" d |> ok d)
+                                |> (\d -> Doc.setText titlePath "shared" d |> ok d)
 
                         vShared =
-                            OpDoc.version alice0
+                            Doc.version alice0
 
                         bob =
                             initDoc "bob"
-                                |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "bob-todo" False)) d |> ok d)
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "bob-todo" False)) d |> ok d)
 
                         merged =
-                            OpDoc.merge alice0 bob
-                                |> (\d -> OpDoc.setText titlePath "shared+" d |> ok d)
+                            Doc.merge alice0 bob
+                                |> (\d -> Doc.setText titlePath "shared+" d |> ok d)
                     in
                     Expect.all
                         [ -- checkout of the pre-merge version sees neither bob's
                           -- concurrent todo nor alice's later title edit
-                          \_ -> OpDoc.readAt vShared merged |> Result.map .title |> Expect.equal (Ok "shared")
-                        , \_ -> OpDoc.readAt vShared merged |> Result.map (.todos >> List.length) |> Expect.equal (Ok 0)
+                          \_ -> Doc.readAt vShared merged |> Result.map .title |> Expect.equal (Ok "shared")
+                        , \_ -> Doc.readAt vShared merged |> Result.map (.todos >> List.length) |> Expect.equal (Ok 0)
                         , -- the live document has everything
                           \_ -> read merged |> Result.map .title |> Expect.equal (Ok "shared+")
                         , \_ -> read merged |> Result.map (.todos >> List.length) |> Expect.equal (Ok 1)

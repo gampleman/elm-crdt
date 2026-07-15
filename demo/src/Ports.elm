@@ -1,6 +1,9 @@
 port module Ports exposing
-    ( connection, incoming, outgoing
-    , renderRichText, richTextInput
+    ( connection
+    , incoming
+    , outgoing
+    , renderRichText
+    , richTextInput
     )
 
 {-| The library is pure Elm and knows nothing about the network. All transport
@@ -10,6 +13,7 @@ ship them over a WebSocket (see `index.js` + `server/relay.js`).
 The rich-text ports bridge Elm to a ProseMirror editor (TipTap) hosted in a
 `<crdt-richtext>` custom element: `renderRichText` pushes the current spans down
 for the editor to display, and `richTextInput` carries user edit intents back up.
+
 -}
 
 import Json.Decode as JD

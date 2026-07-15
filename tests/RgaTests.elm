@@ -4,7 +4,7 @@ module RgaTests exposing (suite)
 tombstone semantics, and the classic concurrent-insert-at-same-origin case.
 -}
 
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
 import Expect

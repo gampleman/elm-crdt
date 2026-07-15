@@ -1,14 +1,13 @@
 module TreeTests exposing (suite)
 
-{-| The movable tree through the **public API**: `S.tree` schema, `Crdt.Ref` edits
+{-| The movable tree through the **public API**: `C.tree` schema, `Crdt.Ref` edits
 (`addChild`/`moveInto`/`moveBefore`/`moveAfter`/`removeNode`, per-node payload
 refs), read back as a `Crdt.Tree.Forest`, and synced through the op-log wire.
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc as Doc exposing (Doc)
 import Crdt.Id as Id exposing (OpId)
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
-import Crdt.Ref as Ref exposing (Ref)
-import Crdt.Schema as S
 import Crdt.Tree as Tree
 import Expect
 import Test exposing (Test, describe, test)
@@ -21,29 +20,29 @@ type alias Item =
 
 
 type alias ItemRefs =
-    { label : Ref Item S.Settable String }
+    { label : Ref Item C.Settable String }
 
 
-itemDoc : Ref.RecordRefs Item ItemRefs
+itemDoc : C.RecordRefs Item ItemRefs
 itemDoc =
-    Ref.record Item ItemRefs
-        |> Ref.field "label" .label S.text
-        |> Ref.build
+    C.record Item ItemRefs
+        |> C.field "label" .label C.text
+        |> C.build
 
 
-type alias Doc =
+type alias Sample =
     { outline : Tree.Forest Item }
 
 
 type alias DocRefs =
-    { outline : Ref Doc (S.TreeK S.Nested Item) (Tree.Forest Item) }
+    { outline : Ref Sample (C.TreeK C.Nested Item) (Tree.Forest Item) }
 
 
-boardDoc : Ref.RecordRefs Doc DocRefs
+boardDoc : C.RecordRefs Sample DocRefs
 boardDoc =
-    Ref.record Doc DocRefs
-        |> Ref.field "outline" .outline (S.tree itemDoc.schema)
-        |> Ref.build
+    C.record Sample DocRefs
+        |> C.field "outline" .outline (C.tree itemDoc.schema)
+        |> C.build
 
 
 refs : DocRefs
@@ -51,19 +50,19 @@ refs =
     boardDoc.refs
 
 
-init : String -> OpDoc Doc
+init : String -> Doc Sample
 init name =
-    OpDoc.init (Id.replica name) boardDoc.schema
+    C.init (Id.replica name) boardDoc.schema
 
 
-ok : OpDoc Doc -> Result OpDoc.Error (OpDoc Doc) -> OpDoc Doc
+ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
-read : OpDoc Doc -> Tree.Forest Item
+read : Doc Sample -> Tree.Forest Item
 read doc =
-    OpDoc.read doc |> Result.map .outline |> Result.withDefault []
+    C.read doc |> Result.map .outline |> Result.withDefault []
 
 
 {-| Flat bracketed render of a forest, e.g. `A[A1] B`, for single-`Expect.equal`
@@ -93,34 +92,34 @@ shape forest =
 {-| Add a root node, returning its id + the new doc. (We read the id back from the
 forest by matching the label, since add doesn't return it.)
 -}
-addRoot : String -> OpDoc Doc -> ( Maybe OpId, OpDoc Doc )
+addRoot : String -> Doc Sample -> ( Maybe OpId, Doc Sample )
 addRoot label doc =
     let
         doc1 =
-            Ref.addChild itemDoc.schema (Item label) Nothing refs.outline doc |> ok doc
+            C.addChild itemDoc.schema (Item label) Nothing refs.outline doc |> ok doc
     in
     ( findId label doc1, doc1 )
 
 
-addUnder : String -> OpId -> OpDoc Doc -> ( Maybe OpId, OpDoc Doc )
+addUnder : String -> OpId -> Doc Sample -> ( Maybe OpId, Doc Sample )
 addUnder label parent doc =
     let
         doc1 =
-            Ref.addChild itemDoc.schema (Item label) (Just parent) refs.outline doc |> ok doc
+            C.addChild itemDoc.schema (Item label) (Just parent) refs.outline doc |> ok doc
     in
     ( findId label doc1, doc1 )
 
 
 {-| Run one outline edit bracketed as a single undo step (as the demo does).
 -}
-tracked : (OpDoc Doc -> Result OpDoc.Error (OpDoc Doc)) -> OpDoc Doc -> OpDoc Doc
+tracked : (Doc Sample -> Result C.EditError (Doc Sample)) -> Doc Sample -> Doc Sample
 tracked edit doc =
-    OpDoc.recordEdit (OpDoc.version doc) (edit doc |> ok doc)
+    Doc.recordEdit (Doc.version doc) (edit doc |> ok doc)
 
 
 {-| Find a node's id by its (unique) label, searching the whole forest.
 -}
-findId : String -> OpDoc Doc -> Maybe OpId
+findId : String -> Doc Sample -> Maybe OpId
 findId label doc =
     let
         go forest =
@@ -139,7 +138,7 @@ findId label doc =
 
 suite : Test
 suite =
-    describe "Tree — public API (S.tree + Crdt.Ref)"
+    describe "Tree — public API (C.tree + Crdt.Ref)"
         [ test "fresh tree is empty" <|
             \_ ->
                 shape (read (init "a")) |> Expect.equal ""
@@ -175,7 +174,7 @@ suite =
                     d3 =
                         case ( mA, mB ) of
                             ( Just aId, Just bId ) ->
-                                Ref.moveInto bId (Just aId) refs.outline d2 |> ok d2
+                                C.moveInto bId (Just aId) refs.outline d2 |> ok d2
 
                             _ ->
                                 d2
@@ -191,7 +190,7 @@ suite =
                     Just aId ->
                         let
                             d2 =
-                                Ref.set (refs.outline |> Ref.treeNode aId itemDoc.schema |> Ref.at itemDoc.refs.label) "A!" d1
+                                C.set (refs.outline |> C.treeNode aId itemDoc.schema |> C.at itemDoc.refs.label) "A!" d1
                                     |> ok d1
                         in
                         shape (read d2) |> Expect.equal "A!"
@@ -215,7 +214,7 @@ suite =
                     d3 =
                         case mA of
                             Just aId ->
-                                Ref.removeNode aId refs.outline d2 |> ok d2
+                                C.removeNode aId refs.outline d2 |> ok d2
 
                             Nothing ->
                                 d2
@@ -237,7 +236,7 @@ suite =
                     d4 =
                         case ( findId "C" d3, findId "A" d3 ) of
                             ( Just cId, Just aId ) ->
-                                Ref.moveBefore cId aId refs.outline d3 |> ok d3
+                                C.moveBefore cId aId refs.outline d3 |> ok d3
 
                             _ ->
                                 d3
@@ -259,7 +258,7 @@ suite =
                                     d1
 
                         bob =
-                            OpDoc.decodeInto (OpDoc.encode d2) (init "bob") |> Result.withDefault (init "bob")
+                            Doc.decodeInto (Doc.encode d2) (init "bob") |> Result.withDefault (init "bob")
                     in
                     Expect.equal (shape (read d2)) (shape (read bob))
             , test "concurrent cycle-forming moves converge (both orders agree)" <|
@@ -279,20 +278,20 @@ suite =
                                 -- syncs `start`, so the two concurrent moves get
                                 -- distinct (different-replica) move-op ids.
                                 bobStart =
-                                    OpDoc.decodeInto (OpDoc.encode start) (init "bob") |> Result.withDefault (init "bob")
+                                    Doc.decodeInto (Doc.encode start) (init "bob") |> Result.withDefault (init "bob")
 
                                 -- alice moves A under B; bob moves B under A
                                 alice =
-                                    Ref.moveInto aId (Just bId) refs.outline start |> ok start
+                                    C.moveInto aId (Just bId) refs.outline start |> ok start
 
                                 bob =
-                                    Ref.moveInto bId (Just aId) refs.outline bobStart |> ok bobStart
+                                    C.moveInto bId (Just aId) refs.outline bobStart |> ok bobStart
 
                                 ab =
-                                    OpDoc.decodeInto (OpDoc.encode bob) alice |> Result.withDefault alice
+                                    Doc.decodeInto (Doc.encode bob) alice |> Result.withDefault alice
 
                                 ba =
-                                    OpDoc.decodeInto (OpDoc.encode alice) bob |> Result.withDefault bob
+                                    Doc.decodeInto (Doc.encode alice) bob |> Result.withDefault bob
                             in
                             Expect.all
                                 [ \_ -> Expect.equal (shape (read ab)) (shape (read ba))
@@ -327,13 +326,13 @@ suite =
                         deleted =
                             case mA of
                                 Just aId ->
-                                    tracked (Ref.removeNode aId refs.outline) d3
+                                    tracked (C.removeNode aId refs.outline) d3
 
                                 Nothing ->
                                     d3
 
                         restored =
-                            OpDoc.undo deleted
+                            Doc.undo deleted
                     in
                     Expect.all
                         [ \_ -> Expect.equal "B" (shape (read deleted))
@@ -344,11 +343,11 @@ suite =
                 \_ ->
                     let
                         added =
-                            tracked (Ref.addChild itemDoc.schema (Item "X") Nothing refs.outline) (init "alice")
+                            tracked (C.addChild itemDoc.schema (Item "X") Nothing refs.outline) (init "alice")
                     in
                     Expect.all
                         [ \_ -> Expect.equal "X" (shape (read added))
-                        , \_ -> Expect.equal "" (shape (read (OpDoc.undo added)))
+                        , \_ -> Expect.equal "" (shape (read (Doc.undo added)))
                         ]
                         ()
             , test "undo a move puts the node back" <|
@@ -363,14 +362,14 @@ suite =
                         moved =
                             case ( mA, mB ) of
                                 ( Just aId, Just bId ) ->
-                                    tracked (Ref.moveInto bId (Just aId) refs.outline) d2
+                                    tracked (C.moveInto bId (Just aId) refs.outline) d2
 
                                 _ ->
                                     d2
                     in
                     Expect.all
                         [ \_ -> Expect.equal "A[B]" (shape (read moved))
-                        , \_ -> Expect.equal "A B" (shape (read (OpDoc.undo moved)))
+                        , \_ -> Expect.equal "A B" (shape (read (Doc.undo moved)))
                         ]
                         ()
             , test "delete then undo then redo re-deletes" <|
@@ -382,13 +381,13 @@ suite =
                         deleted =
                             case mA of
                                 Just aId ->
-                                    tracked (Ref.removeNode aId refs.outline) d1
+                                    tracked (C.removeNode aId refs.outline) d1
 
                                 Nothing ->
                                     d1
 
                         cycled =
-                            deleted |> OpDoc.undo |> OpDoc.redo
+                            deleted |> Doc.undo |> Doc.redo
                     in
                     Expect.equal "" (shape (read cycled))
             , test "add a node, edit its text, undo twice, redo twice restores both" <|
@@ -397,13 +396,13 @@ suite =
                     -- redo must rebuild the node AND its text, in order.
                     let
                         d1 =
-                            tracked (Ref.addChild itemDoc.schema (Item "A") Nothing refs.outline) (init "alice")
+                            tracked (C.addChild itemDoc.schema (Item "A") Nothing refs.outline) (init "alice")
 
                         edited =
                             case findId "A" d1 of
                                 Just aId ->
                                     tracked
-                                        (Ref.set (refs.outline |> Ref.treeNode aId itemDoc.schema |> Ref.at itemDoc.refs.label) "A!")
+                                        (C.set (refs.outline |> C.treeNode aId itemDoc.schema |> C.at itemDoc.refs.label) "A!")
                                         d1
 
                                 Nothing ->
@@ -411,10 +410,10 @@ suite =
 
                         cycled =
                             edited
-                                |> OpDoc.undo
-                                |> OpDoc.undo
-                                |> OpDoc.redo
-                                |> OpDoc.redo
+                                |> Doc.undo
+                                |> Doc.undo
+                                |> Doc.redo
+                                |> Doc.redo
                     in
                     Expect.all
                         [ \_ -> Expect.equal "A!" (shape (read edited))

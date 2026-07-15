@@ -47,7 +47,7 @@ equality (`==`) is a sound convergence oracle.
 
 -}
 
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Dict exposing (Dict)
 import Set exposing (Set)
 
@@ -131,7 +131,7 @@ using a freshly minted id. Returns the updated array and advanced context.
 "After `origin`" is expressed as a **right-child of `origin`** (`side = Right`); at
 the head it is a root (`parent = Nothing, side = Right`). This is the classic-RGA
 anchoring rule, kept for the state-based `Crdt.Edit`/`Crdt.Text` layers and
-`Node.reStamp`. The op-log text layer (`Crdt.OpDoc.applyTextDiff`) chooses
+`Node.reStamp`. The op-log text layer (`Crdt.Doc.applyTextDiff`) chooses
 `parent`/`side` itself to get Fugue's non-interleaving runs.
 
 -}

@@ -1,215 +1,151 @@
 module Crdt.Cursor exposing
-    ( Cursor, Anchor(..)
-    , fromParts, steps, anchor, element
+    ( Cursor, element, sameContainer
     , Range, range, rangeAnchor, rangeFocus
     , encode, decoder, encodeRange, rangeDecoder
     )
 
-{-| Stable positions in a collaborative document.
+{-| A stable position in a collaborative document — where someone's caret or selection
+sits, so you can show remote collaborators' cursors.
 
-A `Cursor` names a position by **identity**, not by offset: a stable id-based
-path to a sequence/text container (`Crdt.OpLog.Target`, the same id-based path the
-op log addresses edits with) plus an `Anchor` for the spot _within_ that
-container. Because it is anchored to element `OpId`s — which are immutable — a
-cursor stays meaningful as other replicas concurrently insert, delete, or
-reorder around it. Resolve one back to a current offset with
-`Crdt.OpDoc.cursorOffset`.
+A `Cursor` remembers a position by the **identity** of the characters around it, not by
+a numeric offset. That is what makes it survive concurrent editing: if a collaborator's
+caret is between characters 3 and 4 and someone else inserts text earlier in the line,
+the caret still sits between the same two characters after the edits merge — it does not
+drift. You create one with `Crdt.cursorAt` (from a field and an offset) and turn it
+back into a current offset, against your own converged document, with
+`Crdt.cursorOffset`.
 
-Cursors are **ephemeral presence data**, not document state: you broadcast them
-on the `Crdt.Presence` channel and each viewer resolves them locally against its
-own converged document. There is no merge — convergence is just `cursorOffset`
-being a pure function of the converged order.
+Cursors are **presence data, not part of the document**. You broadcast them on the
+`Crdt.Presence` channel and every viewer resolves them locally; there is nothing to
+merge. A typical setup carries each peer's caret as an optional presence field:
 
-A `Range` (a selection) is simply an ordered pair of cursors — an `anchor` (where
-the selection started) and a `focus` (where it currently ends). Each endpoint
-resolves independently, so a selection survives concurrent edits the same way a
-single caret does.
+    peerCodec =
+        Presence.codec Peer
+            |> Presence.optional "caret" .caret Presence.cursor
+            |> Presence.buildCodec
 
-@docs Cursor, Anchor
-@docs fromParts, steps, anchor, element
+A `Range` is a text selection: the pair of cursors marking its two ends — the **anchor**
+where the selection started and the **focus** where the caret now reaches (see `Range`
+for why the two ends aren't interchangeable). Each end resolves independently, so a
+selection stretches and shifts correctly as the text changes underneath it.
+
+
+# Cursors
+
+@docs Cursor, element, sameContainer
+
+
+# Selections
+
 @docs Range, range, rangeAnchor, rangeFocus
+
+
+# Sending cursors over the wire
+
 @docs encode, decoder, encodeRange, rangeDecoder
 
 -}
 
+import Crdt.Cursor.Internal as I
 import Crdt.Id exposing (OpId)
-import Crdt.Json as Json
-import Crdt.OpLog exposing (Target, TargetStep(..))
-import Json.Decode as JD exposing (Decoder)
+import Json.Decode exposing (Decoder)
 import Json.Encode as JE
 
 
-{-| Where a cursor sits within its container's sequence.
-
-  - `Start` — before the first element (offset 0).
-  - `After id` — immediately after the element `id` (so the caret is at the
-    offset following it, or, read as item-identity, "on" that element).
-
+{-| A stable position within a text or list field. Build one with `Crdt.cursorAt`
+and resolve it back to a current offset with `Crdt.cursorOffset`. Opaque.
 -}
-type Anchor
-    = Start
-    | After OpId
+type alias Cursor =
+    I.Cursor
 
 
-{-| A stable position: an id-based path to a sequence/text container, plus the
-anchor within it. Opaque; build with `Crdt.OpDoc.cursorAt`.
--}
-type Cursor
-    = Cursor Target Anchor
-
-
-{-| Construct a cursor from a container target and an anchor. (Normally you'd use
-`Crdt.OpDoc.cursorAt`, which derives both from a visible-index path + offset.)
--}
-fromParts : Target -> Anchor -> Cursor
-fromParts =
-    Cursor
-
-
-{-| The anchor (position within the container) of a cursor.
--}
-anchor : Cursor -> Anchor
-anchor (Cursor _ a) =
-    a
-
-
-{-| The container target steps of a cursor (used by `Crdt.OpDoc` to resolve it).
--}
-steps : Cursor -> Target
-steps (Cursor t _) =
-    t
-
-
-{-| The element a cursor is anchored to, if any (`Nothing` for `Start`). Use this
-for item-identity presence — "which list item is this peer on" — independent of
-the item's current index.
+{-| The identity of the element a cursor sits on, if any (`Nothing` when it is at the
+very start). Use this for item-level presence — "which list item is this peer on" —
+which stays correct no matter how the list is reordered.
 -}
 element : Cursor -> Maybe OpId
-element (Cursor _ a) =
-    case a of
-        Start ->
-            Nothing
-
-        After id ->
-            Just id
+element =
+    I.element
 
 
-
--- RANGE ----------------------------------------------------------------------
-
-
-{-| A selection: an ordered pair of cursors. `anchor` is where the selection
-began (the fixed end), `focus` is where it currently extends to (the moving end).
-They may be in either document order — a backwards selection has `focus` before
-`anchor`.
+{-| Do two cursors point into the **same container** (the same text field or list),
+regardless of where within it? Useful when rendering per-field carets: keep only the
+peers whose cursor is in the field you are currently drawing.
 -}
-type Range
-    = Range Cursor Cursor
+sameContainer : Cursor -> Cursor -> Bool
+sameContainer =
+    I.sameContainer
 
 
-{-| Build a range from its anchor (fixed) and focus (moving) cursors.
+{-| A text selection — the pair of cursors marking its two ends.
+
+Think of selecting text by dragging: the point where you first pressed down stays put,
+and the other end follows your pointer. Those are the two ends of a `Range`:
+
+  - the **anchor** is the end that stays put — where the selection started;
+  - the **focus** is the end that moves — where it reaches to right now (where the
+    caret is).
+
+Keeping them apart, rather than just storing "leftmost" and "rightmost", matters for two
+reasons. It records the selection's **direction**: dragging left-to-right puts the focus
+_after_ the anchor, dragging right-to-left puts it _before_ — a "backwards" selection is
+simply one whose focus sits before its anchor. And it is what lets you **grow or shrink**
+a selection from the moving end (shift-clicking, or holding shift and pressing an arrow
+key) while the anchor holds fast.
+
+If all you want is the selected span itself, resolve both ends to offsets with
+`Crdt.cursorOffset` and take the smaller and larger of the two.
+
+-}
+type alias Range =
+    I.Range
+
+
+{-| Build a `Range` from its two ends: the `anchor` (the end that stays put, where the
+selection started) and the `focus` (the moving end, where the caret now is).
 -}
 range : Cursor -> Cursor -> Range
 range =
-    Range
+    I.range
 
 
-{-| The fixed end of a selection.
+{-| The end of the selection that stays put — where it started.
 -}
 rangeAnchor : Range -> Cursor
-rangeAnchor (Range a _) =
-    a
+rangeAnchor =
+    I.rangeAnchor
 
 
-{-| The moving end of a selection.
+{-| The moving end of the selection — where the caret currently is.
 -}
 rangeFocus : Range -> Cursor
-rangeFocus (Range _ f) =
-    f
+rangeFocus =
+    I.rangeFocus
 
 
-
--- JSON -----------------------------------------------------------------------
-
-
-{-| Serialize a cursor for the presence channel.
+{-| Serialize a cursor to JSON, to send on the presence channel.
 -}
 encode : Cursor -> JE.Value
-encode (Cursor t a) =
-    JE.object
-        [ ( "t", JE.list encodeStep t )
-        , ( "a", encodeAnchor a )
-        ]
+encode =
+    I.encode
 
 
 {-| Decode a cursor received from a peer.
 -}
 decoder : Decoder Cursor
 decoder =
-    JD.map2 Cursor
-        (JD.field "t" (JD.list stepDecoder))
-        (JD.field "a" anchorDecoder)
+    I.decoder
 
 
-{-| Serialize a range.
+{-| Serialize a selection to JSON.
 -}
 encodeRange : Range -> JE.Value
-encodeRange (Range a f) =
-    JE.object
-        [ ( "anchor", encode a )
-        , ( "focus", encode f )
-        ]
+encodeRange =
+    I.encodeRange
 
 
-{-| Decode a range.
+{-| Decode a selection received from a peer.
 -}
 rangeDecoder : Decoder Range
 rangeDecoder =
-    JD.map2 Range
-        (JD.field "anchor" decoder)
-        (JD.field "focus" decoder)
-
-
-encodeAnchor : Anchor -> JE.Value
-encodeAnchor a =
-    case a of
-        Start ->
-            JE.object [ ( "k", JE.string "start" ) ]
-
-        After id ->
-            JE.object [ ( "k", JE.string "after" ), ( "id", Json.encodeOpId id ) ]
-
-
-anchorDecoder : Decoder Anchor
-anchorDecoder =
-    JD.field "k" JD.string
-        |> JD.andThen
-            (\k ->
-                case k of
-                    "start" ->
-                        JD.succeed Start
-
-                    "after" ->
-                        JD.map After (JD.field "id" Json.opIdDecoder)
-
-                    other ->
-                        JD.fail ("unknown anchor kind: " ++ other)
-            )
-
-
-encodeStep : TargetStep -> JE.Value
-encodeStep step =
-    case step of
-        IntoKey key ->
-            JE.object [ ( "key", JE.string key ) ]
-
-        IntoElem id ->
-            JE.object [ ( "elem", Json.encodeOpId id ) ]
-
-
-stepDecoder : Decoder TargetStep
-stepDecoder =
-    JD.oneOf
-        [ JD.map IntoKey (JD.field "key" JD.string)
-        , JD.map IntoElem (JD.field "elem" Json.opIdDecoder)
-        ]
+    I.rangeDecoder

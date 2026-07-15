@@ -16,10 +16,9 @@ are resolved against the live tree at apply time (out-of-range picks are no-ops)
 
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc as Doc exposing (Doc)
 import Crdt.Id as Id exposing (OpId)
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
-import Crdt.Ref as Ref exposing (Ref)
-import Crdt.Schema as S
 import Crdt.Tree as Tree
 import Expect
 import Fuzz exposing (Fuzzer)
@@ -35,17 +34,17 @@ type alias NodeItem =
 
 
 type alias NodeRefs =
-    { label : Ref NodeItem S.Settable String }
+    { label : Ref NodeItem C.Settable String }
 
 
-nodeDoc : Ref.RecordRefs NodeItem NodeRefs
+nodeDoc : C.RecordRefs NodeItem NodeRefs
 nodeDoc =
-    Ref.record NodeItem NodeRefs
-        |> Ref.field "label" .label S.text
-        |> Ref.build
+    C.record NodeItem NodeRefs
+        |> C.field "label" .label C.text
+        |> C.build
 
 
-type alias Doc =
+type alias Sample =
     { title : String
     , tags : List String
     , outline : Tree.Forest NodeItem
@@ -53,19 +52,19 @@ type alias Doc =
 
 
 type alias DocRefs =
-    { title : Ref Doc S.Settable String
-    , tags : Ref Doc (S.ListK S.Movable S.Settable String) (List String)
-    , outline : Ref Doc (S.TreeK S.Nested NodeItem) (Tree.Forest NodeItem)
+    { title : Ref Sample C.Settable String
+    , tags : Ref Sample (C.ListK C.Movable C.Settable String) (List String)
+    , outline : Ref Sample (C.TreeK C.Nested NodeItem) (Tree.Forest NodeItem)
     }
 
 
-docDoc : Ref.RecordRefs Doc DocRefs
+docDoc : C.RecordRefs Sample DocRefs
 docDoc =
-    Ref.record Doc DocRefs
-        |> Ref.field "title" .title S.text
-        |> Ref.field "tags" .tags (S.movableList S.text)
-        |> Ref.field "outline" .outline (S.tree nodeDoc.schema)
-        |> Ref.build
+    C.record Sample DocRefs
+        |> C.field "title" .title C.text
+        |> C.field "tags" .tags (C.movableList C.text)
+        |> C.field "outline" .outline (C.tree nodeDoc.schema)
+        |> C.build
 
 
 refs : DocRefs
@@ -73,9 +72,9 @@ refs =
     docDoc.refs
 
 
-init : OpDoc Doc
+init : Doc Sample
 init =
-    OpDoc.init (Id.replica "prop") docDoc.schema
+    C.init (Id.replica "prop") docDoc.schema
 
 
 
@@ -95,11 +94,11 @@ type Edit
 
 {-| Every node id in the tree, in a stable pre-order (roots then children).
 -}
-allNodeIds : OpDoc Doc -> List OpId
+allNodeIds : Doc Sample -> List OpId
 allNodeIds doc =
     let
         forest =
-            OpDoc.read doc |> Result.map .outline |> Result.withDefault []
+            C.read doc |> Result.map .outline |> Result.withDefault []
 
         go items =
             items |> List.concatMap (\i -> Tree.itemId i :: go (Tree.itemChildren i))
@@ -107,9 +106,9 @@ allNodeIds doc =
     go forest
 
 
-rootIds : OpDoc Doc -> List OpId
+rootIds : Doc Sample -> List OpId
 rootIds doc =
-    OpDoc.read doc
+    C.read doc
         |> Result.map (.outline >> List.map Tree.itemId)
         |> Result.withDefault []
 
@@ -119,11 +118,11 @@ tree, out-of-range index) are no-ops but still recorded — matching real UI whe
 click may do nothing yet the user expects undo to skip it (recordEdit of a no-op
 records nothing, so the stack stays clean).
 -}
-applyEdit : Edit -> OpDoc Doc -> OpDoc Doc
+applyEdit : Edit -> Doc Sample -> Doc Sample
 applyEdit edit doc =
     let
         before =
-            OpDoc.version doc
+            Doc.version doc
 
         ok result =
             Result.withDefault doc result
@@ -131,21 +130,21 @@ applyEdit edit doc =
         edited =
             case edit of
                 SetTitle s ->
-                    Ref.set refs.title s doc |> ok
+                    C.set refs.title s doc |> ok
 
                 AddTag s ->
-                    Ref.append S.text s refs.tags doc |> ok
+                    C.append C.text s refs.tags doc |> ok
 
                 RemoveTag i ->
-                    Ref.remove i refs.tags doc |> ok
+                    C.remove i refs.tags doc |> ok
 
                 AddRoot s ->
-                    Ref.addChild nodeDoc.schema (NodeItem s) Nothing refs.outline doc |> ok
+                    C.addChild nodeDoc.schema (NodeItem s) Nothing refs.outline doc |> ok
 
                 AddChildOfFirst s ->
                     case List.head (rootIds doc) of
                         Just p ->
-                            Ref.addChild nodeDoc.schema (NodeItem s) (Just p) refs.outline doc |> ok
+                            C.addChild nodeDoc.schema (NodeItem s) (Just p) refs.outline doc |> ok
 
                         Nothing ->
                             doc
@@ -155,7 +154,7 @@ applyEdit edit doc =
                     -- redo class that lost inner text needs this to be fuzzed)
                     case List.head (allNodeIds doc) of
                         Just n ->
-                            Ref.set (refs.outline |> Ref.treeNode n nodeDoc.schema |> Ref.at nodeDoc.refs.label) s doc |> ok
+                            C.set (refs.outline |> C.treeNode n nodeDoc.schema |> C.at nodeDoc.refs.label) s doc |> ok
 
                         Nothing ->
                             doc
@@ -167,7 +166,7 @@ applyEdit edit doc =
                                 doc
 
                             else
-                                Ref.moveInto first (Just last) refs.outline doc |> ok
+                                C.moveInto first (Just last) refs.outline doc |> ok
 
                         _ ->
                             doc
@@ -175,19 +174,19 @@ applyEdit edit doc =
                 DeleteFirstRoot ->
                     case List.head (rootIds doc) of
                         Just r ->
-                            Ref.removeNode r refs.outline doc |> ok
+                            C.removeNode r refs.outline doc |> ok
 
                         Nothing ->
                             doc
     in
-    OpDoc.recordEdit before edited
+    Doc.recordEdit before edited
 
 
 {-| The observable state we compare — the fully decoded document, rendered.
 -}
-render : OpDoc Doc -> String
+render : Doc Sample -> String
 render doc =
-    case OpDoc.read doc of
+    case C.read doc of
         Ok d ->
             d.title ++ " | " ++ String.join "," d.tags ++ " | " ++ shape d.outline
 
@@ -253,7 +252,7 @@ Returns `(finalDoc, recordedRenders)` where `recordedRenders` starts with the in
 render and appends one render per edit that advanced the version.
 
 -}
-run : List Edit -> ( OpDoc Doc, List String )
+run : List Edit -> ( Doc Sample, List String )
 run es =
     List.foldl
         (\e ( doc, renders ) ->
@@ -261,7 +260,7 @@ run es =
                 d1 =
                     applyEdit e doc
             in
-            if OpDoc.version d1 == OpDoc.version doc then
+            if Doc.version d1 == Doc.version doc then
                 -- no-op edit: nothing recorded, no new undo step
                 ( d1, renders )
 
@@ -287,7 +286,7 @@ suite =
 
                     -- undo as many times as there were (recorded) edits + slack
                     fullyUndone =
-                        List.foldl (\_ d -> OpDoc.undo d) final (List.range 1 (List.length es + 2))
+                        List.foldl (\_ d -> Doc.undo d) final (List.range 1 (List.length es + 2))
                 in
                 render fullyUndone |> Expect.equal (render init)
         , fuzz edits "undo then redo returns to the pre-undo state" <|
@@ -297,7 +296,7 @@ suite =
                         run es
 
                     roundTrip =
-                        OpDoc.redo (OpDoc.undo final)
+                        Doc.redo (Doc.undo final)
                 in
                 -- if there was at least one recorded edit, undo+redo is identity on
                 -- the read; if nothing was recorded, undo/redo are no-ops anyway.
@@ -309,11 +308,11 @@ suite =
                         run es
 
                     once =
-                        OpDoc.redo (OpDoc.undo final)
+                        Doc.redo (Doc.undo final)
 
                     -- alternate several times; must equal a single round-trip
                     many =
-                        List.foldl (\_ d -> OpDoc.redo (OpDoc.undo d)) final (List.range 1 5)
+                        List.foldl (\_ d -> Doc.redo (Doc.undo d)) final (List.range 1 5)
                 in
                 render many |> Expect.equal (render once)
         , fuzz edits "step-by-step: undoing the last edit matches the prior render" <|
@@ -335,5 +334,5 @@ suite =
                     Expect.pass
 
                 else
-                    render (OpDoc.undo final) |> Expect.equal priorRender
+                    render (Doc.undo final) |> Expect.equal priorRender
         ]

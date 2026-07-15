@@ -14,9 +14,9 @@ the sum type and reading them back — no internal `Node` access needed.
 
 -}
 
-import Crdt
-import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc
+import Crdt.Doc.Internal as Doc
+import Crdt.Id.Internal as Id
+import Crdt.Node exposing (Node)
 import Crdt.Path as Path
 import Crdt.Schema.Internal as S exposing (Crdt)
 import Expect
@@ -77,24 +77,36 @@ shapeSchema =
 
 
 
+-- HELPERS ---------------------------------------------------------------------
+
+
+{-| The empty `Node` a schema constructs — used to feed a decoder a node of the
+"wrong" shape and assert it errors rather than crashes.
+-}
+emptyNodeFor : Crdt kind a -> Node
+emptyNodeFor schema =
+    S.emptyNode schema (Id.ctx (Id.replica "x")) |> Tuple.first
+
+
+
 -- SEEDING HELPERS -------------------------------------------------------------
 
 
 {-| Seed a concrete value through its variant seeder (via a one-element list) and
 read it back, using the op-log doc.
 -}
-seedRead : Crdt kind a -> a -> Result Crdt.Error (Maybe a)
+seedRead : Crdt kind a -> a -> Result S.Error (Maybe a)
 seedRead schema value =
     let
         listSchema =
             S.list schema
 
         doc0 =
-            OpDoc.init (Id.replica "seed") listSchema
+            Doc.init (Id.replica "seed") listSchema
     in
-    case OpDoc.listAppend Path.root (schema |> S.with value) doc0 of
+    case Doc.listAppend Path.root (schema |> S.with value) doc0 of
         Ok doc1 ->
-            OpDoc.read doc1 |> Result.map List.head
+            Doc.read doc1 |> Result.map List.head
 
         Err _ ->
             Ok Nothing
@@ -110,17 +122,17 @@ seedEncodeDecodeRead schema value =
             S.list schema
 
         doc0 =
-            OpDoc.init (Id.replica "seed") listSchema
+            Doc.init (Id.replica "seed") listSchema
     in
-    case OpDoc.listAppend Path.root (schema |> S.with value) doc0 of
+    case Doc.listAppend Path.root (schema |> S.with value) doc0 of
         Ok doc1 ->
-            OpDoc.encode doc1
-                |> (\v -> OpDoc.decodeInto v (OpDoc.init (Id.replica "reader") listSchema))
+            Doc.encode doc1
+                |> (\v -> Doc.decodeInto v (Doc.init (Id.replica "reader") listSchema))
                 |> Result.andThen
                     (\doc2 ->
-                        OpDoc.read doc2
+                        Doc.read doc2
                             |> Result.map List.head
-                            |> Result.mapError Crdt.errorToString
+                            |> Result.mapError S.errorToString
                     )
 
         Err _ ->
@@ -146,13 +158,9 @@ suite : Test
 suite =
     describe "Custom (sum) types"
         [ describe "default variant"
-            [ test "fresh op-log doc defaults to the first-declared variant" <|
+            [ test "fresh doc defaults to the first-declared variant" <|
                 \_ ->
-                    OpDoc.read (OpDoc.init (Id.replica "a") docSchema)
-                        |> Expect.equal (Ok { status = Active })
-            , test "fresh state-based doc also defaults to the first variant" <|
-                \_ ->
-                    Crdt.read docSchema (Crdt.init (Id.replica "a") docSchema)
+                    Doc.read (Doc.init (Id.replica "a") docSchema)
                         |> Expect.equal (Ok { status = Active })
             ]
         , describe "seed + read round-trip (all arities)"
@@ -185,16 +193,16 @@ suite =
                             S.list statusSchema
 
                         doc0 =
-                            OpDoc.init (Id.replica "s") listSchema
+                            Doc.init (Id.replica "s") listSchema
 
                         appended =
-                            OpDoc.listAppend Path.root (statusSchema |> S.with Active) doc0
-                                |> Result.andThen (OpDoc.listAppend Path.root (statusSchema |> S.with (Snoozed 1)))
-                                |> Result.andThen (OpDoc.listAppend Path.root (statusSchema |> S.with (Done "z")))
+                            Doc.listAppend Path.root (statusSchema |> S.with Active) doc0
+                                |> Result.andThen (Doc.listAppend Path.root (statusSchema |> S.with (Snoozed 1)))
+                                |> Result.andThen (Doc.listAppend Path.root (statusSchema |> S.with (Done "z")))
                     in
                     case appended of
                         Ok doc1 ->
-                            OpDoc.read doc1 |> Expect.equal (Ok [ Active, Snoozed 1, Done "z" ])
+                            Doc.read doc1 |> Expect.equal (Ok [ Active, Snoozed 1, Done "z" ])
 
                         Err _ ->
                             Expect.fail "append failed"
@@ -203,12 +211,12 @@ suite =
             [ test "reading a non-map node through a custom schema → Err" <|
                 \_ ->
                     -- a plain int register is not a custom-type map
-                    Crdt.read statusSchema (Crdt.init (Id.replica "a") S.int)
+                    S.decodeNode statusSchema (emptyNodeFor S.int)
                         |> Expect.err
             , test "reading a map with no $tag through a custom schema → Err" <|
                 \_ ->
                     -- a record (Map) that lacks the reserved $tag key
-                    Crdt.read statusSchema (Crdt.init (Id.replica "a") docSchema)
+                    S.decodeNode statusSchema (emptyNodeFor docSchema)
                         |> Expect.err
             ]
         ]

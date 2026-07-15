@@ -1,8 +1,8 @@
 module IncrementalMergeTests exposing (suite)
 
-{-| `OpDoc.merge` / `decodeInto` now apply only the **added** ops onto the existing
+{-| `Doc.merge` / `decodeInto` now apply only the **added** ops onto the existing
 cache instead of re-materializing from base (see `docs/12`). The correctness oracle is
-`OpDoc.cacheConsistent` — it holds iff the incrementally-maintained cache equals a full
+`Doc.cacheConsistent` — it holds iff the incrementally-maintained cache equals a full
 re-materialize. These tests assert it survives the adversarial cases the incremental
 path could get wrong:
 
@@ -19,11 +19,10 @@ regression whether it shows up as a stale cache or as divergent reads.
 
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
-import Crdt.Ref as Ref exposing (Ref)
 import Crdt.RichText exposing (Span)
-import Crdt.Schema as S exposing (Crdt)
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
 import Expect
@@ -39,12 +38,12 @@ type alias ONode =
 
 
 type alias ONodeRefs =
-    { text : Ref ONode S.Settable String }
+    { text : Ref ONode C.Settable String }
 
 
-onodeDoc : Ref.RecordRefs ONode ONodeRefs
+onodeDoc : C.RecordRefs ONode ONodeRefs
 onodeDoc =
-    Ref.record ONode ONodeRefs |> Ref.field "text" .text S.text |> Ref.build
+    C.record ONode ONodeRefs |> C.field "text" .text C.text |> C.build
 
 
 type alias Todo =
@@ -52,15 +51,15 @@ type alias Todo =
 
 
 type alias TodoRefs =
-    { text : Ref Todo S.Settable String, done : Ref Todo S.Settable Bool }
+    { text : Ref Todo C.Settable String, done : Ref Todo C.Settable Bool }
 
 
-todoDoc : Ref.RecordRefs Todo TodoRefs
+todoDoc : C.RecordRefs Todo TodoRefs
 todoDoc =
-    Ref.record Todo TodoRefs
-        |> Ref.field "text" .text S.text
-        |> Ref.field "done" .done S.bool
-        |> Ref.build
+    C.record Todo TodoRefs
+        |> C.field "text" .text C.text
+        |> C.field "done" .done C.bool
+        |> C.build
 
 
 type alias Board =
@@ -73,23 +72,23 @@ type alias Board =
 
 
 type alias BoardRefs =
-    { title : Ref Board S.Settable String
-    , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
-    , files : Ref Board (S.DictK S.RichK (List Span)) (Dict String (List Span))
-    , outline : Ref Board (S.TreeK S.Nested ONode) (Tree.Forest ONode)
-    , likes : Ref Board S.Counter Int
+    { title : Ref Board C.Settable String
+    , todos : Ref Board (C.ListK C.Movable C.Nested Todo) (List Todo)
+    , files : Ref Board (C.DictK C.RichK (List Span)) (Dict String (List Span))
+    , outline : Ref Board (C.TreeK C.Nested ONode) (Tree.Forest ONode)
+    , likes : Ref Board C.Counter Int
     }
 
 
-boardDoc : Ref.RecordRefs Board BoardRefs
+boardDoc : C.RecordRefs Board BoardRefs
 boardDoc =
-    Ref.record Board BoardRefs
-        |> Ref.field "title" .title S.text
-        |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
-        |> Ref.field "files" .files (S.dict S.richText)
-        |> Ref.field "outline" .outline (S.tree onodeDoc.schema)
-        |> Ref.field "likes" .likes S.counter
-        |> Ref.build
+    C.record Board BoardRefs
+        |> C.field "title" .title C.text
+        |> C.field "todos" .todos (C.movableList todoDoc.schema)
+        |> C.field "files" .files (C.dict C.richText)
+        |> C.field "outline" .outline (C.tree onodeDoc.schema)
+        |> C.field "likes" .likes C.counter
+        |> C.build
 
 
 refs : BoardRefs
@@ -97,47 +96,47 @@ refs =
     boardDoc.refs
 
 
-init : String -> OpDoc Board
+init : String -> Doc Board
 init name =
-    OpDoc.init (Id.replica name) boardDoc.schema
+    Doc.init (Id.replica name) boardDoc.schema
 
 
-ok : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
+ok : Doc Board -> Result C.EditError (Doc Board) -> Doc Board
 ok fb =
     Result.withDefault fb
 
 
-read : OpDoc Board -> Result S.Error Board
+read : Doc Board -> Result C.ReadError Board
 read =
-    OpDoc.read
+    Doc.read
 
 
 {-| Sync `from` fully into a fresh replica named `name` (over the wire, like a peer
 catching up), so it shares history and can then diverge.
 -}
-peerOf : String -> OpDoc Board -> OpDoc Board
+peerOf : String -> Doc Board -> Doc Board
 peerOf name from =
-    OpDoc.decodeInto (OpDoc.encode from) (init name)
+    Doc.decodeInto (Doc.encode from) (init name)
         |> Result.withDefault (init name)
 
 
 {-| Merge `b` into `a` via the op-store `merge`.
 -}
-mergeOp : OpDoc Board -> OpDoc Board -> OpDoc Board
+mergeOp : Doc Board -> Doc Board -> Doc Board
 mergeOp a b =
-    OpDoc.merge a b
+    Doc.merge a b
 
 
 {-| Merge `b` into `a` via the WIRE (`decodeInto (encode b)`), the demo's real path.
 -}
-mergeWire : OpDoc Board -> OpDoc Board -> OpDoc Board
+mergeWire : Doc Board -> Doc Board -> Doc Board
 mergeWire a b =
-    OpDoc.decodeInto (OpDoc.encode b) a |> Result.withDefault a
+    Doc.decodeInto (Doc.encode b) a |> Result.withDefault a
 
 
-consistent : OpDoc Board -> Expect.Expectation
+consistent : Doc Board -> Expect.Expectation
 consistent doc =
-    OpDoc.cacheConsistent doc |> Expect.equal True
+    Doc.cacheConsistent doc |> Expect.equal True
 
 
 suite : Test
@@ -147,13 +146,13 @@ suite =
             \_ ->
                 let
                     base =
-                        init "seed" |> (\d -> Ref.set refs.title "hi" d |> ok d)
+                        init "seed" |> (\d -> C.set refs.title "hi" d |> ok d)
 
                     a =
-                        peerOf "alice" base |> (\d -> Ref.set refs.title "alice" d |> ok d) |> (\d -> Ref.increment refs.likes 2 d |> ok d)
+                        peerOf "alice" base |> (\d -> C.set refs.title "alice" d |> ok d) |> (\d -> C.increment refs.likes 2 d |> ok d)
 
                     b =
-                        peerOf "bob" base |> (\d -> Ref.increment refs.likes 3 d |> ok d)
+                        peerOf "bob" base |> (\d -> C.increment refs.likes 3 d |> ok d)
 
                     ab =
                         mergeOp a b
@@ -176,12 +175,12 @@ suite =
                 -- incremental merge folds added ops in causal order to guarantee this.
                 let
                     fileRef =
-                        refs.files |> Ref.key "notes" S.richText
+                        refs.files |> C.key "notes" C.richText
 
                     alice =
                         init "alice"
-                            |> (\d -> Ref.setKey S.richText "notes" [] refs.files d |> ok d)
-                            |> (\d -> Ref.setRich fileRef "hello" d |> ok d)
+                            |> (\d -> C.setKey C.richText "notes" [] refs.files d |> ok d)
+                            |> (\d -> C.setRich fileRef "hello" d |> ok d)
 
                     bob =
                         init "bob"
@@ -201,8 +200,8 @@ suite =
                 let
                     base =
                         init "seed"
-                            |> (\d -> Ref.addChild onodeDoc.schema (ONode "a") Nothing refs.outline d |> ok d)
-                            |> (\d -> Ref.addChild onodeDoc.schema (ONode "b") Nothing refs.outline d |> ok d)
+                            |> (\d -> C.addChild onodeDoc.schema (ONode "a") Nothing refs.outline d |> ok d)
+                            |> (\d -> C.addChild onodeDoc.schema (ONode "b") Nothing refs.outline d |> ok d)
 
                     idsOf doc =
                         read doc |> Result.map (.outline >> List.map Tree.itemId) |> Result.withDefault []
@@ -218,8 +217,8 @@ suite =
                     ( a, b ) =
                         case firstTwo base of
                             Just ( x, y ) ->
-                                ( peerOf "alice" base |> (\d -> Ref.moveInto y (Just x) refs.outline d |> ok d)
-                                , peerOf "bob" base |> (\d -> Ref.moveInto x (Just y) refs.outline d |> ok d)
+                                ( peerOf "alice" base |> (\d -> C.moveInto y (Just x) refs.outline d |> ok d)
+                                , peerOf "bob" base |> (\d -> C.moveInto x (Just y) refs.outline d |> ok d)
                                 )
 
                             Nothing ->
@@ -242,13 +241,13 @@ suite =
                 let
                     base =
                         List.range 1 4
-                            |> List.foldl (\i d -> Ref.append todoDoc.schema (Todo (String.fromInt i) False) refs.todos d |> ok d) (init "seed")
+                            |> List.foldl (\i d -> C.append todoDoc.schema (Todo (String.fromInt i) False) refs.todos d |> ok d) (init "seed")
 
                     a =
-                        peerOf "alice" base |> (\d -> Ref.move 3 0 refs.todos d |> ok d)
+                        peerOf "alice" base |> (\d -> C.move 3 0 refs.todos d |> ok d)
 
                     b =
-                        peerOf "bob" base |> (\d -> Ref.move 1 3 refs.todos d |> ok d)
+                        peerOf "bob" base |> (\d -> C.move 1 3 refs.todos d |> ok d)
 
                     ab =
                         mergeOp a b
@@ -266,10 +265,10 @@ suite =
             \_ ->
                 let
                     base =
-                        init "seed" |> (\d -> Ref.set refs.title "x" d |> ok d)
+                        init "seed" |> (\d -> C.set refs.title "x" d |> ok d)
 
                     peer =
-                        peerOf "alice" base |> (\d -> Ref.set refs.title "y" d |> ok d) |> (\d -> Ref.increment refs.likes 1 d |> ok d)
+                        peerOf "alice" base |> (\d -> C.set refs.title "y" d |> ok d) |> (\d -> C.increment refs.likes 1 d |> ok d)
 
                     once =
                         mergeOp base peer
@@ -287,16 +286,16 @@ suite =
             \_ ->
                 let
                     base =
-                        init "seed" |> (\d -> Ref.set refs.title "base" d |> ok d)
+                        init "seed" |> (\d -> C.set refs.title "base" d |> ok d)
 
                     a =
-                        peerOf "a" base |> (\d -> Ref.increment refs.likes 1 d |> ok d)
+                        peerOf "a" base |> (\d -> C.increment refs.likes 1 d |> ok d)
 
                     b =
-                        peerOf "b" base |> (\d -> Ref.increment refs.likes 1 d |> ok d)
+                        peerOf "b" base |> (\d -> C.increment refs.likes 1 d |> ok d)
 
                     c =
-                        peerOf "c" base |> (\d -> Ref.increment refs.likes 1 d |> ok d)
+                        peerOf "c" base |> (\d -> C.increment refs.likes 1 d |> ok d)
 
                     abc =
                         mergeOp (mergeOp a b) c
@@ -317,13 +316,13 @@ suite =
                 -- fold correctly onto the incrementally-merged cache.
                 let
                     base =
-                        init "seed" |> (\d -> Ref.append todoDoc.schema (Todo "a" False) refs.todos d |> ok d)
+                        init "seed" |> (\d -> C.append todoDoc.schema (Todo "a" False) refs.todos d |> ok d)
 
                     peer =
-                        peerOf "alice" base |> (\d -> Ref.append todoDoc.schema (Todo "b" False) refs.todos d |> ok d)
+                        peerOf "alice" base |> (\d -> C.append todoDoc.schema (Todo "b" False) refs.todos d |> ok d)
 
                     merged =
-                        mergeOp base peer |> (\d -> Ref.append todoDoc.schema (Todo "c" False) refs.todos d |> ok d)
+                        mergeOp base peer |> (\d -> C.append todoDoc.schema (Todo "c" False) refs.todos d |> ok d)
                 in
                 Expect.all
                     [ \_ -> consistent merged

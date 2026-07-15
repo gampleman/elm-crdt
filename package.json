@@ -14,7 +14,7 @@
     "docs": "elm-doc-preview",
     "fix": "npm-run-all fix:format fix:review",
     "fix:format": "elm-format --yes src/ tests/ review/src/",
-    "fix:review": "elm-review --fix-all",
+    "fix:review": "elm-review --fix-all-without-prompt",
     "elm-bump": "npm run test && elm bump && npm run fix:review"
   },
   "dependencies": {

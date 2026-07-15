@@ -1,5 +1,5 @@
-module Crdt.OpDoc exposing
-    ( OpDoc, Error(..)
+module Crdt.Doc.Internal exposing
+    ( Doc, Error(..)
     , init, read, merge
     , Diff, Origin(..), mergeWithDiff, decodeWithDiff, diffSince, diffOrigins, diffTouches
     , setText, setBool, setInt, setString, increment
@@ -12,7 +12,7 @@ module Crdt.OpDoc exposing
     , historyLength, versionAt, restoreTo
     , recordEdit, undo, redo, canUndo, canRedo
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
-    , gc
+    , compact
     , encode, encodeSince, decodeInto
     , seedNodeAt, subValue
     , treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
@@ -20,20 +20,18 @@ module Crdt.OpDoc exposing
     , splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock, readBlocks
     )
 
-{-| An op-log-backed document: the public surface over `Crdt.OpLog`.
+{-| **Internal.** The full op-log document implementation: the opaque `Doc` type and
+every operation on it, including the low-level `Path`-addressed edit primitives
+(`setText`, `listAppend`, `mark`, `treeAddChild`, `seedNodeAt`, …) that the `Crdt` module wraps
+in its type-safe API.
 
-Unlike the state-based `Crdt`/`Crdt.Edit` (where the `Node` tree is the source of
-truth), an `OpDoc` _is_ an op store. Edits don't mutate state — they resolve a
-visible-index `Path` against the **current materialized state**, emit ops, and
-append them to the log. `read` materializes the log through the schema; `merge`
-is op-store union.
+`Crdt.Doc` is the **public facade** over this module: it re-exposes only the
+document-lifecycle surface (create/read/merge, history, checkpoints, diff, encode/decode,
+cursors). The path-addressed edit functions here take `Path`/`Seed`/`Prim`/`OpId` values
+that are not part of the public API — application code edits through the `Crdt` module, the only
+supported write path — so they live here rather than in the published module.
 
-This proves the op-log is usable end to end through a real public API. It mirrors
-`Crdt.Edit`'s signatures (path + caller-supplied `Seed` for inserts), so the demo
-can migrate with minimal churn. It does not yet replace the state-based `Crdt` —
-both coexist during the migration (see `docs/02-oplog.md`).
-
-@docs OpDoc, Error
+@docs Doc, Error
 @docs init, read, merge
 @docs Diff, Origin, mergeWithDiff, decodeWithDiff, diffSince, diffOrigins, diffTouches
 @docs setText, setBool, setInt, setString, increment
@@ -46,7 +44,7 @@ both coexist during the migration (see `docs/02-oplog.md`).
 @docs historyLength, versionAt, restoreTo
 @docs recordEdit, undo, redo, canUndo, canRedo
 @docs Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
-@docs gc
+@docs compact
 @docs encode, encodeSince, decodeInto
 @docs seedNodeAt, subValue
 @docs treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
@@ -56,9 +54,9 @@ both coexist during the migration (see `docs/02-oplog.md`).
 -}
 
 import Array
-import Crdt.Cursor as Cursor exposing (Cursor)
+import Crdt.Cursor.Internal as Cursor exposing (Cursor)
 import Crdt.Frac exposing (Frac)
-import Crdt.Id as Id exposing (Ctx, OpId, ReplicaId)
+import Crdt.Id.Internal as Id exposing (Ctx, OpId, ReplicaId)
 import Crdt.Internal as I exposing (Seed)
 import Crdt.Json as Json
 import Crdt.MoveList as MoveList
@@ -67,9 +65,10 @@ import Crdt.OpJson as OpJson
 import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, Target, TargetStep(..))
 import Crdt.Path as Path exposing (Path, Seg(..))
 import Crdt.Rga as Rga
-import Crdt.RichText as RichText
-import Crdt.Schema as Schema exposing (Crdt)
-import Crdt.Tree as Tree
+import Crdt.RichText exposing (Block)
+import Crdt.RichText.Internal as RichText
+import Crdt.Schema.Internal as SchemaI exposing (Crdt)
+import Crdt.Tree.Internal as Tree
 import Dict
 import Json.Decode as JD exposing (Decoder)
 import Json.Encode as JE
@@ -89,20 +88,20 @@ re-materializes from `base`. Merges happen at network frequency, edits at
 keystroke frequency, so this keeps the hot path O(1).
 
 -}
-type OpDoc a
-    = OpDoc
-        { -- the schema's decoder, kept kind-erased so `OpDoc a` needs no kind
+type Doc a
+    = Doc
+        { -- the schema's decoder, kept kind-erased so `Doc a` needs no kind
           -- param (the root schema's edit-kind is irrelevant once stored — an
-          -- `OpDoc` is only ever *read* through it, and edited via `Ref`s the
+          -- `Doc` is only ever *read* through it, and edited via `Ref`s the
           -- caller holds separately).
-          decode : Node -> Result Schema.Error a
+          decode : Node -> Result SchemaI.Error a
         , base : Node
         , store : OpStore
         , ctx : Ctx
         , cached : Node
 
         -- The causal cut that `base` already incorporates. Starts empty (base =
-        -- the schema's empty tree). `gc` folds ops at-or-below a frontier into
+        -- the schema's empty tree). `compact` folds ops at-or-below a frontier into
         -- `base` and advances this; it's the boundary below which history (and
         -- time-travel) has been compacted away.
         , baseFrontier : OpLog.Frontier
@@ -192,14 +191,14 @@ type Error
 
 {-| A fresh, empty op-document for a replica and schema.
 -}
-init : ReplicaId -> Crdt kind a -> OpDoc a
+init : ReplicaId -> Crdt kind a -> Doc a
 init replica schema =
     let
         ( base, ctx ) =
-            Schema.emptyNode schema (Id.ctx replica)
+            SchemaI.emptyNode schema (Id.ctx replica)
     in
-    OpDoc
-        { decode = Schema.decodeNode schema
+    Doc
+        { decode = SchemaI.decodeNode schema
         , base = base
         , store = OpLog.empty
         , ctx = ctx
@@ -215,36 +214,36 @@ init replica schema =
 
 {-| The current materialized `Node` — the maintained cache (no re-fold).
 -}
-state : OpDoc a -> Node
-state (OpDoc d) =
+state : Doc a -> Node
+state (Doc d) =
     d.cached
 
 
 {-| Read the typed value by materializing the log and decoding through the schema.
 -}
-read : OpDoc a -> Result Schema.Error a
-read ((OpDoc d) as doc) =
+read : Doc a -> Result SchemaI.Error a
+read ((Doc d) as doc) =
     d.decode (state doc)
 
 
 {-| Merge another op-document into this one: op-store union, with the clock
 advanced past everything seen so future ids never collide.
 -}
-merge : OpDoc a -> OpDoc a -> OpDoc a
+merge : Doc a -> Doc a -> Doc a
 merge local incoming =
     mergeWithDiff local incoming |> Tuple.first
 
 
 {-| Merge, and return **what changed** as a `Diff` you can query with your typed refs
-(`Crdt.Ref.touched` / `origins`). The document result is identical to `merge`; the diff
+(`Crdt.touched` / `origins`). The document result is identical to `merge`; the diff
 is derived at no extra cost from the ops this merge actually applied (the incoming ops
 not already present), each tagged with its `Origin` (which replica authored it, relative
 to _this_ document's own replica). Use it to re-read only the changed slices — keeping
 untouched slices referentially stable so `Html.Lazy` views over them don't re-render —
 and to drive provenance-aware effects.
 -}
-mergeWithDiff : OpDoc a -> OpDoc a -> ( OpDoc a, Diff )
-mergeWithDiff (OpDoc local) (OpDoc incoming) =
+mergeWithDiff : Doc a -> Doc a -> ( Doc a, Diff )
+mergeWithDiff (Doc local) (Doc incoming) =
     let
         store =
             OpLog.merge local.store incoming.store
@@ -270,7 +269,7 @@ mergeWithDiff (OpDoc local) (OpDoc incoming) =
     -- register stamps buried in insert-op seeds (which carry counters higher than the
     -- insert op's own id) — otherwise a later local edit to a peer-created register
     -- could mint a losing LWW stamp. `Node.maxCounter` walks all of them.
-    ( OpDoc
+    ( Doc
         { local
             | store = store
             , ctx = Id.observe (Node.maxCounter cached) local.ctx
@@ -287,7 +286,7 @@ mergeWithDiff (OpDoc local) (OpDoc incoming) =
 
 {-| What a merge/ingest changed: an opaque set of touched locations, each tagged with
 the `Origin` that authored the change. Query it with the typed refs you already hold
-(`Crdt.Ref.touched ref`, `Crdt.Ref.origins`) — it never exposes an untyped path. Built
+(`Crdt.touched ref`, `Crdt.origins`) — it never exposes an untyped path. Built
 from the ops a `mergeWithDiff` / `decodeWithDiff` applied; empty if nothing changed
 (e.g. re-merging a peer you already have).
 -}
@@ -433,10 +432,10 @@ diffOrigins (Diff entries) =
 identity-addressed target, then compared to each changed target by prefix (either
 direction: a change under `path`, or to a container `path` lives in, both count). When
 several origins touched it, a `Remote` wins over `Local` (a peer's change is the
-interesting one for "did someone else edit this?"). `Crdt.Ref.touched` is the typed front
+interesting one for "did someone else edit this?"). `Crdt.touched` is the typed front
 door; `Path` never appears in a public signature.
 -}
-diffTouches : Path -> OpDoc a -> Diff -> Maybe Origin
+diffTouches : Path -> Doc a -> Diff -> Maybe Origin
 diffTouches path doc (Diff entries) =
     case resolve path doc of
         Ok ( refTarget, _ ) ->
@@ -461,7 +460,7 @@ diffTouches path doc (Diff entries) =
 {-| Best-effort `Path` → `Target` even when the path no longer fully resolves: resolve
 as far as the current state allows (used only as a fallback in `diffTouches`).
 -}
-targetOfPath : Path -> OpDoc a -> Target
+targetOfPath : Path -> Doc a -> Target
 targetOfPath path doc =
     case resolve path doc of
         Ok ( target, _ ) ->
@@ -539,16 +538,16 @@ version before an edit, then `diffSince` after), so a UI can refresh only the to
 slices no matter how the change arrived. `mergeWithDiff` / `decodeWithDiff` give the
 same information for the network path without needing a captured version.
 -}
-diffSince : Version -> OpDoc a -> Diff
-diffSince (Version known) (OpDoc d) =
+diffSince : Version -> Doc a -> Diff
+diffSince (Version known) (Doc d) =
     diffFromOps (Id.ctxReplica d.ctx) (OpLog.opsAfter known d.store)
 
 
 {-| How many operations the document holds. Useful to reason about transport
 size / delta minimality without exposing the op representation.
 -}
-opCount : OpDoc a -> Int
-opCount (OpDoc d) =
+opCount : Doc a -> Int
+opCount (Doc d) =
     List.length (OpLog.ops d.store)
 
 
@@ -558,8 +557,8 @@ merges — the Phase 2 correctness invariant (see `docs/02-oplog.md`). Exposed
 (rather than the raw `Node`s it compares) so the invariant stays checkable
 without leaking the internal state type.
 -}
-cacheConsistent : OpDoc a -> Bool
-cacheConsistent (OpDoc d) =
+cacheConsistent : Doc a -> Bool
+cacheConsistent (Doc d) =
     d.cached == OpLog.materialize d.base d.store
 
 
@@ -572,8 +571,8 @@ been GC'd (`base` holds compacted history), this is a _snapshot_ — the
 materialized base, its frontier, and the live tail ops — so a fresh peer can
 catch up even though the early ops are gone. Otherwise it's just the op set.
 -}
-encode : OpDoc a -> JE.Value
-encode (OpDoc d) =
+encode : Doc a -> JE.Value
+encode (Doc d) =
     if List.isEmpty d.baseFrontier then
         opsPayload (OpLog.ops d.store)
 
@@ -586,8 +585,8 @@ is at or ahead of our compacted `baseFrontier`, the delta is just the ops they
 lack (`opsAfter`). If they are _behind_ our `baseFrontier`, the ops they need are
 gone — so we send a snapshot (base + frontier + tail) instead.
 -}
-encodeSince : Version -> OpDoc a -> JE.Value
-encodeSince (Version known) (OpDoc d) =
+encodeSince : Version -> Doc a -> JE.Value
+encodeSince (Version known) (Doc d) =
     if frontierCovers known d.baseFrontier then
         -- peer already has everything our base subsumes: a plain op delta
         opsPayload (OpLog.opsAfter known d.store)
@@ -641,7 +640,7 @@ snapshotPayload base frontier tail =
 The cache is re-materialized and the clock advanced past everything seen.
 
 -}
-decodeInto : JE.Value -> OpDoc a -> Result String (OpDoc a)
+decodeInto : JE.Value -> Doc a -> Result String (Doc a)
 decodeInto value doc =
     decodeWithDiff value doc |> Result.map Tuple.first
 
@@ -652,11 +651,11 @@ changed** as a `Diff`, alongside the updated document — the network counterpar
 only the changed slices (keeping the rest referentially stable for `Html.Lazy`) and
 attribute the change to the peer that sent it. Same result document as `decodeInto`.
 -}
-decodeWithDiff : JE.Value -> OpDoc a -> Result String ( OpDoc a, Diff )
-decodeWithDiff value (OpDoc d) =
+decodeWithDiff : JE.Value -> Doc a -> Result String ( Doc a, Diff )
+decodeWithDiff value (Doc d) =
     JD.decodeValue payloadDecoder value
         |> Result.mapError JD.errorToString
-        |> Result.map (\payload -> applyPayload payload (OpDoc d))
+        |> Result.map (\payload -> applyPayload payload (Doc d))
 
 
 type Payload
@@ -684,13 +683,13 @@ payloadDecoder =
             )
 
 
-applyPayload : Payload -> OpDoc a -> ( OpDoc a, Diff )
-applyPayload payload (OpDoc d) =
+applyPayload : Payload -> Doc a -> ( Doc a, Diff )
+applyPayload payload (Doc d) =
     case payload of
         OpsPayload incomingOps ->
             -- base unchanged → INCREMENTAL: fold only the added ops onto the existing
             -- cache (preserving referential identity), like `merge`.
-            rebuildIncremental (List.foldl OpLog.insert d.store incomingOps) (OpDoc d)
+            rebuildIncremental (List.foldl OpLog.insert d.store incomingOps) (Doc d)
 
         SnapshotPayload snapBase snapFrontier tailOps ->
             if frontierCovers snapFrontier d.baseFrontier && not (frontierCovers d.baseFrontier snapFrontier) then
@@ -705,12 +704,12 @@ applyPayload payload (OpDoc d) =
                 in
                 -- a NEW base is a different fold origin, so re-materialize fully. This is
                 -- the rare catch-up path; correctness over identity here.
-                rebuild store1 snapBase snapFrontier (OpDoc d)
+                rebuild store1 snapBase snapFrontier (Doc d)
 
             else
                 -- we're at/ahead of the snapshot's base: ignore it, take the tail
                 -- incrementally (base unchanged).
-                rebuildIncremental (List.foldl OpLog.insert d.store tailOps) (OpDoc d)
+                rebuildIncremental (List.foldl OpLog.insert d.store tailOps) (Doc d)
 
 
 {-| Re-materialize from a (possibly new) base + store and advance the clock. Used when
@@ -718,8 +717,8 @@ applyPayload payload (OpDoc d) =
 Its diff covers every added op (a snapshot catch-up conservatively reports the whole
 delta as changed).
 -}
-rebuild : OpStore -> Node -> OpLog.Frontier -> OpDoc a -> ( OpDoc a, Diff )
-rebuild store base baseFrontier (OpDoc d) =
+rebuild : OpStore -> Node -> OpLog.Frontier -> Doc a -> ( Doc a, Diff )
+rebuild store base baseFrontier (Doc d) =
     let
         cached =
             OpLog.materialize base store
@@ -727,7 +726,7 @@ rebuild store base baseFrontier (OpDoc d) =
         added =
             OpLog.addedOpsInOrder d.store store
     in
-    ( OpDoc
+    ( Doc
         { d
             | store = store
             , base = base
@@ -745,8 +744,8 @@ the added ops onto the existing cache — the incremental, identity-preserving c
 of `rebuild`, mirroring `merge`. `base`/`baseFrontier` are unchanged. Returns the diff of
 the added ops.
 -}
-rebuildIncremental : OpStore -> OpDoc a -> ( OpDoc a, Diff )
-rebuildIncremental store (OpDoc d) =
+rebuildIncremental : OpStore -> Doc a -> ( Doc a, Diff )
+rebuildIncremental store (Doc d) =
     let
         added =
             OpLog.addedOpsInOrder d.store store
@@ -754,7 +753,7 @@ rebuildIncremental store (OpDoc d) =
         cached =
             OpLog.applyOps d.cached added
     in
-    ( OpDoc
+    ( Doc
         { d
             | store = store
             , cached = cached
@@ -786,8 +785,8 @@ type Version
 {-| The current version (the live frontier). Capture it before an edit to be able
 to return to "the state as of now" later.
 -}
-version : OpDoc a -> Version
-version (OpDoc d) =
+version : Doc a -> Version
+version (Doc d) =
     case OpLog.frontier d.store of
         [] ->
             -- store empty (fresh, or fully compacted): the version is whatever
@@ -810,16 +809,16 @@ safe across replicas if every replica you will merge with has already
 incorporated everything below `cut`. Passing your own `version` is always safe
 for a _local_ store (single replica / before persistence); passing a frontier a
 future merge partner hasn't reached can drop their not-yet-merged concurrent work
-below `cut`. See `docs/04-gc.md`.
+below `cut`. See `docs/04-compact.md`.
 
 -}
-gc : Version -> OpDoc a -> OpDoc a
-gc (Version cut) (OpDoc d) =
+compact : Version -> Doc a -> Doc a
+compact (Version cut) (Doc d) =
     let
         ( base1, store1 ) =
             OpLog.compact d.base cut d.store
     in
-    OpDoc
+    Doc
         { d
             | base = base1
             , store = store1
@@ -834,25 +833,25 @@ gc (Version cut) (OpDoc d) =
 {-| The materialized `Node` as of a `Version` — only ops causally at or before
 that frontier are folded. Newer ops (and concurrent ops from peers) are excluded.
 -}
-stateAt : Version -> OpDoc a -> Node
-stateAt (Version frontier) (OpDoc d) =
+stateAt : Version -> Doc a -> Node
+stateAt (Version frontier) (Doc d) =
     OpLog.checkout frontier d.base d.store
 
 
 {-| Read the typed value as of a `Version` — time-travel through the schema.
 The live document is unchanged; this is a read-only view of the past.
 -}
-readAt : Version -> OpDoc a -> Result Schema.Error a
-readAt v ((OpDoc d) as doc) =
+readAt : Version -> Doc a -> Result SchemaI.Error a
+readAt v ((Doc d) as doc) =
     d.decode (stateAt v doc)
 
 
 {-| How many ops the live history holds — the number of distinct edit steps you
 can scrub through. `versionAt 0` is the empty document; `versionAt (historyLength
-doc)` is the current state. (Ops folded away by `gc` are no longer scrubbable.)
+doc)` is the current state. (Ops folded away by `compact` are no longer scrubbable.)
 -}
-historyLength : OpDoc a -> Int
-historyLength (OpDoc d) =
+historyLength : Doc a -> Int
+historyLength (Doc d) =
     List.length (OpLog.causalOrder d.store)
 
 
@@ -864,8 +863,8 @@ A prefix of the causal order is downward-closed (every op's deps precede it), so
 the frontier of that prefix checks out exactly those ops.
 
 -}
-versionAt : Int -> OpDoc a -> Version
-versionAt step (OpDoc d) =
+versionAt : Int -> Doc a -> Version
+versionAt step (Doc d) =
     OpLog.causalOrder d.store
         |> List.take (max 0 step)
         |> frontierOfOps
@@ -901,7 +900,7 @@ that were _deleted_ since the version are re-created with fresh ids — the orig
 are tombstoned forever. Restoring to the current version is a no-op.
 
 -}
-restoreTo : Version -> OpDoc a -> OpDoc a
+restoreTo : Version -> Doc a -> Doc a
 restoreTo v doc =
     restoreNode [] (stateAt v doc) (state doc) doc
 
@@ -909,7 +908,7 @@ restoreTo v doc =
 {-| Emit one op against the current frontier, advancing the clock and folding it
 onto the cache (the same O(1) path as any single edit).
 -}
-emit : Action -> OpDoc a -> OpDoc a
+emit : Action -> Doc a -> Doc a
 emit action doc =
     let
         ( id, doc1 ) =
@@ -928,7 +927,7 @@ a known predecessor. Fugue's `Left`-side anchoring is used only by `applyTextDif
 which chooses parent/side itself to keep concurrent runs from interleaving.
 
 -}
-emitInsert : List TargetStep -> Maybe OpId -> Node -> OpDoc a -> ( OpId, OpDoc a )
+emitInsert : List TargetStep -> Maybe OpId -> Node -> Doc a -> ( OpId, Doc a )
 emitInsert target after seed doc =
     let
         ( elemId, doc1 ) =
@@ -939,20 +938,20 @@ emitInsert target after seed doc =
     )
 
 
-ctxOf : OpDoc a -> Ctx
-ctxOf (OpDoc d) =
+ctxOf : Doc a -> Ctx
+ctxOf (Doc d) =
     d.ctx
 
 
-withCtx : Ctx -> OpDoc a -> OpDoc a
-withCtx ctx (OpDoc d) =
-    OpDoc { d | ctx = ctx }
+withCtx : Ctx -> Doc a -> Doc a
+withCtx ctx (Doc d) =
+    Doc { d | ctx = ctx }
 
 
 {-| Emit the ops that turn `current` (at `target`) back into `old`. Recurses
 structurally; under one schema both nodes always share a shape at every path.
 -}
-restoreNode : List TargetStep -> Node -> Node -> OpDoc a -> OpDoc a
+restoreNode : List TargetStep -> Node -> Node -> Doc a -> Doc a
 restoreNode target old current doc =
     case ( old, current ) of
         ( Node.Reg ro, Node.Reg rc ) ->
@@ -1005,7 +1004,7 @@ Id-agnostic: works off the two node maps, so it's stable no matter how many othe
 undos/redos have re-minted ids around it.
 
 -}
-restoreTree : List TargetStep -> Tree.Tree Node -> Tree.Tree Node -> OpDoc a -> OpDoc a
+restoreTree : List TargetStep -> Tree.Tree Node -> Tree.Tree Node -> Doc a -> Doc a
 restoreTree target old current doc =
     let
         oldIds =
@@ -1073,7 +1072,7 @@ restoreTree target old current doc =
 {-| For a node present in both `old` and the live doc: move it back to its `old`
 parent/pos if it differs, then restore its payload.
 -}
-restoreTreeNode : List TargetStep -> Tree.Tree Node -> OpId -> OpDoc a -> OpDoc a
+restoreTreeNode : List TargetStep -> Tree.Tree Node -> OpId -> Doc a -> Doc a
 restoreTreeNode target old id doc =
     let
         liveTree =
@@ -1153,14 +1152,14 @@ visibleElems node =
                     []
 
 
-restoreMap : List TargetStep -> Dict.Dict String Node.Entry -> Dict.Dict String Node.Entry -> OpDoc a -> OpDoc a
+restoreMap : List TargetStep -> Dict.Dict String Node.Entry -> Dict.Dict String Node.Entry -> Doc a -> Doc a
 restoreMap target mo mc doc =
     (Dict.keys mo ++ Dict.keys mc)
         |> Set.fromList
         |> Set.foldl (\k d -> restoreMapKey (target ++ [ IntoKey k ]) (Dict.get k mo) (Dict.get k mc) d) doc
 
 
-restoreMapKey : List TargetStep -> Maybe Node.Entry -> Maybe Node.Entry -> OpDoc a -> OpDoc a
+restoreMapKey : List TargetStep -> Maybe Node.Entry -> Maybe Node.Entry -> Doc a -> Doc a
 restoreMapKey keyTarget mOld mCur doc =
     case ( mOld, mCur ) of
         ( Just oe, Just ce ) ->
@@ -1204,7 +1203,7 @@ order: delete current-only elements, recurse into kept ones (identity preserved)
 and re-insert version-only ones (deleted since) as fresh elements, chained into
 position.
 -}
-restoreSeq : List TargetStep -> List ( OpId, Node ) -> List ( OpId, Node ) -> OpDoc a -> OpDoc a
+restoreSeq : List TargetStep -> List ( OpId, Node ) -> List ( OpId, Node ) -> Doc a -> Doc a
 restoreSeq target oldEls curEls doc =
     let
         oldKeys =
@@ -1251,7 +1250,7 @@ restoreSeq target oldEls curEls doc =
 pass moves each item after the previous one's home cell so the final visible order
 matches the version's.
 -}
-restoreMov : List TargetStep -> List ( OpId, Node ) -> List ( OpId, Node ) -> OpDoc a -> OpDoc a
+restoreMov : List TargetStep -> List ( OpId, Node ) -> List ( OpId, Node ) -> Doc a -> Doc a
 restoreMov target oldEntries curEntries doc =
     let
         oldKeys =
@@ -1320,7 +1319,7 @@ restoreMov target oldEntries curEntries doc =
 
 
 {-| Record a local change for undo, given the version **before** it and the doc
-**after** it. The library does not know which of your `OpDoc` calls form one
+**after** it. The library does not know which of your `Doc` calls form one
 user-level "edit", so you bracket them: capture `version doc` before, make your
 edits, then call `recordEdit before edited`. The inverse of exactly the ops added
 in between is pushed onto the undo stack and the redo stack is cleared (a new edit
@@ -1331,8 +1330,8 @@ so a peer's concurrent edit to another field survives and the revert still syncs
 A no-op change (no ops added) records nothing.
 
 -}
-recordEdit : Version -> OpDoc a -> OpDoc a
-recordEdit before ((OpDoc d) as doc) =
+recordEdit : Version -> Doc a -> Doc a
+recordEdit before ((Doc d) as doc) =
     let
         after =
             version doc
@@ -1342,20 +1341,20 @@ recordEdit before ((OpDoc d) as doc) =
         doc
 
     else
-        OpDoc { d | undoStack = { before = before, after = after } :: d.undoStack, redoStack = [] }
+        Doc { d | undoStack = { before = before, after = after } :: d.undoStack, redoStack = [] }
 
 
 {-| Whether there is a local edit to undo.
 -}
-canUndo : OpDoc a -> Bool
-canUndo (OpDoc d) =
+canUndo : Doc a -> Bool
+canUndo (Doc d) =
     not (List.isEmpty d.undoStack)
 
 
 {-| Whether there is an undone local edit to redo.
 -}
-canRedo : OpDoc a -> Bool
-canRedo (OpDoc d) =
+canRedo : Doc a -> Bool
+canRedo (Doc d) =
     not (List.isEmpty d.redoStack)
 
 
@@ -1368,8 +1367,8 @@ Robust across sequences: the inverse is recomputed from the frozen version range
 each time, so earlier undos/redos re-minting ids never invalidate this entry.
 
 -}
-undo : OpDoc a -> OpDoc a
-undo ((OpDoc d) as doc) =
+undo : Doc a -> Doc a
+undo ((Doc d) as doc) =
     case d.undoStack of
         [] ->
             doc
@@ -1390,15 +1389,15 @@ undo ((OpDoc d) as doc) =
                     { before = preUndo, after = version applied }
             in
             case applied of
-                OpDoc ad ->
-                    OpDoc { ad | undoStack = rest, redoStack = redoEntry :: ad.redoStack }
+                Doc ad ->
+                    Doc { ad | undoStack = rest, redoStack = redoEntry :: ad.redoStack }
 
 
 {-| Redo the most recently undone edit: symmetric to `undo` — invert the undo's own
 ops (the range it recorded), restoring the edit.
 -}
-redo : OpDoc a -> OpDoc a
-redo ((OpDoc d) as doc) =
+redo : Doc a -> Doc a
+redo ((Doc d) as doc) =
     case d.redoStack of
         [] ->
             doc
@@ -1417,8 +1416,8 @@ redo ((OpDoc d) as doc) =
                     { before = preRedo, after = version applied }
             in
             case applied of
-                OpDoc ad ->
-                    OpDoc { ad | redoStack = rest, undoStack = undoEntry :: ad.undoStack }
+                Doc ad ->
+                    Doc { ad | redoStack = rest, undoStack = undoEntry :: ad.undoStack }
 
 
 {-| The reverse actions that undo the ops added between `before` and `after` — the
@@ -1427,8 +1426,8 @@ reverse emission order). Each inverse is computed against the state as of _just
 before_ that op applied, so a register set inverts to its prior value, a delete to
 a re-create, etc.
 -}
-inverseBetween : Version -> Version -> OpDoc a -> List RevAction
-inverseBetween (Version beforeFrontier) (Version afterFrontier) (OpDoc d) =
+inverseBetween : Version -> Version -> Doc a -> List RevAction
+inverseBetween (Version beforeFrontier) (Version afterFrontier) (Doc d) =
     let
         beforeKeys =
             OpLog.ancestorKeys beforeFrontier d.store
@@ -1555,12 +1554,12 @@ inverseOf theOp preState =
 are resolved through (and revivals recorded into) the doc's `idRemap` table, so a
 delete undone as a fresh copy stays targetable by any later inverse — see `idRemap`.
 -}
-applyRevs : List RevAction -> OpDoc a -> OpDoc a
+applyRevs : List RevAction -> Doc a -> Doc a
 applyRevs revs doc =
     List.foldl applyRev doc revs
 
 
-applyRev : RevAction -> OpDoc a -> OpDoc a
+applyRev : RevAction -> Doc a -> Doc a
 applyRev rev doc =
     case rev of
         Rev action ->
@@ -1604,7 +1603,7 @@ applyRev rev doc =
 
 {-| Emit an `AddMark` op (the op id doubles as the mark id) over `[start, end]`.
 -}
-emitMark : List TargetStep -> String -> Prim -> Node.MarkAnchor -> Node.MarkAnchor -> OpDoc a -> OpDoc a
+emitMark : List TargetStep -> String -> Prim -> Node.MarkAnchor -> Node.MarkAnchor -> Doc a -> Doc a
 emitMark container type_ value start end doc =
     let
         ( markId, doc1 ) =
@@ -1624,24 +1623,24 @@ remapAnchor table anchor =
 
 {-| The doc's current id-remap table.
 -}
-remapOf : OpDoc a -> Dict.Dict String OpId
-remapOf (OpDoc d) =
+remapOf : Doc a -> Dict.Dict String OpId
+remapOf (Doc d) =
     d.idRemap
 
 
 {-| Record `original → replacement` in the remap table.
 -}
-registerRemap : OpId -> OpId -> OpDoc a -> OpDoc a
-registerRemap original replacement (OpDoc d) =
-    OpDoc { d | idRemap = Dict.insert (Id.opIdToString original) replacement d.idRemap }
+registerRemap : OpId -> OpId -> Doc a -> Doc a
+registerRemap original replacement (Doc d) =
+    Doc { d | idRemap = Dict.insert (Id.opIdToString original) replacement d.idRemap }
 
 
 {-| Merge a whole `originalId → revivedId` map (from `Node.reStampWithMap`) into the
 remap table. Existing entries win (they were recorded by more recent revivals).
 -}
-registerRemapAll : Dict.Dict String OpId -> OpDoc a -> OpDoc a
-registerRemapAll mapping (OpDoc d) =
-    OpDoc { d | idRemap = Dict.union d.idRemap mapping }
+registerRemapAll : Dict.Dict String OpId -> Doc a -> Doc a
+registerRemapAll mapping (Doc d) =
+    Doc { d | idRemap = Dict.union d.idRemap mapping }
 
 
 {-| Resolve an id through the remap table, transitively (a revived copy that was
@@ -1772,7 +1771,7 @@ elementContent elem node =
 in the live doc, as fresh create ops. Each node gets a new id (the original is
 tombstoned); children are created under their re-minted parent, preserving order.
 -}
-reviveNode : List TargetStep -> Maybe OpId -> OpId -> Tree.Tree Node -> OpDoc a -> OpDoc a
+reviveNode : List TargetStep -> Maybe OpId -> OpId -> Tree.Tree Node -> Doc a -> Doc a
 reviveNode container newParent sourceId source doc =
     case Tree.get sourceId source of
         Nothing ->
@@ -1850,7 +1849,7 @@ element currently at visible index `offset - 1`. Fails if `path` doesn't resolve
 to a sequence/text container.
 
 -}
-cursorAt : Path -> Int -> OpDoc a -> Result Error Cursor
+cursorAt : Path -> Int -> Doc a -> Result Error Cursor
 cursorAt path offset doc =
     resolve path doc
         |> Result.andThen
@@ -1890,7 +1889,7 @@ across deletion of the anchored element (tombstones retained — see
 `Crdt.Rga.liveCountThrough`); for `Mov` it counts live values at-or-before the
 anchor in the current order.
 -}
-cursorOffset : Cursor -> OpDoc a -> Maybe Int
+cursorOffset : Cursor -> Doc a -> Maybe Int
 cursorOffset cursor doc =
     let
         node =
@@ -1941,7 +1940,7 @@ countThrough anchor ids =
 this document, normalized so `start <= end`. `Nothing` if either endpoint's
 container is gone.
 -}
-cursorRange : Cursor.Range -> OpDoc a -> Maybe ( Int, Int )
+cursorRange : Cursor.Range -> Doc a -> Maybe ( Int, Int )
 cursorRange r doc =
     Maybe.map2
         (\a f -> ( min a f, max a f ))
@@ -2035,8 +2034,8 @@ navigateTarget tgt node =
 {-| Save a named checkpoint pinning the current version. Records the label and
 the saving replica; does not change the document (no op is emitted).
 -}
-checkpoint : String -> OpDoc a -> OpDoc a
-checkpoint message ((OpDoc d) as doc) =
+checkpoint : String -> Doc a -> Doc a
+checkpoint message ((Doc d) as doc) =
     let
         cp =
             Checkpoint
@@ -2045,13 +2044,13 @@ checkpoint message ((OpDoc d) as doc) =
                 , version = version doc
                 }
     in
-    OpDoc { d | checkpoints = cp :: d.checkpoints }
+    Doc { d | checkpoints = cp :: d.checkpoints }
 
 
 {-| All saved checkpoints, most recent first.
 -}
-checkpoints : OpDoc a -> List Checkpoint
-checkpoints (OpDoc d) =
+checkpoints : Doc a -> List Checkpoint
+checkpoints (Doc d) =
     d.checkpoints
 
 
@@ -2084,9 +2083,9 @@ checkpointVersion (Checkpoint cp) =
 frontier as it stood before this batch, so the ops apply straight onto the cached
 state in emission order — no re-materialization (the O(1) hot path).
 -}
-commit : List Op -> OpDoc a -> OpDoc a
-commit newOps (OpDoc d) =
-    OpDoc
+commit : List Op -> Doc a -> Doc a
+commit newOps (Doc d) =
+    Doc
         { d
             | store = List.foldl OpLog.insert d.store newOps
             , cached = OpLog.applyOps d.cached newOps
@@ -2099,13 +2098,13 @@ commit newOps (OpDoc d) =
 
 {-| Mint a fresh op id, advancing the clock.
 -}
-mint : OpDoc a -> ( OpId, OpDoc a )
-mint (OpDoc d) =
+mint : Doc a -> ( OpId, Doc a )
+mint (Doc d) =
     let
         ( id, ctx1 ) =
             Id.nextId d.ctx
     in
-    ( id, OpDoc { d | ctx = ctx1 } )
+    ( id, Doc { d | ctx = ctx1 } )
 
 
 
@@ -2114,7 +2113,7 @@ mint (OpDoc d) =
 
 {-| Set a register leaf (LWW) to a primitive.
 -}
-setPrim : Path -> Prim -> OpDoc a -> Result Error (OpDoc a)
+setPrim : Path -> Prim -> Doc a -> Result Error (Doc a)
 setPrim path prim doc =
     resolve path doc
         |> Result.map
@@ -2129,21 +2128,21 @@ setPrim path prim doc =
 
 {-| Set a boolean register.
 -}
-setBool : Path -> Bool -> OpDoc a -> Result Error (OpDoc a)
+setBool : Path -> Bool -> Doc a -> Result Error (Doc a)
 setBool path b =
     setPrim path (PBool b)
 
 
 {-| Set an integer register.
 -}
-setInt : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+setInt : Path -> Int -> Doc a -> Result Error (Doc a)
 setInt path n =
     setPrim path (PInt n)
 
 
 {-| Set a string register (overwrite; for collaborative text use `setText`).
 -}
-setString : Path -> String -> OpDoc a -> Result Error (OpDoc a)
+setString : Path -> String -> Doc a -> Result Error (Doc a)
 setString path s =
     setPrim path (PString s)
 
@@ -2152,7 +2151,7 @@ setString path s =
 Concurrent increments from different replicas sum, rather than one clobbering the
 other.
 -}
-increment : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+increment : Path -> Int -> Doc a -> Result Error (Doc a)
 increment path delta doc =
     resolve path doc
         |> Result.map
@@ -2173,7 +2172,7 @@ increment path delta doc =
 character insert/delete ops (a common-prefix/suffix diff) so concurrent edits in
 other regions survive.
 -}
-setText : Path -> String -> OpDoc a -> Result Error (OpDoc a)
+setText : Path -> String -> Doc a -> Result Error (Doc a)
 setText path value doc =
     resolve path doc
         |> Result.andThen
@@ -2191,7 +2190,7 @@ setText path value doc =
 `value` (a minimal insert/delete diff, like `setText`). Marks are untouched; because
 they anchor to surviving characters, formatting follows the edited text.
 -}
-setRichText : Path -> String -> OpDoc a -> Result Error (OpDoc a)
+setRichText : Path -> String -> Doc a -> Result Error (Doc a)
 setRichText path value doc =
     resolve path doc
         |> Result.andThen
@@ -2211,7 +2210,7 @@ anchors inserts inside the block (so text can't leak across a block marker into 
 wrong block — the whole-document `setRichText` can't express that). Marks/other
 blocks are untouched.
 -}
-setBlockText : Path -> Int -> String -> OpDoc a -> Result Error (OpDoc a)
+setBlockText : Path -> Int -> String -> Doc a -> Result Error (Doc a)
 setBlockText path blockIndex value doc =
     withRich path
         doc
@@ -2297,7 +2296,7 @@ charElemsOfBlock r blockIndex =
 `[from, to)` of a rich-text field. The range is resolved to character identities, so
 the mark is stable under concurrent edits.
 -}
-mark : Path -> Int -> Int -> String -> Prim -> OpDoc a -> Result Error (OpDoc a)
+mark : Path -> Int -> Int -> String -> Prim -> Doc a -> Result Error (Doc a)
 mark path from to type_ value doc =
     markRange path from to type_ value doc
 
@@ -2305,12 +2304,12 @@ mark path from to type_ value doc =
 {-| Clear mark `type_` over the visible range `[from, to)` (an `AddMark` with value
 `PNull`, which competes by LWW with any covering set-op).
 -}
-clearMark : Path -> Int -> Int -> String -> OpDoc a -> Result Error (OpDoc a)
+clearMark : Path -> Int -> Int -> String -> Doc a -> Result Error (Doc a)
 clearMark path from to type_ doc =
     markRange path from to type_ PNull doc
 
 
-markRange : Path -> Int -> Int -> String -> Prim -> OpDoc a -> Result Error (OpDoc a)
+markRange : Path -> Int -> Int -> String -> Prim -> Doc a -> Result Error (Doc a)
 markRange path from to type_ value doc =
     resolve path doc
         |> Result.andThen
@@ -2374,7 +2373,7 @@ that wants a different rule, e.g. heading → paragraph, applies it on top with 
 follow-up `setBlockType`.)
 
 -}
-splitBlock : Path -> Int -> Int -> OpDoc a -> Result Error (OpDoc a)
+splitBlock : Path -> Int -> Int -> Doc a -> Result Error (Doc a)
 splitBlock path blockIndex charOffset doc =
     withRich path
         doc
@@ -2423,7 +2422,7 @@ splitBlock path blockIndex charOffset doc =
 (`DeleteElem`). The two runs coalesce; no characters move. No-op on block 0 (it has
 no separator before it) or an out-of-range index.
 -}
-mergeBlock : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+mergeBlock : Path -> Int -> Doc a -> Result Error (Doc a)
 mergeBlock path blockIndex doc =
     withRich path
         doc
@@ -2450,7 +2449,7 @@ covers that block's marker element. **Block 0 has no marker element** — its ty
 back by `RichText.leadingTypeMark`. Either way the mark uses a freshly minted id and
 converges by per-target LWW; there is no reserved element or constant id.
 -}
-setBlockType : Path -> Int -> Maybe String -> OpDoc a -> Result Error (OpDoc a)
+setBlockType : Path -> Int -> Maybe String -> Doc a -> Result Error (Doc a)
 setBlockType path blockIndex maybeType doc =
     withRich path
         doc
@@ -2496,7 +2495,7 @@ setBlockType path blockIndex maybeType doc =
 Accretive — concurrent indent/outdent commute. For block 0 the token is placed at the
 document head (before the first char); for a separator block, right after its marker.
 -}
-indentBlock : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+indentBlock : Path -> Int -> Doc a -> Result Error (Doc a)
 indentBlock path blockIndex doc =
     withRich path
         doc
@@ -2521,7 +2520,7 @@ indentBlock path blockIndex doc =
 depth 0). Two concurrent outdents hit the same token → one net outdent. For block 0 the
 tokens are the head nest tokens (before the first marker).
 -}
-outdentBlock : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+outdentBlock : Path -> Int -> Doc a -> Result Error (Doc a)
 outdentBlock path blockIndex doc =
     withRich path
         doc
@@ -2603,7 +2602,7 @@ leadingNestToken rga =
 
 {-| Resolve a rich-text field and run `f target richNode`, or a `WrongNodeType` error.
 -}
-withRich : Path -> OpDoc a -> (List TargetStep -> Node.RichNode -> OpDoc a) -> Result Error (OpDoc a)
+withRich : Path -> Doc a -> (List TargetStep -> Node.RichNode -> Doc a) -> Result Error (Doc a)
 withRich path doc f =
     resolve path doc
         |> Result.andThen
@@ -2621,7 +2620,7 @@ withRich path doc f =
 Fugue placement. Distinct from `emitInsert` only in that the caller supplies the
 `parent`/`side` directly (block elements are placed by us, not appended after).
 -}
-emitBlockElem : List TargetStep -> Maybe OpId -> Rga.Side -> Node -> OpDoc a -> OpDoc a
+emitBlockElem : List TargetStep -> Maybe OpId -> Rga.Side -> Node -> Doc a -> Doc a
 emitBlockElem target parent side seed doc =
     let
         ( elemId, doc1 ) =
@@ -2635,7 +2634,7 @@ used for the **leading marker**, which has a well-known constant id so concurren
 creators dedupe. The op is idempotent: re-inserting the same id/action is a no-op in
 the store, so two peers both creating it converge to one element.
 -}
-emitBlockElemWithId : OpId -> List TargetStep -> Maybe OpId -> Rga.Side -> Node -> OpDoc a -> OpDoc a
+emitBlockElemWithId : OpId -> List TargetStep -> Maybe OpId -> Rga.Side -> Node -> Doc a -> Doc a
 emitBlockElemWithId elemId target parent side seed doc =
     let
         seeded =
@@ -2736,7 +2735,7 @@ highestNestToken rga markerId =
 
 {-| Diff the whole char sequence of a text/rich node to read as `value`.
 -}
-applyTextDiff : List TargetStep -> Rga.Rga Node -> String -> OpDoc a -> OpDoc a
+applyTextDiff : List TargetStep -> Rga.Rga Node -> String -> Doc a -> Doc a
 applyTextDiff target rga value doc =
     let
         -- CHARACTER elements only — a rich-text sequence may also hold block markers /
@@ -2771,7 +2770,7 @@ the document edge (head / end). `rga` is the full text sequence (for Fugue place
 Used by both `applyTextDiff` (whole sequence, both fallbacks `Nothing`) and
 `setBlockText` (one block's chars).
 -}
-applyCharDiff : List TargetStep -> Rga.Rga Node -> List ( OpId, String ) -> Maybe OpId -> Maybe OpId -> String -> OpDoc a -> OpDoc a
+applyCharDiff : List TargetStep -> Rga.Rga Node -> List ( OpId, String ) -> Maybe OpId -> Maybe OpId -> String -> Doc a -> Doc a
 applyCharDiff target rga charElems fallbackLeft fallbackRight value doc =
     let
         -- each char element holds exactly one char (they are minted per-char), so
@@ -2965,7 +2964,7 @@ re-ordering — so a run of appends to one list is O(1) each instead of O(n²)
 overall. Otherwise we compute it once and start the run.
 
 -}
-listAppend : Path -> Seed -> OpDoc a -> Result Error (OpDoc a)
+listAppend : Path -> Seed -> Doc a -> Result Error (Doc a)
 listAppend path seed doc =
     resolve path doc
         |> Result.andThen
@@ -3027,8 +3026,8 @@ anchorBefore i node =
 {-| The cached last-appended id for `target`, if the append fast-path is live for
 exactly this list.
 -}
-appendCacheFor : List TargetStep -> OpDoc a -> Maybe OpId
-appendCacheFor target (OpDoc d) =
+appendCacheFor : List TargetStep -> Doc a -> Maybe OpId
+appendCacheFor target (Doc d) =
     case d.lastAppend of
         Just ( cachedTarget, lastId ) ->
             if cachedTarget == target then
@@ -3043,7 +3042,7 @@ appendCacheFor target (OpDoc d) =
 
 {-| Tombstone the element at a visible index in a list.
 -}
-listRemove : Path -> Int -> OpDoc a -> Result Error (OpDoc a)
+listRemove : Path -> Int -> Doc a -> Result Error (Doc a)
 listRemove path i doc =
     resolve path doc
         |> Result.andThen
@@ -3069,7 +3068,7 @@ listRemove path i doc =
 `movableList`. The item keeps its identity (nested edits and cursors follow it).
 On a plain `list` (`Seq`) this fails — only `movableList` supports moves.
 -}
-listMove : Path -> Int -> Int -> OpDoc a -> Result Error (OpDoc a)
+listMove : Path -> Int -> Int -> Doc a -> Result Error (Doc a)
 listMove path from to doc =
     resolve path doc
         |> Result.andThen
@@ -3113,7 +3112,7 @@ listMove path from to doc =
 {-| Add a new node to the tree at `path`, as the **last child** of `parent`
 (`Nothing` = a new root), seeded from `seed`. The new node's id is minted here.
 -}
-treeAddChild : Path -> Maybe OpId -> Seed -> OpDoc a -> Result Error (OpDoc a)
+treeAddChild : Path -> Maybe OpId -> Seed -> Doc a -> Result Error (Doc a)
 treeAddChild path parent seed doc =
     treeContainer path doc
         |> Result.map
@@ -3144,28 +3143,28 @@ treeAddChild path parent seed doc =
 Cycle-forming moves are skipped at read (the node stays put), so this always
 converges. No seed — the node keeps its content.
 -}
-treeMoveInto : Path -> OpId -> Maybe OpId -> OpDoc a -> Result Error (OpDoc a)
+treeMoveInto : Path -> OpId -> Maybe OpId -> Doc a -> Result Error (Doc a)
 treeMoveInto path child parent doc =
     treeMoveTo path child parent (\t -> endPos parent t) doc
 
 
 {-| Move `child` to sit immediately **before** `sibling` (same parent as sibling).
 -}
-treeMoveBefore : Path -> OpId -> OpId -> OpDoc a -> Result Error (OpDoc a)
+treeMoveBefore : Path -> OpId -> OpId -> Doc a -> Result Error (Doc a)
 treeMoveBefore path child sibling doc =
     treeMoveTo path child (currentParent path sibling doc) (\t -> beforePos sibling t) doc
 
 
 {-| Move `child` to sit immediately **after** `sibling` (same parent as sibling).
 -}
-treeMoveAfter : Path -> OpId -> OpId -> OpDoc a -> Result Error (OpDoc a)
+treeMoveAfter : Path -> OpId -> OpId -> Doc a -> Result Error (Doc a)
 treeMoveAfter path child sibling doc =
     treeMoveTo path child (currentParent path sibling doc) (\t -> afterPos sibling t) doc
 
 
 {-| Delete a tree node (and its subtree, at read) at `path`.
 -}
-treeRemove : Path -> OpId -> OpDoc a -> Result Error (OpDoc a)
+treeRemove : Path -> OpId -> Doc a -> Result Error (Doc a)
 treeRemove path child doc =
     treeContainer path doc
         |> Result.map
@@ -3181,7 +3180,7 @@ treeRemove path child doc =
 {-| Shared move emitter: resolve the tree container, compute the position with
 `posOf`, emit a seedless `TreeMove`.
 -}
-treeMoveTo : Path -> OpId -> Maybe OpId -> (Tree.Tree Node -> Crdt.Frac.Frac) -> OpDoc a -> Result Error (OpDoc a)
+treeMoveTo : Path -> OpId -> Maybe OpId -> (Tree.Tree Node -> Crdt.Frac.Frac) -> Doc a -> Result Error (Doc a)
 treeMoveTo path child parent posOf doc =
     treeContainer path doc
         |> Result.map
@@ -3198,7 +3197,7 @@ treeMoveTo path child parent posOf doc =
 
 {-| Resolve a path to a tree node: its id-target plus the `Tree` value.
 -}
-treeContainer : Path -> OpDoc a -> Result Error ( List TargetStep, Tree.Tree Node )
+treeContainer : Path -> Doc a -> Result Error ( List TargetStep, Tree.Tree Node )
 treeContainer path doc =
     resolve path doc
         |> Result.andThen
@@ -3214,7 +3213,7 @@ treeContainer path doc =
 
 {-| The current parent of `sibling` in the tree at `path` (for before/after moves).
 -}
-currentParent : Path -> OpId -> OpDoc a -> Maybe OpId
+currentParent : Path -> OpId -> Doc a -> Maybe OpId
 currentParent path sibling doc =
     treeContainer path doc
         |> Result.toMaybe
@@ -3311,8 +3310,8 @@ followingSibling target ids =
 `target` so the next append to this list is O(1). `commit` clears `lastAppend`
 first (any edit invalidates it), so we re-establish it here afterwards.
 -}
-emitAppend : List TargetStep -> Maybe OpId -> Seed -> OpDoc a -> OpDoc a
-emitAppend target after seed (OpDoc d) =
+emitAppend : List TargetStep -> Maybe OpId -> Seed -> Doc a -> Doc a
+emitAppend target after seed (Doc d) =
     let
         ( elemId, ctx1 ) =
             Id.nextId d.ctx
@@ -3321,7 +3320,7 @@ emitAppend target after seed (OpDoc d) =
             I.runSeed seed ctx1
 
         doc1 =
-            OpDoc { d | ctx = ctx2 }
+            Doc { d | ctx = ctx2 }
 
         committed =
             commit
@@ -3329,8 +3328,8 @@ emitAppend target after seed (OpDoc d) =
                 doc1
     in
     case committed of
-        OpDoc cd ->
-            OpDoc { cd | lastAppend = Just ( target, elemId ) }
+        Doc cd ->
+            Doc { cd | lastAppend = Just ( target, elemId ) }
 
 
 
@@ -3339,13 +3338,13 @@ emitAppend target after seed (OpDoc d) =
 
 {-| Set (or overwrite) a dictionary key to a fresh subtree, marking it present.
 -}
-setKey : Path -> String -> Seed -> OpDoc a -> Result Error (OpDoc a)
+setKey : Path -> String -> Seed -> Doc a -> Result Error (Doc a)
 setKey path k seed doc =
     resolve path doc
         |> Result.map
             (\( target, _ ) ->
                 let
-                    (OpDoc d) =
+                    (Doc d) =
                         doc
 
                     ( id, ctx1 ) =
@@ -3355,7 +3354,7 @@ setKey path k seed doc =
                         I.runSeed seed ctx1
 
                     doc1 =
-                        OpDoc { d | ctx = ctx2 }
+                        Doc { d | ctx = ctx2 }
                 in
                 commit
                     [ op id (frontierOf doc1) (SetPresence { target = target ++ [ IntoKey k ], present = True, seed = seedNode }) ]
@@ -3365,7 +3364,7 @@ setKey path k seed doc =
 
 {-| Remove a dictionary key (LWW presence tombstone).
 -}
-removeKey : Path -> String -> OpDoc a -> Result Error (OpDoc a)
+removeKey : Path -> String -> Doc a -> Result Error (Doc a)
 removeKey path k doc =
     resolve path doc
         |> Result.map
@@ -3380,20 +3379,20 @@ removeKey path k doc =
             )
 
 
-{-| Add a **contribution** to a user-defined op-set CRDT (`Crdt.Schema.opSet`): write the
+{-| Add a **contribution** to a user-defined op-set CRDT (`Crdt.SchemaI.opSet`): write the
 seeded contribution node under a freshly-minted **op-id key**, so every contribution has a
 unique identity and concurrent contributions from any replicas all survive a merge (they
 union by distinct key). This is `setKey` with the key being the op's own id — the one new
 primitive extensibility needs, reusing the existing presence op. Returns the contribution's
 key (its op-id string) so a caller can later `retract` exactly it.
 -}
-contribute : Path -> Seed -> OpDoc a -> Result Error ( String, OpDoc a )
+contribute : Path -> Seed -> Doc a -> Result Error ( String, Doc a )
 contribute path seed doc =
     resolve path doc
         |> Result.map
             (\( target, _ ) ->
                 let
-                    (OpDoc d) =
+                    (Doc d) =
                         doc
 
                     ( id, ctx1 ) =
@@ -3406,7 +3405,7 @@ contribute path seed doc =
                         I.runSeed seed ctx1
 
                     doc1 =
-                        OpDoc { d | ctx = ctx2 }
+                        Doc { d | ctx = ctx2 }
                 in
                 ( key
                 , commit
@@ -3421,7 +3420,7 @@ contribute path seed doc =
 into the read. Turns a grow-only op-set into a two-phase / removable one. No-op if the key
 is unknown (nothing to remove).
 -}
-retract : Path -> String -> OpDoc a -> Result Error (OpDoc a)
+retract : Path -> String -> Doc a -> Result Error (Doc a)
 retract path key doc =
     resolve path doc
         |> Result.map
@@ -3445,14 +3444,14 @@ stable, id-based `Target` plus the node found there. This is the bridge from the
 index-addressed public API to the identity-addressed op model — list indices
 become element `OpId`s, so the emitted op is position-independent.
 -}
-resolve : Path -> OpDoc a -> Result Error ( List TargetStep, Node )
+resolve : Path -> Doc a -> Result Error ( List TargetStep, Node )
 resolve path doc =
     walk (Path.segments path) (state doc) []
 
 
 
 -- REF PRIMITIVES -------------------------------------------------------------
--- Node-free entry points that `Crdt.Ref` builds its typed `set`/`over` on.
+-- Node-free entry points that the `Crdt` module builds its typed `set`/`over` on.
 -- They keep the `Node` type internal: callers pass a `Seed` (opaque) or a
 -- sub-schema, never a `Node`.
 
@@ -3461,9 +3460,9 @@ resolve path doc =
 emitting the **minimal** ops to get there (so concurrent edits elsewhere survive).
 The seed's node is compared against the current node with the same diff engine
 `restoreTo` uses; a text target additionally gets a character-level diff so
-collaborative text still merges by character. Used by `Crdt.Ref`'s `set`.
+collaborative text still merges by character. Used by the `Crdt` module's `set`.
 -}
-seedNodeAt : Path -> Seed -> OpDoc a -> Result Error (OpDoc a)
+seedNodeAt : Path -> Seed -> Doc a -> Result Error (Doc a)
 seedNodeAt path seed doc =
     case resolve path doc of
         Ok ( target, current ) ->
@@ -3503,7 +3502,7 @@ seedNodeAt path seed doc =
 a `SetPresence` creating it with the seeded value; else `Nothing` (the caller keeps the
 original resolve error). Enables writing an unseeded (migration-tolerant) field.
 -}
-seedAbsentField : Path -> Seed -> OpDoc a -> Maybe (OpDoc a)
+seedAbsentField : Path -> Seed -> Doc a -> Maybe (Doc a)
 seedAbsentField path seed doc =
     case List.reverse (Path.segments path) of
         (Path.Field name) :: revParent ->
@@ -3543,7 +3542,7 @@ pathOfSegments segs =
 `Nothing` if the parent doesn't resolve to a map or the key already exists (then the
 normal path should have handled it).
 -}
-createKeyAt : Path -> String -> Seed -> OpDoc a -> Maybe (OpDoc a)
+createKeyAt : Path -> String -> Seed -> Doc a -> Maybe (Doc a)
 createKeyAt parentPath name seed doc =
     case resolve parentPath doc of
         Ok ( parentTarget, parentNode ) ->
@@ -3574,17 +3573,17 @@ createKeyAt parentPath name seed doc =
             Nothing
 
 
-{-| Read the typed value at `path` through a sub-schema. `Crdt.Ref`'s `over` uses
+{-| Read the typed value at `path` through a sub-schema. the `Crdt` module's `over` uses
 this to fetch the current value, apply a function, and write it back with
 `seedNodeAt`. Keeps `Node` internal (the sub-schema decodes it).
 -}
-subValue : Crdt kind sub -> Path -> OpDoc a -> Result Error sub
+subValue : Crdt kind sub -> Path -> Doc a -> Result Error sub
 subValue schema path doc =
     resolve path doc
         |> Result.andThen
             (\( _, node ) ->
-                Schema.decodeNode schema node
-                    |> Result.mapError (\e -> WrongNodeType (Schema.errorToString e))
+                SchemaI.decodeNode schema node
+                    |> Result.mapError (\e -> WrongNodeType (SchemaI.errorToString e))
             )
 
 
@@ -3593,7 +3592,7 @@ subValue schema path doc =
 block edits (`splitBlock` etc.) address markers by the `marker` id these carry. See
 `Crdt.RichText.toBlocks` / `docs/11`.
 -}
-readBlocks : Path -> OpDoc a -> Result Error (List RichText.Block)
+readBlocks : Path -> Doc a -> Result Error (List Block)
 readBlocks path doc =
     resolve path doc
         |> Result.andThen
@@ -3723,8 +3722,8 @@ op id deps action =
     { id = id, deps = deps, action = action }
 
 
-frontierOf : OpDoc a -> OpLog.Frontier
-frontierOf (OpDoc d) =
+frontierOf : Doc a -> OpLog.Frontier
+frontierOf (Doc d) =
     OpLog.frontier d.store
 
 

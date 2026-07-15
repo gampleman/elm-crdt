@@ -6,10 +6,11 @@ Peritext flatten: per-character LWW by op id, PNull clears, run grouping, and th
 mark covers characters strictly between its anchor boundaries.
 -}
 
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.Node as Node exposing (AnchorSide(..), MarkAnchor, MarkOp, Prim(..))
 import Crdt.Rga as Rga
 import Crdt.RichText as RichText
+import Crdt.RichText.Internal as RTI
 import Dict
 import Expect
 import Test exposing (Test, describe, test)
@@ -84,7 +85,7 @@ E.g. `he|llo{bold}` = "he" unmarked, "llo" bold.
 -}
 render : Node.RichNode -> String
 render node =
-    RichText.toSpans node
+    RTI.toSpans node
         |> List.map
             (\s ->
                 let
@@ -120,7 +121,7 @@ suite =
                 render (richFrom "hello" []) |> Expect.equal "hello"
         , test "plainText ignores marks" <|
             \_ ->
-                RichText.plainText (richFrom "hello" [ mark 100 "bold" (PBool True) ( 0, Before ) ( 0, After ) ])
+                RTI.plainText (richFrom "hello" [ mark 100 "bold" (PBool True) ( 0, Before ) ( 0, After ) ])
                     |> Expect.equal "hello"
         , test "bold a middle range splits into three spans" <|
             \_ ->

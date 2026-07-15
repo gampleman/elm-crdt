@@ -14,7 +14,7 @@ The central properties:
 
 -}
 
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, TargetStep(..))
 import Crdt.Rga as Rga

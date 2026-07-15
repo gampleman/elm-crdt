@@ -5,15 +5,15 @@ not interleave.** This is the merge-quality property RGA lacks and the whole rea
 for `docs/09-fugue.md`. Convergence (agreement) held under RGA too; what Fugue adds
 is that each replica's run stays a contiguous block.
 
-We drive it end-to-end through the public `Crdt.OpDoc` text API (`setText`) and the
+We drive it end-to-end through the public `Crdt.Doc` text API (`setText`) and the
 real sync path (`encode`/`decodeInto`), plus a couple of unit-level ordering checks
 on `Crdt.Rga` directly for the `side = Left` case that RGA could not express.
 
 -}
 
-import Crdt.Id as Id
+import Crdt.Doc.Internal as Doc exposing (Doc)
+import Crdt.Id.Internal as Id
 import Crdt.Node as Node exposing (Node, Prim(..))
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
 import Crdt.Rga as Rga
 import Crdt.Schema.Internal as S exposing (Crdt)
@@ -26,13 +26,13 @@ import Test exposing (Test, describe, fuzz2, test)
 -- SCHEMA: a single text field ------------------------------------------------
 
 
-type alias Doc =
+type alias Sample =
     { body : String }
 
 
-schema : Crdt S.Nested Doc
+schema : Crdt S.Nested Sample
 schema =
-    S.record Doc
+    S.record Sample
         |> S.field "body" .body S.text
         |> S.build
 
@@ -42,26 +42,26 @@ bodyPath =
     Path.root |> Path.field "body"
 
 
-initDoc : String -> OpDoc Doc
+initDoc : String -> Doc Sample
 initDoc name =
-    OpDoc.init (Id.replica name) schema
+    Doc.init (Id.replica name) schema
 
 
-setBody : String -> OpDoc Doc -> OpDoc Doc
+setBody : String -> Doc Sample -> Doc Sample
 setBody s doc =
-    OpDoc.setText bodyPath s doc |> Result.withDefault doc
+    Doc.setText bodyPath s doc |> Result.withDefault doc
 
 
-body : OpDoc Doc -> String
+body : Doc Sample -> String
 body doc =
-    OpDoc.read doc |> Result.map .body |> Result.withDefault "<err>"
+    Doc.read doc |> Result.map .body |> Result.withDefault "<err>"
 
 
 {-| Merge `from` fully into `to` (both directions makes convergence checks trivial).
 -}
-mergeIn : OpDoc Doc -> OpDoc Doc -> OpDoc Doc
+mergeIn : Doc Sample -> Doc Sample -> Doc Sample
 mergeIn from to =
-    OpDoc.decodeInto (OpDoc.encode from) to |> Result.withDefault to
+    Doc.decodeInto (Doc.encode from) to |> Result.withDefault to
 
 
 

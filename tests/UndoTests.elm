@@ -1,6 +1,6 @@
 module UndoTests exposing (suite)
 
-{-| Loro-style **local** undo/redo (`OpDoc.recordEdit` / `undo` / `redo`).
+{-| Loro-style **local** undo/redo (`Doc.recordEdit` / `undo` / `redo`).
 
 This is per-replica undo, not global time-travel: `undo` inverts _this_ replica's
 own ops as fresh ops, so
@@ -18,8 +18,8 @@ identity not. That is asserted by value.
 
 -}
 
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
 import Crdt.Schema.Internal as S exposing (Crdt)
 import Dict
@@ -79,12 +79,12 @@ todoDonePath i =
     Path.root |> Path.field "todos" |> Path.index i |> Path.field "done"
 
 
-initDoc : String -> OpDoc Board
+initDoc : String -> Doc Board
 initDoc name =
-    OpDoc.init (Id.replica name) schema
+    Doc.init (Id.replica name) schema
 
 
-ok : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
+ok : Doc Board -> Result Doc.Error (Doc Board) -> Doc Board
 ok fallback =
     Result.withDefault fallback
 
@@ -101,35 +101,35 @@ texts board =
 
 {-| Make one tracked edit: capture the version, apply `f`, record it for undo.
 -}
-edit : (OpDoc Board -> OpDoc Board) -> OpDoc Board -> OpDoc Board
+edit : (Doc Board -> Doc Board) -> Doc Board -> Doc Board
 edit f doc =
     let
         before =
-            OpDoc.version doc
+            Doc.version doc
     in
-    OpDoc.recordEdit before (f doc)
+    Doc.recordEdit before (f doc)
 
 
-appendTodo : String -> OpDoc Board -> OpDoc Board
+appendTodo : String -> Doc Board -> Doc Board
 appendTodo t doc =
-    edit (\d -> OpDoc.listAppend todosPath (todo t) d |> ok d) doc
+    edit (\d -> Doc.listAppend todosPath (todo t) d |> ok d) doc
 
 
-readTexts : OpDoc Board -> Result S.Error (List String)
+readTexts : Doc Board -> Result S.Error (List String)
 readTexts =
-    OpDoc.read >> Result.map texts
+    Doc.read >> Result.map texts
 
 
 suite : Test
 suite =
-    describe "OpDoc local undo/redo"
+    describe "Doc local undo/redo"
         [ describe "basics"
             [ test "undo reverts the last edit" <|
                 \_ ->
                     initDoc "alice"
                         |> appendTodo "A"
                         |> appendTodo "B"
-                        |> OpDoc.undo
+                        |> Doc.undo
                         |> readTexts
                         |> Expect.equal (Ok [ "A" ])
             , test "undo then redo restores it" <|
@@ -137,8 +137,8 @@ suite =
                     initDoc "alice"
                         |> appendTodo "A"
                         |> appendTodo "B"
-                        |> OpDoc.undo
-                        |> OpDoc.redo
+                        |> Doc.undo
+                        |> Doc.redo
                         |> readTexts
                         |> Expect.equal (Ok [ "A", "B" ])
             , test "multiple undos peel edits in reverse order" <|
@@ -147,8 +147,8 @@ suite =
                         |> appendTodo "A"
                         |> appendTodo "B"
                         |> appendTodo "C"
-                        |> OpDoc.undo
-                        |> OpDoc.undo
+                        |> Doc.undo
+                        |> Doc.undo
                         |> readTexts
                         |> Expect.equal (Ok [ "A" ])
             , test "canUndo / canRedo track stack state" <|
@@ -161,10 +161,10 @@ suite =
                             appendTodo "A" d0
 
                         d2 =
-                            OpDoc.undo d1
+                            Doc.undo d1
                     in
                     Expect.equal
-                        ( OpDoc.canUndo d0, OpDoc.canUndo d1, OpDoc.canRedo d2 )
+                        ( Doc.canUndo d0, Doc.canUndo d1, Doc.canRedo d2 )
                         ( False, True, True )
             , test "a fresh edit clears the redo stack" <|
                 \_ ->
@@ -173,12 +173,12 @@ suite =
                             initDoc "alice"
                                 |> appendTodo "A"
                                 |> appendTodo "B"
-                                |> OpDoc.undo
+                                |> Doc.undo
                                 |> appendTodo "C"
                     in
                     Expect.all
                         [ \_ -> Expect.equal (Ok [ "A", "C" ]) (readTexts d)
-                        , \_ -> Expect.equal False (OpDoc.canRedo d)
+                        , \_ -> Expect.equal False (Doc.canRedo d)
                         ]
                         ()
             , test "undoing past the bottom of the stack is a no-op" <|
@@ -188,7 +188,7 @@ suite =
                             appendTodo "A" (initDoc "alice")
                     in
                     -- one real undo (-> []), then two extra undos do nothing
-                    OpDoc.undo (OpDoc.undo (OpDoc.undo d))
+                    Doc.undo (Doc.undo (Doc.undo d))
                         |> readTexts
                         |> Expect.equal (Ok [])
             , test "recordEdit of a no-op change records nothing" <|
@@ -198,14 +198,14 @@ suite =
                             appendTodo "A" (initDoc "alice")
 
                         before =
-                            OpDoc.version d
+                            Doc.version d
 
                         -- no edit between capture and record
                         d2 =
-                            OpDoc.recordEdit before d
+                            Doc.recordEdit before d
                     in
                     -- the only undoable thing is still the append
-                    OpDoc.undo d2 |> readTexts |> Expect.equal (Ok [])
+                    Doc.undo d2 |> readTexts |> Expect.equal (Ok [])
             ]
         , describe "across edit kinds"
             [ test "undo a register edit restores the prior value" <|
@@ -214,20 +214,20 @@ suite =
                         d =
                             initDoc "alice"
                                 |> appendTodo "A"
-                                |> edit (\x -> OpDoc.setBool (todoDonePath 0) True x |> ok x)
+                                |> edit (\x -> Doc.setBool (todoDonePath 0) True x |> ok x)
                     in
                     Expect.all
-                        [ \_ -> Expect.equal (Ok [ True ]) (OpDoc.read d |> Result.map (.todos >> List.map .done))
-                        , \_ -> Expect.equal (Ok [ False ]) (OpDoc.undo d |> OpDoc.read |> Result.map (.todos >> List.map .done))
+                        [ \_ -> Expect.equal (Ok [ True ]) (Doc.read d |> Result.map (.todos >> List.map .done))
+                        , \_ -> Expect.equal (Ok [ False ]) (Doc.undo d |> Doc.read |> Result.map (.todos >> List.map .done))
                         ]
                         ()
             , test "undo a counter increment subtracts it back" <|
                 \_ ->
                     initDoc "alice"
-                        |> edit (\d -> OpDoc.increment votesPath 5 d |> ok d)
-                        |> edit (\d -> OpDoc.increment votesPath 3 d |> ok d)
-                        |> OpDoc.undo
-                        |> OpDoc.read
+                        |> edit (\d -> Doc.increment votesPath 5 d |> ok d)
+                        |> edit (\d -> Doc.increment votesPath 3 d |> ok d)
+                        |> Doc.undo
+                        |> Doc.read
                         |> Result.map .votes
                         |> Expect.equal (Ok 5)
             , test "undo a dict key add removes it; redo re-adds" <|
@@ -235,14 +235,14 @@ suite =
                     let
                         d =
                             initDoc "alice"
-                                |> edit (\x -> OpDoc.setKey notesPath "k" (S.text |> S.with "v") x |> ok x)
+                                |> edit (\x -> Doc.setKey notesPath "k" (S.text |> S.with "v") x |> ok x)
 
                         undone =
-                            OpDoc.undo d
+                            Doc.undo d
                     in
                     Expect.all
-                        [ \_ -> Expect.equal (Ok Dict.empty) (OpDoc.read undone |> Result.map .notes)
-                        , \_ -> Expect.equal (Ok (Dict.fromList [ ( "k", "v" ) ])) (OpDoc.redo undone |> OpDoc.read |> Result.map .notes)
+                        [ \_ -> Expect.equal (Ok Dict.empty) (Doc.read undone |> Result.map .notes)
+                        , \_ -> Expect.equal (Ok (Dict.fromList [ ( "k", "v" ) ])) (Doc.redo undone |> Doc.read |> Result.map .notes)
                         ]
                         ()
             , test "undo a delete re-creates the item (fresh identity, same value/position)" <|
@@ -251,8 +251,8 @@ suite =
                         |> appendTodo "A"
                         |> appendTodo "B"
                         |> appendTodo "C"
-                        |> edit (\d -> OpDoc.listRemove todosPath 1 d |> ok d)
-                        |> OpDoc.undo
+                        |> edit (\d -> Doc.listRemove todosPath 1 d |> ok d)
+                        |> Doc.undo
                         |> readTexts
                         |> Expect.equal (Ok [ "A", "B", "C" ])
             , test "undo a move puts the item back in place" <|
@@ -261,8 +261,8 @@ suite =
                         |> appendTodo "A"
                         |> appendTodo "B"
                         |> appendTodo "C"
-                        |> edit (\d -> OpDoc.listMove todosPath 0 2 d |> ok d)
-                        |> OpDoc.undo
+                        |> edit (\d -> Doc.listMove todosPath 0 2 d |> ok d)
+                        |> Doc.undo
                         |> readTexts
                         |> Expect.equal (Ok [ "A", "B", "C" ])
             , test "undo/redo cycle is stable across repetition" <|
@@ -273,10 +273,10 @@ suite =
 
                         cycled =
                             d
-                                |> OpDoc.undo
-                                |> OpDoc.redo
-                                |> OpDoc.undo
-                                |> OpDoc.redo
+                                |> Doc.undo
+                                |> Doc.redo
+                                |> Doc.undo
+                                |> Doc.redo
                     in
                     Expect.equal (readTexts d) (readTexts cycled)
             ]
@@ -294,25 +294,25 @@ suite =
 
                         bob =
                             -- bob is a different replica that has alice's ops
-                            OpDoc.merge (initDoc "bob") start
+                            Doc.merge (initDoc "bob") start
 
                         -- alice appends X (tracked); bob concurrently appends Y
                         aliceX =
                             appendTodo "X" alice
 
                         bobY =
-                            OpDoc.listAppend todosPath (todo "Y") bob |> ok bob
+                            Doc.listAppend todosPath (todo "Y") bob |> ok bob
 
                         -- they sync: alice merges bob's Y
                         aliceSynced =
-                            OpDoc.merge aliceX bobY
+                            Doc.merge aliceX bobY
 
                         -- alice undoes her own X — Y must remain
                         afterUndo =
-                            OpDoc.undo aliceSynced
+                            Doc.undo aliceSynced
 
                         result =
-                            OpDoc.read afterUndo |> Result.map (texts >> List.sort)
+                            Doc.read afterUndo |> Result.map (texts >> List.sort)
                     in
                     Expect.equal (Ok [ "A", "Y" ]) result
             , test "my undo syncs: a peer merging me also sees the undo" <|
@@ -322,21 +322,21 @@ suite =
                             initDoc "alice" |> appendTodo "A"
 
                         bob =
-                            OpDoc.merge (initDoc "bob") start
+                            Doc.merge (initDoc "bob") start
 
                         aliceB =
                             appendTodo "B" start
 
                         -- bob has B too
                         bobWithB =
-                            OpDoc.merge bob aliceB
+                            Doc.merge bob aliceB
 
                         -- alice undoes B, bob merges alice's undo ops
                         aliceUndone =
-                            OpDoc.undo aliceB
+                            Doc.undo aliceB
 
                         bobMerged =
-                            OpDoc.merge bobWithB aliceUndone
+                            Doc.merge bobWithB aliceUndone
                     in
                     Expect.equal (Ok [ "A" ]) (readTexts bobMerged)
             , test "undo survives a merge in between (stacks preserved across merge)" <|
@@ -346,21 +346,21 @@ suite =
                             initDoc "alice" |> appendTodo "A"
 
                         bob =
-                            OpDoc.merge (initDoc "bob") start
+                            Doc.merge (initDoc "bob") start
 
                         aliceB =
                             appendTodo "B" start
 
                         bobC =
-                            OpDoc.listAppend todosPath (todo "C") bob |> ok bob
+                            Doc.listAppend todosPath (todo "C") bob |> ok bob
 
                         -- alice merges bob's C, THEN undoes her own B
                         merged =
-                            OpDoc.merge aliceB bobC
+                            Doc.merge aliceB bobC
 
                         afterUndo =
-                            OpDoc.undo merged
+                            Doc.undo merged
                     in
-                    Expect.equal (Ok [ "A", "C" ]) (OpDoc.read afterUndo |> Result.map (texts >> List.sort))
+                    Expect.equal (Ok [ "A", "C" ]) (Doc.read afterUndo |> Result.map (texts >> List.sort))
             ]
         ]

@@ -31,11 +31,11 @@ materialize + checkout. It is not yet wired into the public `Crdt` module.
 -}
 
 import Crdt.Frac exposing (Frac)
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node(..), Prim)
 import Crdt.Rga as Rga
-import Crdt.Tree as Tree
+import Crdt.Tree.Internal as Tree
 import Dict exposing (Dict)
 import Set exposing (Set)
 

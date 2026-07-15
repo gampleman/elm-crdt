@@ -5,13 +5,11 @@
     "license": "BSD-3-Clause",
     "version": "1.0.0",
     "exposed-modules": [
-        "Crdt.Schema",
+        "Crdt",
+        "Crdt.Doc",
         "Crdt.Id",
-        "Crdt.Text",
-        "Crdt.Presence",
-        "Crdt.OpDoc",
         "Crdt.Cursor",
-        "Crdt.Ref",
+        "Crdt.Presence",
         "Crdt.Tree",
         "Crdt.RichText"
     ],

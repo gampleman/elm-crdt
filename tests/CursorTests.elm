@@ -10,8 +10,8 @@ These tests are pure library (no UI): make a cursor, mutate/merge, resolve.
 -}
 
 import Crdt.Cursor as Cursor
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
 import Crdt.Schema.Internal as S exposing (Crdt)
 import Expect
@@ -23,7 +23,7 @@ import Test exposing (Test, describe, test)
 -- FIXTURE --------------------------------------------------------------------
 
 
-type alias Doc =
+type alias Sample =
     { title : String
     , todos : List Todo
     }
@@ -33,9 +33,9 @@ type alias Todo =
     { text : String }
 
 
-schema : Crdt S.Nested Doc
+schema : Crdt S.Nested Sample
 schema =
-    S.record Doc
+    S.record Sample
         |> S.field "title" .title S.text
         |> S.field "todos" .todos (S.list todoSchema)
         |> S.build
@@ -56,31 +56,31 @@ todosPath =
     Path.root |> Path.field "todos"
 
 
-initDoc : String -> OpDoc Doc
+initDoc : String -> Doc Sample
 initDoc name =
-    OpDoc.init (Id.replica name) schema
+    Doc.init (Id.replica name) schema
 
 
-okDoc : OpDoc Doc -> Result OpDoc.Error (OpDoc Doc) -> OpDoc Doc
+okDoc : Doc Sample -> Result Doc.Error (Doc Sample) -> Doc Sample
 okDoc fallback =
     Result.withDefault fallback
 
 
-okC : Result OpDoc.Error a -> Maybe a
+okC : Result Doc.Error a -> Maybe a
 okC =
     Result.toMaybe
 
 
 {-| Set the title to a literal string (text edit).
 -}
-setTitle : String -> OpDoc Doc -> OpDoc Doc
+setTitle : String -> Doc Sample -> Doc Sample
 setTitle s doc =
-    OpDoc.setText titlePath s doc |> okDoc doc
+    Doc.setText titlePath s doc |> okDoc doc
 
 
-addTodo : String -> OpDoc Doc -> OpDoc Doc
+addTodo : String -> Doc Sample -> Doc Sample
 addTodo label doc =
-    OpDoc.listAppend todosPath (todoSchema |> S.with (Todo label)) doc |> okDoc doc
+    Doc.listAppend todosPath (todoSchema |> S.with (Todo label)) doc |> okDoc doc
 
 
 
@@ -97,9 +97,9 @@ suite =
                         initDoc "alice" |> setTitle "hello"
                 in
                 -- offset 3 in "hello" (between 'l' and 'l')
-                case OpDoc.cursorAt titlePath 3 doc |> okC of
+                case Doc.cursorAt titlePath 3 doc |> okC of
                     Just cur ->
-                        OpDoc.cursorOffset cur doc |> Expect.equal (Just 3)
+                        Doc.cursorOffset cur doc |> Expect.equal (Just 3)
 
                     Nothing ->
                         Expect.fail "cursorAt failed"
@@ -111,7 +111,7 @@ suite =
 
                     -- caret at offset 2 (before 'r' in "wo|rld")
                     cur =
-                        OpDoc.cursorAt titlePath 2 doc |> okC
+                        Doc.cursorAt titlePath 2 doc |> okC
 
                     -- prepend "say " -> "say world"; the caret should now be at 6
                     doc2 =
@@ -119,7 +119,7 @@ suite =
                 in
                 case cur of
                     Just c ->
-                        OpDoc.cursorOffset c doc2 |> Expect.equal (Just 6)
+                        Doc.cursorOffset c doc2 |> Expect.equal (Just 6)
 
                     Nothing ->
                         Expect.fail "cursorAt failed"
@@ -131,14 +131,14 @@ suite =
 
                     -- caret at offset 1 ("a|b")
                     cur =
-                        OpDoc.cursorAt titlePath 1 doc |> okC
+                        Doc.cursorAt titlePath 1 doc |> okC
 
                     doc2 =
                         setTitle "abXYZ" doc
                 in
                 case cur of
                     Just c ->
-                        OpDoc.cursorOffset c doc2 |> Expect.equal (Just 1)
+                        Doc.cursorOffset c doc2 |> Expect.equal (Just 1)
 
                     Nothing ->
                         Expect.fail "cursorAt failed"
@@ -150,7 +150,7 @@ suite =
 
                     -- caret after 'b' (offset 2)
                     cur =
-                        OpDoc.cursorAt titlePath 2 doc |> okC
+                        Doc.cursorAt titlePath 2 doc |> okC
 
                     -- delete 'b' and 'c' -> "ad"; the anchor char ('b') is gone,
                     -- so the caret should land after 'a' (offset 1)
@@ -159,7 +159,7 @@ suite =
                 in
                 case cur of
                     Just c ->
-                        OpDoc.cursorOffset c doc2 |> Expect.equal (Just 1)
+                        Doc.cursorOffset c doc2 |> Expect.equal (Just 1)
 
                     Nothing ->
                         Expect.fail "cursorAt failed"
@@ -171,12 +171,12 @@ suite =
 
                     -- a cursor at offset 3, captured on the shared base
                     cur =
-                        OpDoc.cursorAt titlePath 3 base |> okC
+                        Doc.cursorAt titlePath 3 base |> okC
 
                     -- bob starts from the same shared state
                     bob =
                         initDoc "bob"
-                            |> OpDoc.decodeInto (OpDoc.encode base)
+                            |> Doc.decodeInto (Doc.encode base)
                             |> Result.withDefault (initDoc "bob")
 
                     -- alice and bob edit concurrently, then exchange ops both ways
@@ -197,8 +197,8 @@ suite =
                         -- both replicas converged (same read) AND resolve the
                         -- cursor to the same offset
                         Expect.all
-                            [ \_ -> Expect.equal (OpDoc.read aMerged) (OpDoc.read bMerged)
-                            , \_ -> Expect.equal (OpDoc.cursorOffset c aMerged) (OpDoc.cursorOffset c bMerged)
+                            [ \_ -> Expect.equal (Doc.read aMerged) (Doc.read bMerged)
+                            , \_ -> Expect.equal (Doc.cursorOffset c aMerged) (Doc.cursorOffset c bMerged)
                             ]
                             ()
 
@@ -215,23 +215,23 @@ suite =
                         Path.root |> Path.field "todos" |> Path.index 1 |> Path.field "text"
 
                     cur =
-                        OpDoc.cursorAt secondText 1 doc |> okC
+                        Doc.cursorAt secondText 1 doc |> okC
 
                     -- a peer inserts a NEW todo at the front; "second" is now index 2
                     bob =
                         initDoc "bob"
-                            |> OpDoc.decodeInto (OpDoc.encode doc)
+                            |> Doc.decodeInto (Doc.encode doc)
                             |> Result.withDefault (initDoc "bob")
-                            |> (\d -> OpDoc.listAppend todosPath (todoSchema |> S.with (Todo "zero")) d |> okDoc d)
+                            |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "zero")) d |> okDoc d)
 
                     merged =
-                        OpDoc.merge doc (mergeFrom bob doc)
+                        Doc.merge doc (mergeFrom bob doc)
                 in
                 case cur of
                     Just c ->
                         -- the cursor still resolves into "second"'s text at offset 1,
                         -- regardless of the outer list reorder
-                        OpDoc.cursorOffset c merged |> Expect.equal (Just 1)
+                        Doc.cursorOffset c merged |> Expect.equal (Just 1)
 
                     Nothing ->
                         Expect.fail "cursorAt failed"
@@ -243,14 +243,14 @@ suite =
 
                     -- select offsets 1..4 (focus before anchor to test normalization)
                     a =
-                        OpDoc.cursorAt titlePath 4 doc |> okC
+                        Doc.cursorAt titlePath 4 doc |> okC
 
                     f =
-                        OpDoc.cursorAt titlePath 1 doc |> okC
+                        Doc.cursorAt titlePath 1 doc |> okC
                 in
                 case Maybe.map2 Cursor.range a f of
                     Just r ->
-                        OpDoc.cursorRange r doc |> Expect.equal (Just ( 1, 4 ))
+                        Doc.cursorRange r doc |> Expect.equal (Just ( 1, 4 ))
 
                     Nothing ->
                         Expect.fail "cursorAt failed"
@@ -261,14 +261,14 @@ suite =
                         initDoc "alice" |> setTitle "hello"
 
                     cur =
-                        OpDoc.cursorAt titlePath 3 doc |> okC
+                        Doc.cursorAt titlePath 3 doc |> okC
                 in
                 case cur of
                     Just c ->
                         Cursor.encode c
                             |> Json.decodeValue Cursor.decoder
                             |> Result.toMaybe
-                            |> Maybe.andThen (\c2 -> OpDoc.cursorOffset c2 doc)
+                            |> Maybe.andThen (\c2 -> Doc.cursorOffset c2 doc)
                             |> Expect.equal (Just 3)
 
                     Nothing ->
@@ -279,8 +279,8 @@ suite =
 {-| Encode `from`'s ops and decode them into `into`, returning the updated
 `into`. (A little sugar so the convergence tests read cleanly.)
 -}
-mergeFrom : OpDoc Doc -> OpDoc Doc -> OpDoc Doc
+mergeFrom : Doc Sample -> Doc Sample -> Doc Sample
 mergeFrom from into =
     into
-        |> OpDoc.decodeInto (OpDoc.encode from)
+        |> Doc.decodeInto (Doc.encode from)
         |> Result.withDefault into

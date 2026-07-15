@@ -1,37 +1,36 @@
 module BlockTests exposing (suite)
 
-{-| Block structure end-to-end through the public API: a `S.richText` field edited
+{-| Block structure end-to-end through the public API: a `C.richText` field edited
 via `Crdt.Ref` block edits (`splitBlock`/`mergeBlock`/`setBlockType`/`indentBlock`/
-`outdentBlock`) and read back as `RichText.Block`s via `OpDoc.readBlocks`, synced
+`outdentBlock`) and read back as `RichText.Block`s via `Doc.readBlocks`, synced
 through the op-log wire. Pins the properties from `docs/11`: split/merge preserve
 char identity, type-change converges by LWW, marks span a split, concurrent split +
 edit converge, indent/outdent (incl. concurrency), and wire + undo round-trips.
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
-import Crdt.Ref as Ref exposing (Ref)
 import Crdt.RichText exposing (Block, MarkValue(..), Span)
-import Crdt.Schema as S
 import Dict
 import Expect
 import Test exposing (Test, describe, test)
 
 
-type alias Doc =
+type alias Sample =
     { body : List Span }
 
 
 type alias DocRefs =
-    { body : Ref Doc S.RichK (List Span) }
+    { body : Ref Sample C.RichK (List Span) }
 
 
-docDoc : Ref.RecordRefs Doc DocRefs
+docDoc : C.RecordRefs Sample DocRefs
 docDoc =
-    Ref.record Doc DocRefs
-        |> Ref.field "body" .body S.richText
-        |> Ref.build
+    C.record Sample DocRefs
+        |> C.field "body" .body C.richText
+        |> C.build
 
 
 refs : DocRefs
@@ -44,25 +43,25 @@ bodyPath =
     Path.root |> Path.field "body"
 
 
-init : String -> OpDoc Doc
+init : String -> Doc Sample
 init name =
-    OpDoc.init (Id.replica name) docDoc.schema
+    Doc.init (Id.replica name) docDoc.schema
 
 
-ok : OpDoc Doc -> Result OpDoc.Error (OpDoc Doc) -> OpDoc Doc
+ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
-blocks : OpDoc Doc -> List Block
+blocks : Doc Sample -> List Block
 blocks doc =
-    OpDoc.readBlocks bodyPath doc |> Result.withDefault []
+    Doc.readBlocks bodyPath doc |> Result.withDefault []
 
 
 {-| Compact render: `type:depth"text"` per block, joined by `|` (matching
 BlockCoreTests). Marks within a block are ignored here; a dedicated test checks them.
 -}
-render : OpDoc Doc -> String
+render : Doc Sample -> String
 render doc =
     blocks doc
         |> List.map
@@ -76,26 +75,26 @@ render doc =
         |> String.join " | "
 
 
-withText : String -> OpDoc Doc
+withText : String -> Doc Sample
 withText s =
-    Ref.setRich refs.body s (init "a") |> ok (init "a")
+    C.setRich refs.body s (init "a") |> ok (init "a")
 
 
-mergeIn : OpDoc Doc -> OpDoc Doc -> OpDoc Doc
+mergeIn : Doc Sample -> Doc Sample -> Doc Sample
 mergeIn from to =
-    OpDoc.decodeInto (OpDoc.encode from) to |> Result.withDefault to
+    Doc.decodeInto (Doc.encode from) to |> Result.withDefault to
 
 
 suite : Test
 suite =
-    describe "Rich-text block structure (S.richText + Ref block edits)"
+    describe "Rich-text block structure (C.richText + Ref block edits)"
         [ describe "split / merge"
             [ test "split a paragraph into two blocks" <|
                 \_ ->
                     let
                         d =
                             withText "abcd"
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
                     in
                     render d |> Expect.equal ":0\"ab\" | :0\"cd\""
             , test "split preserves character identity (a mark still resolves across it)" <|
@@ -105,8 +104,8 @@ suite =
                     let
                         d =
                             withText "abcd"
-                                |> (\doc -> Ref.mark refs.body 1 3 "bold" Flag doc |> ok doc)
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.mark refs.body 1 3 "bold" Flag doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
 
                         boldTexts =
                             blocks d
@@ -124,8 +123,8 @@ suite =
                     let
                         d =
                             withText "abcdef"
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
-                                |> (\doc -> Ref.mark refs.body 3 5 "bold" Flag doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.mark refs.body 3 5 "bold" Flag doc |> ok doc)
 
                         boldTexts =
                             blocks d
@@ -139,10 +138,10 @@ suite =
                 \_ ->
                     let
                         split =
-                            withText "abcd" |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                            withText "abcd" |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
 
                         merged =
-                            Ref.mergeBlock refs.body 1 split |> ok split
+                            C.mergeBlock refs.body 1 split |> ok split
                     in
                     render merged |> Expect.equal ":0\"abcd\""
             , test "editing text after a split still targets the right chars (marker in sequence)" <|
@@ -153,8 +152,8 @@ suite =
                     let
                         d =
                             withText "abcd"
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
-                                |> (\doc -> Ref.setRich refs.body "abcdef" doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.setRich refs.body "abcdef" doc |> ok doc)
                     in
                     render d |> Expect.equal ":0\"ab\" | :0\"cdef\""
             , test "typing into a later block via setBlockText lands there, not block 0 (He\\nd)" <|
@@ -166,8 +165,8 @@ suite =
                     let
                         d =
                             withText "He"
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
-                                |> (\doc -> Ref.setBlockText refs.body 1 "d" doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.setBlockText refs.body 1 "d" doc |> ok doc)
                     in
                     render d |> Expect.equal ":0\"He\" | :0\"d\""
             , test "typing into an EMPTY block bounded by a following block lands there (not the next block)" <|
@@ -178,8 +177,8 @@ suite =
                     let
                         d =
                             withText "hello"
-                                |> (\doc -> Ref.splitBlock refs.body 0 0 doc |> ok doc)
-                                |> (\doc -> Ref.setBlockText refs.body 0 "X" doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 0 doc |> ok doc)
+                                |> (\doc -> C.setBlockText refs.body 0 "X" doc |> ok doc)
                     in
                     render d |> Expect.equal ":0\"X\" | :0\"hello\""
             , test "setBlockText edits only its block, leaving others intact" <|
@@ -187,8 +186,8 @@ suite =
                     let
                         d =
                             withText "abcd"
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
-                                |> (\doc -> Ref.setBlockText refs.body 0 "abZ" doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.setBlockText refs.body 0 "abZ" doc |> ok doc)
                     in
                     render d |> Expect.equal ":0\"abZ\" | :0\"cd\""
             ]
@@ -197,10 +196,10 @@ suite =
                 \_ ->
                     let
                         split =
-                            withText "abcd" |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                            withText "abcd" |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
 
                         typed =
-                            Ref.setBlockType refs.body 1 (Just "h1") split |> ok split
+                            C.setBlockType refs.body 1 (Just "h1") split |> ok split
                     in
                     render typed |> Expect.equal ":0\"ab\" | h1:0\"cd\""
             , test "the first block is formattable (leading marker created lazily)" <|
@@ -210,7 +209,7 @@ suite =
                     let
                         d =
                             withText "abcd"
-                                |> (\doc -> Ref.setBlockType refs.body 0 (Just "h1") doc |> ok doc)
+                                |> (\doc -> C.setBlockType refs.body 0 (Just "h1") doc |> ok doc)
                     in
                     render d |> Expect.equal "h1:0\"abcd\""
             , test "splitting after block 0 is formatted places the marker correctly (leading marker not a separator)" <|
@@ -222,10 +221,10 @@ suite =
                     let
                         d =
                             withText "ferfefrefre"
-                                |> (\doc -> Ref.splitBlock refs.body 0 5 doc |> ok doc)
-                                |> (\doc -> Ref.setBlockType refs.body 0 (Just "ul") doc |> ok doc)
-                                |> (\doc -> Ref.setBlockType refs.body 1 (Just "ul") doc |> ok doc)
-                                |> (\doc -> Ref.splitBlock refs.body 1 0 doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 5 doc |> ok doc)
+                                |> (\doc -> C.setBlockType refs.body 0 (Just "ul") doc |> ok doc)
+                                |> (\doc -> C.setBlockType refs.body 1 (Just "ul") doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 1 0 doc |> ok doc)
                     in
                     render d |> Expect.equal "ul:0\"ferfe\" | ul:0\"\" | ul:0\"frefre\""
             , test "split inherits the block's type and depth" <|
@@ -233,9 +232,9 @@ suite =
                     let
                         d =
                             withText "abcd"
-                                |> (\doc -> Ref.setBlockType refs.body 0 (Just "ul") doc |> ok doc)
-                                |> (\doc -> Ref.indentBlock refs.body 0 doc |> ok doc)
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.setBlockType refs.body 0 (Just "ul") doc |> ok doc)
+                                |> (\doc -> C.indentBlock refs.body 0 doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
                     in
                     render d |> Expect.equal "ul:1\"ab\" | ul:1\"cd\""
             , test "concurrent first-block formatting dedupes via the well-known leading id" <|
@@ -247,10 +246,10 @@ suite =
                             withText "abcd"
 
                         alice =
-                            Ref.setBlockType refs.body 0 (Just "h1") (mergeIn base (init "alice")) |> ok base
+                            C.setBlockType refs.body 0 (Just "h1") (mergeIn base (init "alice")) |> ok base
 
                         bob =
-                            Ref.setBlockType refs.body 0 (Just "blockquote") (mergeIn base (init "bob")) |> ok base
+                            C.setBlockType refs.body 0 (Just "blockquote") (mergeIn base (init "bob")) |> ok base
 
                         ab =
                             mergeIn bob alice
@@ -270,10 +269,10 @@ suite =
                 \_ ->
                     let
                         base =
-                            withText "abcd" |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                            withText "abcd" |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
 
                         setType peer t =
-                            Ref.setBlockType refs.body 1 (Just t) (mergeIn base (init peer))
+                            C.setBlockType refs.body 1 (Just t) (mergeIn base (init peer))
                                 |> ok base
 
                         alice =
@@ -308,12 +307,12 @@ suite =
                             withText "alpha"
 
                         a =
-                            Ref.indentBlock refs.body 0 (mergeIn base (init "alice")) |> ok base
+                            C.indentBlock refs.body 0 (mergeIn base (init "alice")) |> ok base
 
                         b =
                             mergeIn base (init "bob")
-                                |> (\d -> Ref.setBlockText refs.body 0 "" d |> ok d)
-                                |> (\d -> Ref.indentBlock refs.body 0 d |> ok d)
+                                |> (\d -> C.setBlockText refs.body 0 "" d |> ok d)
+                                |> (\d -> C.indentBlock refs.body 0 d |> ok d)
 
                         ab =
                             mergeIn b a
@@ -328,15 +327,15 @@ suite =
                 \_ ->
                     let
                         split =
-                            withText "abcd" |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                            withText "abcd" |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
 
                         indentedTwice =
                             split
-                                |> (\d -> Ref.indentBlock refs.body 1 d |> ok d)
-                                |> (\d -> Ref.indentBlock refs.body 1 d |> ok d)
+                                |> (\d -> C.indentBlock refs.body 1 d |> ok d)
+                                |> (\d -> C.indentBlock refs.body 1 d |> ok d)
 
                         outdentedOnce =
-                            Ref.outdentBlock refs.body 1 indentedTwice |> ok indentedTwice
+                            C.outdentBlock refs.body 1 indentedTwice |> ok indentedTwice
                     in
                     Expect.all
                         [ \_ -> Expect.equal ":0\"ab\" | :2\"cd\"" (render indentedTwice)
@@ -347,10 +346,10 @@ suite =
                 \_ ->
                     let
                         split =
-                            withText "abcd" |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                            withText "abcd" |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
 
                         d =
-                            Ref.outdentBlock refs.body 1 split |> ok split
+                            C.outdentBlock refs.body 1 split |> ok split
                     in
                     render d |> Expect.equal ":0\"ab\" | :0\"cd\""
             , test "concurrent indent + outdent cancel (net depth unchanged)" <|
@@ -359,14 +358,14 @@ suite =
                     let
                         base =
                             withText "abcd"
-                                |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
-                                |> (\doc -> Ref.indentBlock refs.body 1 doc |> ok doc)
+                                |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
+                                |> (\doc -> C.indentBlock refs.body 1 doc |> ok doc)
 
                         alice =
-                            Ref.indentBlock refs.body 1 (mergeIn base (init "alice")) |> ok base
+                            C.indentBlock refs.body 1 (mergeIn base (init "alice")) |> ok base
 
                         bob =
-                            Ref.outdentBlock refs.body 1 (mergeIn base (init "bob")) |> ok base
+                            C.outdentBlock refs.body 1 (mergeIn base (init "bob")) |> ok base
 
                         ab =
                             mergeIn bob alice
@@ -389,10 +388,10 @@ suite =
 
                         -- alice splits at 2; bob appends "X" at the end (offset 4)
                         alice =
-                            Ref.splitBlock refs.body 0 2 (mergeIn base (init "alice")) |> ok base
+                            C.splitBlock refs.body 0 2 (mergeIn base (init "alice")) |> ok base
 
                         bob =
-                            Ref.setRich refs.body "abcdX" (mergeIn base (init "bob")) |> ok base
+                            C.setRich refs.body "abcdX" (mergeIn base (init "bob")) |> ok base
 
                         ab =
                             mergeIn bob alice
@@ -411,10 +410,10 @@ suite =
                 \_ ->
                     let
                         alice =
-                            withText "abcd" |> (\doc -> Ref.splitBlock refs.body 0 2 doc |> ok doc)
+                            withText "abcd" |> (\doc -> C.splitBlock refs.body 0 2 doc |> ok doc)
 
                         bob =
-                            OpDoc.decodeInto (OpDoc.encode alice) (init "bob") |> Result.withDefault (init "bob")
+                            Doc.decodeInto (Doc.encode alice) (init "bob") |> Result.withDefault (init "bob")
                     in
                     render bob |> Expect.equal ":0\"ab\" | :0\"cd\""
             , test "undo a split rejoins the blocks; redo re-splits" <|
@@ -424,13 +423,13 @@ suite =
                             withText "abcd"
 
                         split =
-                            OpDoc.recordEdit (OpDoc.version base)
-                                (Ref.splitBlock refs.body 0 2 base |> ok base)
+                            Doc.recordEdit (Doc.version base)
+                                (C.splitBlock refs.body 0 2 base |> ok base)
                     in
                     Expect.all
                         [ \_ -> Expect.equal ":0\"ab\" | :0\"cd\"" (render split)
-                        , \_ -> Expect.equal ":0\"abcd\"" (render (OpDoc.undo split))
-                        , \_ -> Expect.equal ":0\"ab\" | :0\"cd\"" (render (split |> OpDoc.undo |> OpDoc.redo))
+                        , \_ -> Expect.equal ":0\"abcd\"" (render (Doc.undo split))
+                        , \_ -> Expect.equal ":0\"ab\" | :0\"cd\"" (render (split |> Doc.undo |> Doc.redo))
                         ]
                         ()
             ]

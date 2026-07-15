@@ -8,10 +8,10 @@ pin: implicit leading block, split into two blocks, block type from the marker's
 (merge / outdent) are skipped.
 -}
 
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.Node as Node exposing (AnchorSide(..), MarkOp, Prim(..))
 import Crdt.Rga as Rga
-import Crdt.RichText as RichText
+import Crdt.RichText.Internal as RichText
 import Dict
 import Expect
 import Test exposing (Test, describe, test)

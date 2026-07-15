@@ -17,12 +17,11 @@ as the demo uses it.
 
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc.Internal as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
 import Crdt.Path as Path exposing (Path)
-import Crdt.Ref as Ref exposing (Ref)
 import Crdt.RichText exposing (Block, Span)
-import Crdt.Schema as S
 import Expect
 import Fuzz exposing (Fuzzer)
 import Test exposing (Test, describe, fuzz)
@@ -32,19 +31,19 @@ import Test exposing (Test, describe, fuzz)
 -- SCHEMA ---------------------------------------------------------------------
 
 
-type alias Doc =
+type alias Sample =
     { body : List Span }
 
 
 type alias DocRefs =
-    { body : Ref Doc S.RichK (List Span) }
+    { body : Ref Sample C.RichK (List Span) }
 
 
-docDoc : Ref.RecordRefs Doc DocRefs
+docDoc : C.RecordRefs Sample DocRefs
 docDoc =
-    Ref.record Doc DocRefs
-        |> Ref.field "body" .body S.richText
-        |> Ref.build
+    C.record Sample DocRefs
+        |> C.field "body" .body C.richText
+        |> C.build
 
 
 refs : DocRefs
@@ -57,24 +56,24 @@ bodyPath =
     Path.root |> Path.field "body"
 
 
-init : String -> OpDoc Doc
+init : String -> Doc Sample
 init name =
-    OpDoc.init (Id.replica name) docDoc.schema
+    Doc.init (Id.replica name) docDoc.schema
 
 
-ok : OpDoc Doc -> Result OpDoc.Error (OpDoc Doc) -> OpDoc Doc
+ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
-blocks : OpDoc Doc -> List Block
+blocks : Doc Sample -> List Block
 blocks doc =
-    OpDoc.readBlocks bodyPath doc |> Result.withDefault []
+    Doc.readBlocks bodyPath doc |> Result.withDefault []
 
 
 {-| The observable state we compare: type:depth"text" per block, joined by `|`.
 -}
-render : OpDoc Doc -> String
+render : Doc Sample -> String
 render doc =
     blocks doc
         |> List.map
@@ -91,9 +90,9 @@ render doc =
 
 {-| Merge `from`'s full op set into `to` (the op-log wire, as the demo syncs).
 -}
-mergeIn : OpDoc Doc -> OpDoc Doc -> OpDoc Doc
+mergeIn : Doc Sample -> Doc Sample -> Doc Sample
 mergeIn from to =
-    OpDoc.decodeInto (OpDoc.encode from) to |> Result.withDefault to
+    Doc.decodeInto (Doc.encode from) to |> Result.withDefault to
 
 
 
@@ -112,7 +111,7 @@ type Edit
 {-| Apply one edit, resolving its block index against the current block count so a
 fuzzed index is always in range.
 -}
-applyEdit : Edit -> OpDoc Doc -> OpDoc Doc
+applyEdit : Edit -> Doc Sample -> Doc Sample
 applyEdit edit doc =
     let
         n =
@@ -145,13 +144,13 @@ applyEdit edit doc =
                     else
                         modBy (blockLen bi + 1) (abs off)
             in
-            Ref.splitBlock refs.body bi charOffset doc |> ok doc
+            C.splitBlock refs.body bi charOffset doc |> ok doc
 
         MergeAt i ->
-            Ref.mergeBlock refs.body (clampIndex i) doc |> ok doc
+            C.mergeBlock refs.body (clampIndex i) doc |> ok doc
 
         SetType i t ->
-            Ref.setBlockType refs.body
+            C.setBlockType refs.body
                 (clampIndex i)
                 (if t == "" then
                     Nothing
@@ -163,16 +162,16 @@ applyEdit edit doc =
                 |> ok doc
 
         Indent i ->
-            Ref.indentBlock refs.body (clampIndex i) doc |> ok doc
+            C.indentBlock refs.body (clampIndex i) doc |> ok doc
 
         Outdent i ->
-            Ref.outdentBlock refs.body (clampIndex i) doc |> ok doc
+            C.outdentBlock refs.body (clampIndex i) doc |> ok doc
 
         SetBlockText i s ->
-            Ref.setBlockText refs.body (clampIndex i) s doc |> ok doc
+            C.setBlockText refs.body (clampIndex i) s doc |> ok doc
 
 
-runFrom : OpDoc Doc -> List Edit -> OpDoc Doc
+runFrom : Doc Sample -> List Edit -> Doc Sample
 runFrom =
     List.foldl applyEdit
 
@@ -180,12 +179,12 @@ runFrom =
 {-| A shared starting document (a few blocks with text), synced to both replicas so
 their concurrent edits build on a common base.
 -}
-sharedBase : OpDoc Doc
+sharedBase : Doc Sample
 sharedBase =
-    Ref.setRich refs.body "alphabravocharlie" (init "seed")
+    C.setRich refs.body "alphabravocharlie" (init "seed")
         |> ok (init "seed")
-        |> (\d -> Ref.splitBlock refs.body 0 5 d |> ok d)
-        |> (\d -> Ref.splitBlock refs.body 1 5 d |> ok d)
+        |> (\d -> C.splitBlock refs.body 0 5 d |> ok d)
+        |> (\d -> C.splitBlock refs.body 1 5 d |> ok d)
 
 
 

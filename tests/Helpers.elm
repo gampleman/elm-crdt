@@ -1,55 +1,18 @@
-module Helpers exposing
-    ( Board
-    , Todo
-    , boardSchema
-    , fuzzNode
-    , todoSchema
-    )
+module Helpers exposing (fuzzNode)
 
 {-| Shared fixtures + fuzzers for the test suite. Mirrors the schema used by the
 demo so tests and demo stay in lockstep.
 -}
 
-import Crdt.Id as Id exposing (OpId, ReplicaId)
+import Crdt.Id.Internal as Id exposing (OpId, ReplicaId)
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
-import Crdt.Schema.Internal as S exposing (Crdt)
 import Dict
 import Fuzz exposing (Fuzzer)
 
 
 
 -- DOMAIN SCHEMA (same shape as the demo) -------------------------------------
-
-
-type alias Board =
-    { title : String
-    , todos : List Todo
-    , notes : Dict.Dict String String
-    }
-
-
-type alias Todo =
-    { text : String
-    , done : Bool
-    }
-
-
-boardSchema : Crdt S.Nested Board
-boardSchema =
-    S.record Board
-        |> S.field "title" .title S.text
-        |> S.field "todos" .todos (S.list todoSchema)
-        |> S.field "notes" .notes (S.dict S.text)
-        |> S.build
-
-
-todoSchema : Crdt S.Nested Todo
-todoSchema =
-    S.record Todo
-        |> S.field "text" .text S.text
-        |> S.field "done" .done S.bool
-        |> S.build
 
 
 replicas : List ReplicaId

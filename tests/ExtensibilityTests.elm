@@ -1,6 +1,6 @@
 module ExtensibilityTests exposing (suite)
 
-{-| User-defined CRDT types via `Crdt.Schema.opSet` + `Crdt.Ref.contribute`/`retract`
+{-| User-defined CRDT types via `Crdt.Schema.opSet` + `Crdt.C.contribute`/`retract`
 (see docs/14). An op-set is a grow-only/removable set of op-id-keyed contributions folded
 into a value at read; convergence is free (merge unions the contributions), the semantics
 is the user's `fold`. These tests build three user types — a max-register, a multi-value
@@ -9,10 +9,9 @@ property that makes it a real CRDT: **concurrent contributions from two replicas
 to the same value in both merge orders**, plus that the fold and removal read correctly.
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
-import Crdt.Ref as Ref exposing (Ref)
-import Crdt.Schema as S exposing (Crdt)
 import Expect
 import Set
 import Test exposing (Test, describe, test)
@@ -22,7 +21,7 @@ import Test exposing (Test, describe, test)
 -- A DOCUMENT WITH THREE USER-DEFINED CRDT FIELDS -----------------------------
 
 
-type alias Doc =
+type alias Sample =
     { high : Int -- max-register: the highest score anyone contributed
     , seen : List Int -- multi-value register: every concurrently-set value
     , tags : List String -- add-wins set of strings
@@ -30,43 +29,43 @@ type alias Doc =
 
 
 type alias DocRefs =
-    { high : Ref Doc (S.OpSetK Int) Int
-    , seen : Ref Doc (S.OpSetK Int) (List Int)
-    , tags : Ref Doc (S.OpSetK String) (List String)
+    { high : Ref Sample (C.OpSetK Int) Int
+    , seen : Ref Sample (C.OpSetK Int) (List Int)
+    , tags : Ref Sample (C.OpSetK String) (List String)
     }
 
 
-maxRegister : Crdt (S.OpSetK Int) Int
+maxRegister : C.Schema (C.OpSetK Int) Int
 maxRegister =
-    S.opSet { contribution = S.int, fold = List.maximum >> Maybe.withDefault 0 }
+    C.opSet { contribution = C.int, fold = List.maximum >> Maybe.withDefault 0 }
 
 
-mvRegister : Crdt (S.OpSetK Int) (List Int)
+mvRegister : C.Schema (C.OpSetK Int) (List Int)
 mvRegister =
     -- keep every distinct concurrently-contributed value, sorted for a stable read
-    S.opSet { contribution = S.int, fold = \xs -> Set.toList (Set.fromList xs) }
+    C.opSet { contribution = C.int, fold = \xs -> Set.toList (Set.fromList xs) }
 
 
-stringSet : Crdt (S.OpSetK String) (List String)
+stringSet : C.Schema (C.OpSetK String) (List String)
 stringSet =
-    S.opSet { contribution = S.string, fold = \xs -> Set.toList (Set.fromList xs) }
+    C.opSet { contribution = C.string, fold = \xs -> Set.toList (Set.fromList xs) }
 
 
-docDoc : Ref.RecordRefs Doc DocRefs
+docDoc : C.RecordRefs Sample DocRefs
 docDoc =
-    Ref.record Doc DocRefs
-        |> Ref.field "high" .high maxRegister
-        |> Ref.field "seen" .seen mvRegister
-        |> Ref.field "tags" .tags stringSet
-        |> Ref.build
+    C.record Sample DocRefs
+        |> C.field "high" .high maxRegister
+        |> C.field "seen" .seen mvRegister
+        |> C.field "tags" .tags stringSet
+        |> C.build
 
 
-init : String -> OpDoc Doc
+init : String -> Doc Sample
 init name =
-    OpDoc.init (Id.replica name) docDoc.schema
+    C.init (Id.replica name) docDoc.schema
 
 
-okc : OpDoc Doc -> Result OpDoc.Error ( String, OpDoc Doc ) -> OpDoc Doc
+okc : Doc Sample -> Result C.EditError ( String, Doc Sample ) -> Doc Sample
 okc fb r =
     case r of
         Ok ( _, d ) ->
@@ -76,24 +75,24 @@ okc fb r =
             fb
 
 
-ok : OpDoc Doc -> Result OpDoc.Error (OpDoc Doc) -> OpDoc Doc
+ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
-read : OpDoc Doc -> Result S.Error Doc
+read : Doc Sample -> Result C.ReadError Sample
 read =
-    OpDoc.read
+    C.read
 
 
-peerOf : String -> OpDoc Doc -> OpDoc Doc
+peerOf : String -> Doc Sample -> Doc Sample
 peerOf name from =
-    OpDoc.decodeInto (OpDoc.encode from) (init name) |> Result.withDefault (init name)
+    Doc.decodeInto (Doc.encode from) (init name) |> Result.withDefault (init name)
 
 
-mergeIn : OpDoc Doc -> OpDoc Doc -> OpDoc Doc
+mergeIn : Doc Sample -> Doc Sample -> Doc Sample
 mergeIn from to =
-    OpDoc.decodeInto (OpDoc.encode from) to |> Result.withDefault to
+    Doc.decodeInto (Doc.encode from) to |> Result.withDefault to
 
 
 suite : Test
@@ -108,9 +107,9 @@ suite =
                 let
                     d =
                         init "a"
-                            |> (\x -> Ref.contribute S.int 5 docDoc.refs.high x |> okc x)
-                            |> (\x -> Ref.contribute S.int 12 docDoc.refs.high x |> okc x)
-                            |> (\x -> Ref.contribute S.int 3 docDoc.refs.high x |> okc x)
+                            |> (\x -> C.contribute C.int 5 docDoc.refs.high x |> okc x)
+                            |> (\x -> C.contribute C.int 12 docDoc.refs.high x |> okc x)
+                            |> (\x -> C.contribute C.int 3 docDoc.refs.high x |> okc x)
                 in
                 read d |> Result.map .high |> Expect.equal (Ok 12)
         , test "CONCURRENT contributions converge (max), both merge orders" <|
@@ -122,10 +121,10 @@ suite =
                         init "seed"
 
                     a =
-                        peerOf "alice" base |> (\x -> Ref.contribute S.int 7 docDoc.refs.high x |> okc x)
+                        peerOf "alice" base |> (\x -> C.contribute C.int 7 docDoc.refs.high x |> okc x)
 
                     b =
-                        peerOf "bob" base |> (\x -> Ref.contribute S.int 20 docDoc.refs.high x |> okc x)
+                        peerOf "bob" base |> (\x -> C.contribute C.int 20 docDoc.refs.high x |> okc x)
 
                     ab =
                         mergeIn b a
@@ -147,10 +146,10 @@ suite =
                         init "seed"
 
                     a =
-                        peerOf "alice" base |> (\x -> Ref.contribute S.int 1 docDoc.refs.seen x |> okc x)
+                        peerOf "alice" base |> (\x -> C.contribute C.int 1 docDoc.refs.seen x |> okc x)
 
                     b =
-                        peerOf "bob" base |> (\x -> Ref.contribute S.int 2 docDoc.refs.seen x |> okc x)
+                        peerOf "bob" base |> (\x -> C.contribute C.int 2 docDoc.refs.seen x |> okc x)
 
                     ab =
                         mergeIn b a
@@ -170,10 +169,10 @@ suite =
                         init "seed"
 
                     a =
-                        peerOf "alice" base |> (\x -> Ref.contribute S.string "red" docDoc.refs.tags x |> okc x)
+                        peerOf "alice" base |> (\x -> C.contribute C.string "red" docDoc.refs.tags x |> okc x)
 
                     b =
-                        peerOf "bob" base |> (\x -> Ref.contribute S.string "blue" docDoc.refs.tags x |> okc x)
+                        peerOf "bob" base |> (\x -> C.contribute C.string "blue" docDoc.refs.tags x |> okc x)
 
                     merged =
                         mergeIn b a
@@ -183,19 +182,19 @@ suite =
             \_ ->
                 let
                     ( _, d1 ) =
-                        Ref.contribute S.string "keep" docDoc.refs.tags (init "a")
+                        C.contribute C.string "keep" docDoc.refs.tags (init "a")
                             |> Result.withDefault ( "", init "a" )
 
                     ( _, d2 ) =
-                        Ref.contribute S.string "drop" docDoc.refs.tags d1
+                        C.contribute C.string "drop" docDoc.refs.tags d1
                             |> Result.withDefault ( "", d1 )
 
                     ( dropKey, d3 ) =
-                        Ref.contribute S.string "dropme" docDoc.refs.tags d2
+                        C.contribute C.string "dropme" docDoc.refs.tags d2
                             |> Result.withDefault ( "", d2 )
 
                     d4 =
-                        Ref.retract dropKey docDoc.refs.tags d3 |> ok d3
+                        C.retract dropKey docDoc.refs.tags d3 |> ok d3
                 in
                 Expect.all
                     [ \_ -> Expect.equal (Ok [ "drop", "keep" ]) (read d2 |> Result.map .tags)
@@ -211,14 +210,14 @@ suite =
                 -- under a DIFFERENT key → add-wins (bob's survives). Both orders agree.
                 let
                     ( aliceKey, base1 ) =
-                        Ref.contribute S.string "x" docDoc.refs.tags (init "seed")
+                        C.contribute C.string "x" docDoc.refs.tags (init "seed")
                             |> Result.withDefault ( "", init "seed" )
 
                     a =
-                        peerOf "alice" base1 |> (\x -> Ref.retract aliceKey docDoc.refs.tags x |> ok x)
+                        peerOf "alice" base1 |> (\x -> C.retract aliceKey docDoc.refs.tags x |> ok x)
 
                     b =
-                        peerOf "bob" base1 |> (\x -> Ref.contribute S.string "x" docDoc.refs.tags x |> okc x)
+                        peerOf "bob" base1 |> (\x -> C.contribute C.string "x" docDoc.refs.tags x |> okc x)
 
                     ab =
                         mergeIn b a

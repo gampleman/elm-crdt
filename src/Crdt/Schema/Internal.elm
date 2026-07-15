@@ -1,7 +1,7 @@
 module Crdt.Schema.Internal exposing
     ( Crdt, Error(..), Seed
     , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
-    , int, float, string, bool, text, counter, lww
+    , int, float, string, bool, text, counter, register
     , optional, withDefault, map
     , list, movableList, dict, tree, richText, opSet
     , record, field, aliasedField, build, RecordBuilder
@@ -27,7 +27,7 @@ state — that is the hard diff problem. All in-place mutation goes through
 
 @docs Crdt, Error, Seed
 @docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
-@docs int, float, string, bool, text, counter, lww
+@docs int, float, string, bool, text, counter, register
 @docs optional, withDefault, map
 @docs list, movableList, dict, tree, richText, opSet
 @docs record, field, aliasedField, build, RecordBuilder
@@ -37,15 +37,18 @@ state — that is the hard diff problem. All in-place mutation goes through
 
 -}
 
-import Crdt.Id as Id exposing (Ctx)
+import Crdt.Id.Internal as Id exposing (Ctx)
 import Crdt.Internal as I
 import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
-import Crdt.RichText as RichText exposing (Span)
+import Crdt.RichText exposing (Span)
+import Crdt.RichText.Internal as RichText
 import Crdt.Text as Text
-import Crdt.Tree as Tree
+import Crdt.Tree.Internal as Tree
 import Dict exposing (Dict)
+import Json.Decode as JD
+import Json.Encode as JE
 
 
 {-| An opaque builder of a fresh subtree from a value, produced by `with` and
@@ -57,7 +60,7 @@ type alias Seed =
 
 
 {-| A schema tying a typed value `a` to CRDT `Node` state, tagged with a phantom
-`kind` describing how it may be _edited_ (used by `Crdt.Ref` to reject nonsensical
+`kind` describing how it may be _edited_ (used by the `Crdt` module to reject nonsensical
 edits at compile time — e.g. `increment` on text). The `kind` never affects reads
 or merge; it is erased at runtime.
 -}
@@ -143,7 +146,7 @@ type RichK
 
 
 {-| Kind marker: a user-defined **op-set** CRDT over contribution type `c` (see
-`opSet` / `docs/14`). Its only edit verbs are `Crdt.Ref.contribute`/`retract` — it
+`opSet` / `docs/14`). Its only edit verbs are `Crdt.contribute`/`retract` — it
 is not `set`/`increment`-able — so the phantom carries `c` to type those verbs.
 -}
 type OpSetK c
@@ -151,11 +154,18 @@ type OpSetK c
 
 
 {-| What can go wrong reading a `Node` through a schema.
+
+`UnknownVariant` is special: it means a custom type's stored `$tag` names no declared
+variant — the forward-compatibility case where a newer peer wrote a variant this schema
+doesn't know. It is kept distinct from `BadValue` (genuinely malformed data) so that
+`withDefault`/`catchAll` can tolerate _just_ it while real errors still fail loudly.
+
 -}
 type Error
     = TypeMismatch String
     | MissingField String
     | BadValue String
+    | UnknownVariant String
 
 
 {-| Render an error for display.
@@ -171,6 +181,9 @@ errorToString err =
 
         BadValue s ->
             "bad value: " ++ s
+
+        UnknownVariant s ->
+            "unknown variant: " ++ s
 
 
 
@@ -192,7 +205,7 @@ emptyNode (Crdt c) =
 
 
 {-| Seed a node from a value, producing an opaque `Seed` that `Crdt.Edit` /
-`Crdt.OpDoc` pass to `listAppend` / `setKey`.
+`Crdt.Doc` pass to `listAppend` / `setKey`.
 
     todoSchema |> S.with (Todo "pack" False)
 
@@ -303,12 +316,54 @@ bool =
         (PBool False)
 
 
-{-| An explicit LWW marker. Primitives are already last-write-wins, so this is
-the identity — provided for readable schemas.
+{-| An LWW register holding an **arbitrary** value, stored as JSON. Give a `default`
+(what a fresh document reads before any write), an `encode`, and a `decoder`. The whole
+value is one last-write-wins cell: a concurrent edit replaces it wholesale (latest write
+wins), it does not merge structurally.
 -}
-lww : Crdt kind a -> Crdt kind a
-lww =
-    identity
+register : a -> (a -> JE.Value) -> JD.Decoder a -> Crdt Settable a
+register default encode decoder =
+    let
+        toPrim value =
+            PString (JE.encode 0 (encode value))
+
+        fromPrim prim =
+            case prim of
+                PString s ->
+                    JD.decodeString decoder s
+                        |> Result.mapError (\e -> BadValue (JD.errorToString e))
+
+                _ ->
+                    Err (BadValue "expected a JSON-encoded register")
+    in
+    Crdt
+        { -- Like the primitive registers, a `register` is seeded into the empty node
+          -- (below), so it is present from the start and merges by plain SetReg LWW.
+          -- Absence-tolerance for schema evolution is opt-in via `withDefault`.
+          whenAbsent = Nothing
+        , decode =
+            \node ->
+                case Node.asPrim node of
+                    Just p ->
+                        fromPrim p
+
+                    Nothing ->
+                        Err (TypeMismatch "expected a register")
+        , empty =
+            \ctx ->
+                let
+                    ( id, ctx1 ) =
+                        Id.nextId ctx
+                in
+                ( Node.reg (toPrim default) id, ctx1 )
+        , seed =
+            \value ctx ->
+                let
+                    ( id, ctx1 ) =
+                        Id.nextId ctx
+                in
+                ( Node.reg (toPrim value) id, ctx1 )
+        }
 
 
 
@@ -353,7 +408,16 @@ optional (Crdt inner) =
                         case Dict.get justKey entries of
                             Just e ->
                                 if e.present then
-                                    inner.decode e.value |> Result.map Just
+                                    case inner.decode e.value |> Result.map Just of
+                                        -- an unknown custom-type tag (a newer peer's
+                                        -- variant) reads as `Nothing`, like an absent
+                                        -- value — the same evolution tolerance as
+                                        -- `withDefault`.
+                                        Err (UnknownVariant _) ->
+                                            Ok Nothing
+
+                                        result ->
+                                            result
 
                                 else
                                     Ok Nothing
@@ -403,15 +467,26 @@ it stays convergent: a base seed's stamp is minted at `init` (a low Lamport coun
 so any real write outranks it by LWW — the default is only ever the pre-write value, and
 two peers both showing the unwritten default agree because the _value_ agrees.
 
-A present-but-**undecodable** node still surfaces its decode error (drift within a value
-is not the same as an absent field); use `map` to coerce a changed value shape.
+It also covers the sibling evolution case for **custom types**: a stored `$tag` naming a
+variant this schema doesn't know (a newer peer added it) reads as `default` instead of
+failing — the same "the shape evolved" tolerance as an absent field. A genuinely
+**undecodable** node (wrong node kind, malformed value) still surfaces its error; only
+absence and unknown-variant are absorbed. `catchAll` is the alternative for custom types
+when you'd rather keep the unknown tag than collapse it to a default.
 
 -}
 withDefault : a -> Crdt kind a -> Crdt kind a
 withDefault default (Crdt inner) =
     Crdt
         { whenAbsent = Just default
-        , decode = inner.decode
+        , decode =
+            \node ->
+                case inner.decode node of
+                    Err (UnknownVariant _) ->
+                        Ok default
+
+                    result ->
+                        result
         , empty = \ctx -> inner.seed default ctx
         , seed = inner.seed
         }
@@ -444,7 +519,7 @@ map to from (Crdt inner) =
 {-| A PN-counter, read as its integer total. Unlike an `int` register (which is
 last-write-wins, so concurrent `+1`/`+1` collapses to 1), concurrent increments
 from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.Edit.increment`
-/ `Crdt.OpDoc.increment` to change it.
+/ `Crdt.Doc.increment` to change it.
 -}
 counter : Crdt Counter Int
 counter =
@@ -505,7 +580,7 @@ text =
 
 {-| Collaborative **rich** (formatted) text, read as a list of `Span`s (maximal runs
 sharing formatting). Backed by a Fugue character sequence plus a Peritext mark set;
-edited by text insert/delete plus `mark`/`unmark` (see `Crdt.Ref`).
+edited by text insert/delete plus `mark`/`unmark` (see the `Crdt` module).
 -}
 richText : Crdt RichK (List Span)
 richText =
@@ -579,7 +654,7 @@ list (Crdt elem) =
 
 
 {-| A **reorderable** list of `a` — like `list`, but items can be moved with
-`Crdt.OpDoc.listMove` and keep their identity (nested edits and cursors follow a
+`Crdt.Doc.listMove` and keep their identity (nested edits and cursors follow a
 moved item). Backed by `Crdt.MoveList`. Reads as a plain `List a` in order.
 -}
 movableList : Crdt ek a -> Crdt (ListK Movable ek a) (List a)
@@ -625,7 +700,7 @@ movableList (Crdt elem) =
 
 {-| A movable **tree** of `a`: hierarchical, re-parentable, sibling-ordered data
 backed by `Crdt.Tree`. Reads as a `Crdt.Tree.Forest a` (ordered nested items with
-stable ids). Edit it through `Crdt.Ref` (`addChild` / `moveNode` / `removeNode`).
+stable ids). Edit it through the `Crdt` module (`addChild` / `moveInto` / `removeNode`).
 A fresh tree is empty; nodes are added by ref, not seeded, so `seed` yields empty.
 -}
 tree : Crdt ek a -> Crdt (TreeK ek a) (Tree.Forest a)
@@ -742,7 +817,7 @@ your `fold`. This is the shape of the built-in counter (op-keyed deltas, summed)
     mvReg =
         opSet { contribution = mySchema, fold = identity }
 
-Edited only through `Crdt.Ref.contribute` (add a contribution) and `retract` (tombstone
+Edited only through `Crdt.contribute` (add a contribution) and `retract` (tombstone
 one); it is not `set`-able, since its value is derived, not stored.
 
 **Law:** `fold` must be a pure function of the _set_ of contributions — order-independent
@@ -974,7 +1049,7 @@ stampEntries ( pairs, ctx ) =
 clock. Both `seed` (real value) and `empty` (default variant) build one of these.
 
 **Opaque** (it wraps a `Ctx -> (Node, Ctx)`, and `Node` is package-internal) so it
-can be _named_ in the ref-emitting sum builders (`Crdt.Ref.variantNR`) without
+can be _named_ in the ref-emitting sum builders (`Crdt.variant0`/`variant1`/…) without
 leaking `Node` into the public API. You never construct one directly.
 
 -}
@@ -1068,24 +1143,27 @@ catch-all is a real variant of your type, so `match` must handle it. Declare it 
         )
         |> variant0 "active" Active
         |> variant1 "done" Done text
-        |> catchAll "unknown" Unknown
+        |> catchAll Unknown
         |> buildCustom
 
 `ctor` is your constructor (`Unknown : String -> value`). Seeding/switching to
 `Unknown t` writes `$tag = t` with **no payload** — so the tag is _preserved_ on the
 wire and a newer peer still reads its real variant. (Conservation caveat: an old peer
 that switches away from an unknown value can't reproduce its payload — documented in
-`docs/13`. Merely holding the value loses nothing, since it isn't rewritten.) The
-`placeholderTag` is used only for the fresh-document default if the catch-all happens to
-be the first variant, which is unusual.
+`docs/13`. Merely holding the value loses nothing, since it isn't rewritten.)
 
 -}
-catchAll : String -> (String -> value) -> CustomBuilder ((String -> VariantSeed) -> b) value -> CustomBuilder b value
-catchAll placeholderTag ctor (CustomBuilder cb) =
+catchAll : (String -> value) -> CustomBuilder ((String -> VariantSeed) -> b) value -> CustomBuilder b value
+catchAll ctor (CustomBuilder cb) =
     CustomBuilder
         { match = cb.match (\tag -> seedCustomNode tag [])
         , decoders = cb.decoders
-        , default = keepFirst cb.default (seedCustomNode placeholderTag [])
+
+        -- The catch-all never supplies the fresh-document default: it contributes no
+        -- tag of its own, and a real variant declared before it already set the default.
+        -- If the catch-all is somehow the only/first variant, `buildCustom` seeds an
+        -- empty node, which reads back through the catch-all as the empty tag.
+        , default = cb.default
         , catchAll = Just ctor
         }
 
@@ -1211,7 +1289,7 @@ escapeVariant name =
 
 
 {-| The payload-map key a variant's node is stored under (the escaped variant
-name). Exposed so `Crdt.Ref` can build a path to a variant's payload without
+name). Exposed so the `Crdt` module can build a path to a variant's payload without
 re-deriving the escape rule.
 -}
 variantArgKey : String -> String
@@ -1306,7 +1384,7 @@ decodeCustom decoders fallback node =
                                             Ok (toValue name)
 
                                         Nothing ->
-                                            Err (BadValue ("unknown variant: " ++ name))
+                                            Err (UnknownVariant name)
 
                         _ ->
                             Err (BadValue "custom $tag is not a string")
