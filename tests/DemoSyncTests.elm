@@ -145,7 +145,7 @@ suite =
                     alice =
                         init "alice"
                             |> (\d -> C.set refs.title "Trip" d |> ok d)
-                            |> (\d -> C.append todoDoc.schema (Todo "pack" False) refs.todos d |> ok d)
+                            |> (\d -> C.append refs.todos todoDoc.schema (Todo "pack" False) d |> ok d)
 
                     bob =
                         Doc.decodeInto (Doc.encode alice) (init "bob") |> Result.withDefault (init "bob")
@@ -184,7 +184,7 @@ suite =
                         Doc.version (init "alice")
 
                     alice =
-                        C.append todoDoc.schema (Todo "buy milk" False) refs.todos (init "alice") |> ok (init "alice")
+                        C.append refs.todos todoDoc.schema (Todo "buy milk" False) (init "alice") |> ok (init "alice")
 
                     bob =
                         deltaSync before alice (init "bob")
@@ -197,7 +197,7 @@ suite =
                         Doc.version (init "alice")
 
                     alice =
-                        C.addChild outlineDoc.schema (OutlineNode "root") Nothing refs.outline (init "alice")
+                        C.addChild refs.outline outlineDoc.schema (OutlineNode "root") Nothing (init "alice")
                             |> ok (init "alice")
 
                     bob =
@@ -218,7 +218,7 @@ suite =
                     -- create a file, type text, then bold a range — the demo's intents
                     alice =
                         init "alice"
-                            |> (\d -> C.setKey C.richText "notes.md" [] refs.files d |> ok d)
+                            |> (\d -> C.setKey refs.files C.richText "notes.md" [] d |> ok d)
                             |> (\d -> C.setRich file "hello" d |> ok d)
                             |> (\d -> C.mark file 0 3 "bold" Flag d |> ok d)
 

@@ -130,9 +130,9 @@ using a freshly minted id. Returns the updated array and advanced context.
 
 "After `origin`" is expressed as a **right-child of `origin`** (`side = Right`); at
 the head it is a root (`parent = Nothing, side = Right`). This is the classic-RGA
-anchoring rule, kept for the state-based `Crdt.Edit`/`Crdt.Text` layers and
-`Node.reStamp`. The op-log text layer (`Crdt.Doc.applyTextDiff`) chooses
-`parent`/`side` itself to get Fugue's non-interleaving runs.
+anchoring rule, used by the `Crdt.Text` char layer and `Node.reStamp`. The op-log
+text layer (`Crdt.Doc.Internal.applyTextDiff`) chooses `parent`/`side` itself to get
+Fugue's non-interleaving runs.
 
 -}
 insertAfter : Id.Ctx -> Maybe OpId -> c -> Rga c -> ( Rga c, Id.Ctx )

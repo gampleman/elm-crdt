@@ -769,9 +769,9 @@ rebuildIncremental store (Doc d) =
 
 
 {-| A point in the document's shared history — the causal frontier at some
-moment. Unlike the local snapshot stacks of `Crdt.History`, a `Version` is
-**collaborative**: it is derived from the op DAG, so any two peers that hold the
-same ops agree on it, and it can be carried, stored, and checked out later.
+moment. A `Version` is **collaborative**: it is derived from the op DAG, so any two
+peers that hold the same ops agree on it, and it can be carried, stored, and checked
+out later.
 
 A `Version` also doubles as a **branch handle** — checking out a version and
 continuing to edit from the live document, then comparing, is the basis for

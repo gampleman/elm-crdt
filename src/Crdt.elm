@@ -15,7 +15,7 @@ module Crdt exposing
     , set, over, increment, switch
     , append, remove, move
     , setKey, removeKey
-    , treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
+    , node, addChild, moveInto, moveBefore, moveAfter, removeNode
     , setRich, mark, unmark
     , readBlocks, setBlockText, splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock
     , contribute, retract
@@ -209,10 +209,10 @@ grows at the end; reach for `movableList` whenever order is something users cont
 
     -- insert `todo` as the new element at index 2 of a movable list:
     doc
-        |> Crdt.append todoSchema todo todosRef
+        |> Crdt.append todosRef todoSchema todo
         |> Result.andThen
             (\d ->
-                Crdt.move (List.length (currentTodos d) - 1) 2 todosRef d
+                Crdt.move todosRef (List.length (currentTodos d) - 1) 2 d
             )
 
 @docs append, remove, move
@@ -225,7 +225,7 @@ grows at the end; reach for `movableList` whenever order is something users cont
 
 # Editing trees
 
-@docs treeNode, addChild, moveInto, moveBefore, moveAfter, removeNode
+@docs node, addChild, moveInto, moveBefore, moveAfter, removeNode
 
 
 # Editing text and rich text
@@ -677,7 +677,7 @@ type Ref r kind a
 {-| Compose refs: descend from a spot of type `sub` into a spot inside it. Reads as
 navigation in a pipe:
 
-    board.refs.status |> at status.refs.done
+    board.refs.status |> at status.refs.archivedReason
 
 -}
 at : Ref sub innerKind a -> Ref r outerKind sub -> Ref r innerKind a
@@ -978,16 +978,16 @@ refPath (Ref r) =
 {-| Append a value to the end of a list ref, seeded through the element schema.
 Compiles for any list (`ListK _ ek e`).
 -}
-append : Schema ek e -> e -> Ref r (ListK mv ek e) (List e) -> Doc doc -> Result EditError (Doc doc)
-append elemSchema value (Ref r) doc =
+append : Ref r (ListK mv ek e) (List e) -> Schema ek e -> e -> Doc doc -> Result EditError (Doc doc)
+append (Ref r) elemSchema value doc =
     DocI.listAppend r.path (SI.with value elemSchema) doc
         |> mapEdit
 
 
 {-| Remove the element at visible index `i` from a list ref.
 -}
-remove : Int -> Ref r (ListK mv ek e) (List e) -> Doc doc -> Result EditError (Doc doc)
-remove i (Ref r) doc =
+remove : Ref r (ListK mv ek e) (List e) -> Int -> Doc doc -> Result EditError (Doc doc)
+remove (Ref r) i doc =
     DocI.listRemove r.path i doc
         |> mapEdit
 
@@ -996,8 +996,8 @@ remove i (Ref r) doc =
 `Movable` list (`ListK Movable …`) — calling it on a plain `list` is a type error.
 The moved item keeps its identity (nested edits and cursors follow it).
 -}
-move : Int -> Int -> Ref r (ListK Movable ek e) (List e) -> Doc doc -> Result EditError (Doc doc)
-move from to (Ref r) doc =
+move : Ref r (ListK Movable ek e) (List e) -> Int -> Int -> Doc doc -> Result EditError (Doc doc)
+move (Ref r) from to doc =
     DocI.listMove r.path from to doc
         |> mapEdit
 
@@ -1009,16 +1009,16 @@ move from to (Ref r) doc =
 {-| Set (create or overwrite) a dict key to a value, seeded through the value
 schema. Compiles for a dict ref (`DictK vk v`).
 -}
-setKey : Schema vk v -> String -> v -> Ref r (DictK vk v) dictType -> Doc doc -> Result EditError (Doc doc)
-setKey valSchema k value (Ref r) doc =
+setKey : Ref r (DictK vk v) dictType -> Schema vk v -> String -> v -> Doc doc -> Result EditError (Doc doc)
+setKey (Ref r) valSchema k value doc =
     DocI.setKey r.path k (SI.with value valSchema) doc
         |> mapEdit
 
 
 {-| Remove a dict key (LWW tombstone).
 -}
-removeKey : String -> Ref r (DictK vk v) dictType -> Doc doc -> Result EditError (Doc doc)
-removeKey k (Ref r) doc =
+removeKey : Ref r (DictK vk v) dictType -> String -> Doc doc -> Result EditError (Doc doc)
+removeKey (Ref r) k doc =
     DocI.removeKey r.path k doc
         |> mapEdit
 
@@ -1033,12 +1033,17 @@ value; it is written under a fresh op-id, so concurrent contributions from any r
 all survive and the op-set's `fold` sees them all. Returns the contribution's key (its
 op-id string), which you can keep to `retract` exactly that contribution later.
 
-    ( key, doc1 ) =
-        Crdt.contribute Crdt.int 42 board.refs.highScore doc
+    case Crdt.contribute board.refs.highScore Crdt.int 42 doc of
+        Ok ( key, doc1 ) ->
+            -- keep `key` if you'll want to `retract` this contribution later
+            ...
+
+        Err _ ->
+            ...
 
 -}
-contribute : Schema ck c -> c -> Ref r (OpSetK c) a -> Doc doc -> Result EditError ( String, Doc doc )
-contribute contributionSchema value (Ref r) doc =
+contribute : Ref r (OpSetK c) a -> Schema ck c -> c -> Doc doc -> Result EditError ( String, Doc doc )
+contribute (Ref r) contributionSchema value doc =
     DocI.contribute r.path (SI.with value contributionSchema) doc
         |> mapEdit
 
@@ -1064,19 +1069,20 @@ contributions only.
 
     -- add an item, remembering the key so it can be removed later:
     ( appleKey, doc1 ) =
-        Crdt.contribute Crdt.string "apple" cartRef doc
+        Crdt.contribute cartRef Crdt.string "apple" doc
+            |> Result.withDefault ( "", doc )
 
     -- …the shopper removes it again:
     doc2 =
-        Crdt.retract appleKey cartRef doc1
+        Crdt.retract cartRef appleKey doc1
             |> Result.withDefault doc1
 
 If you want removal keyed by value rather than by contribution id, keep your own
 `Dict value key` alongside the document and look the key up when removing.
 
 -}
-retract : String -> Ref r (OpSetK c) a -> Doc doc -> Result EditError (Doc doc)
-retract contributionKey (Ref r) doc =
+retract : Ref r (OpSetK c) a -> String -> Doc doc -> Result EditError (Doc doc)
+retract (Ref r) contributionKey doc =
     DocI.retract r.path contributionKey doc
         |> mapEdit
 
@@ -1087,11 +1093,11 @@ retract contributionKey (Ref r) doc =
 
 
 {-| A payload ref for tree node `nodeId`, given the node schema. Compose into it or
-`set`/`over` its content: `treeNode id nodeSchema treeRef |> Ref.at nodeRefs.title`.
+`set`/`over` its content: `treeRef |> Crdt.node id nodeSchema |> Crdt.at nodeRefs.title`.
 Editing a node not currently present is a no-op.
 -}
-treeNode : Id.OpId -> Schema ek a -> Ref r (TreeK ek a) forest -> Ref r ek a
-treeNode nodeId nodeSchema (Ref container) =
+node : Id.OpId -> Schema ek a -> Ref r (TreeK ek a) forest -> Ref r ek a
+node nodeId nodeSchema (Ref container) =
     Ref
         { path = container.path |> Path.node nodeId
         , schema = nodeSchema
@@ -1101,8 +1107,8 @@ treeNode nodeId nodeSchema (Ref container) =
 {-| Add a new node (seeded from `value`) as the last child of `parent` (`Nothing` =
 a new root) in a tree ref.
 -}
-addChild : Schema ek a -> a -> Maybe Id.OpId -> Ref r (TreeK ek a) forest -> Doc doc -> Result EditError (Doc doc)
-addChild nodeSchema value parent (Ref r) doc =
+addChild : Ref r (TreeK ek a) forest -> Schema ek a -> a -> Maybe Id.OpId -> Doc doc -> Result EditError (Doc doc)
+addChild (Ref r) nodeSchema value parent doc =
     DocI.treeAddChild r.path parent (SI.with value nodeSchema) doc
         |> mapEdit
 
@@ -1110,32 +1116,32 @@ addChild nodeSchema value parent (Ref r) doc =
 {-| Re-parent `child` to be the last child of `parent` (`Nothing` = a root).
 Cycle-forming moves are skipped (the node stays put), so this always converges.
 -}
-moveInto : Id.OpId -> Maybe Id.OpId -> Ref r (TreeK ek a) forest -> Doc doc -> Result EditError (Doc doc)
-moveInto child parent (Ref r) doc =
+moveInto : Ref r (TreeK ek a) forest -> Id.OpId -> Maybe Id.OpId -> Doc doc -> Result EditError (Doc doc)
+moveInto (Ref r) child parent doc =
     DocI.treeMoveInto r.path child parent doc
         |> mapEdit
 
 
 {-| Move `child` to sit immediately before `sibling` (under the sibling's parent).
 -}
-moveBefore : Id.OpId -> Id.OpId -> Ref r (TreeK ek a) forest -> Doc doc -> Result EditError (Doc doc)
-moveBefore child sibling (Ref r) doc =
+moveBefore : Ref r (TreeK ek a) forest -> Id.OpId -> Id.OpId -> Doc doc -> Result EditError (Doc doc)
+moveBefore (Ref r) child sibling doc =
     DocI.treeMoveBefore r.path child sibling doc
         |> mapEdit
 
 
 {-| Move `child` to sit immediately after `sibling` (under the sibling's parent).
 -}
-moveAfter : Id.OpId -> Id.OpId -> Ref r (TreeK ek a) forest -> Doc doc -> Result EditError (Doc doc)
-moveAfter child sibling (Ref r) doc =
+moveAfter : Ref r (TreeK ek a) forest -> Id.OpId -> Id.OpId -> Doc doc -> Result EditError (Doc doc)
+moveAfter (Ref r) child sibling doc =
     DocI.treeMoveAfter r.path child sibling doc
         |> mapEdit
 
 
 {-| Remove a node and its subtree from a tree ref.
 -}
-removeNode : Id.OpId -> Ref r (TreeK ek a) forest -> Doc doc -> Result EditError (Doc doc)
-removeNode child (Ref r) doc =
+removeNode : Ref r (TreeK ek a) forest -> Id.OpId -> Doc doc -> Result EditError (Doc doc)
+removeNode (Ref r) child doc =
     DocI.treeRemove r.path child doc
         |> mapEdit
 

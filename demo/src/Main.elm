@@ -185,7 +185,7 @@ node ref (by stable id), and the field ref. Drives that node's text input + care
 -}
 outlineTextRef : OpId -> Ref Board C.Settable String
 outlineTextRef id =
-    refs.outline |> C.treeNode id nodeDoc.schema |> C.at nodeDoc.refs.text
+    refs.outline |> C.node id nodeDoc.schema |> C.at nodeDoc.refs.text
 
 
 {-| Per-peer ephemeral state. Never merged into the document — it lives on the
@@ -487,7 +487,7 @@ update msg model =
 
                     -- append a fresh todo at the end of the list
                     doc1 =
-                        C.append todoDoc.schema (Todo model.newTodo False) refs.todos model.doc
+                        C.append refs.todos todoDoc.schema (Todo model.newTodo False) model.doc
                             |> orKeep model.doc
                 in
                 recordPush before { model | doc = doc1, newTodo = "" }
@@ -515,7 +515,7 @@ update msg model =
                     Doc.version model.doc
 
                 doc1 =
-                    C.remove i refs.todos model.doc |> orKeep model.doc
+                    C.remove refs.todos i model.doc |> orKeep model.doc
             in
             recordPush before { model | doc = doc1 }
 
@@ -557,7 +557,7 @@ update msg model =
                                 Doc.version model.doc
 
                             doc1 =
-                                C.move from target refs.todos model.doc
+                                C.move refs.todos from target model.doc
                                     |> orKeep model.doc
                         in
                         pushDoc (refreshSlices before { model | doc = doc1, dragging = Just target })
@@ -608,7 +608,7 @@ update msg model =
 
                     -- seed an empty rich-text file at this key, then open it
                     doc1 =
-                        C.setKey C.richText name [] refs.files model.doc
+                        C.setKey refs.files C.richText name [] model.doc
                             |> orKeep model.doc
                 in
                 recordPush before
@@ -631,7 +631,7 @@ update msg model =
                     Doc.version model.doc
 
                 doc1 =
-                    C.removeKey k refs.files model.doc |> orKeep model.doc
+                    C.removeKey refs.files k model.doc |> orKeep model.doc
 
                 -- close the file if it was the open one
                 selected =
@@ -644,26 +644,26 @@ update msg model =
             recordPush before { model | doc = doc1, selectedFile = selected }
 
         AddOutlineRoot ->
-            outlineEdit (C.addChild nodeDoc.schema (Node "") Nothing refs.outline) model
+            outlineEdit (C.addChild refs.outline nodeDoc.schema (Node "") Nothing) model
 
         AddOutlineChild parent ->
-            outlineEdit (C.addChild nodeDoc.schema (Node "") (Just parent) refs.outline) model
+            outlineEdit (C.addChild refs.outline nodeDoc.schema (Node "") (Just parent)) model
 
         IndentNode node maybePrev ->
             -- nest under the preceding sibling (Nothing = no previous sibling; no-op)
             case maybePrev of
                 Just prev ->
-                    outlineEdit (C.moveInto node (Just prev) refs.outline) model
+                    outlineEdit (C.moveInto refs.outline node (Just prev)) model
 
                 Nothing ->
                     ( model, Cmd.none )
 
         OutdentNode node maybeGrandparent ->
             -- promote to sit under the parent's parent (Nothing = already a root)
-            outlineEdit (C.moveInto node maybeGrandparent refs.outline) model
+            outlineEdit (C.moveInto refs.outline node maybeGrandparent) model
 
         RemoveNode node ->
-            outlineEdit (C.removeNode node refs.outline) model
+            outlineEdit (C.removeNode refs.outline node) model
 
         FocusField fieldName ->
             -- mark the start of a typing session so it undoes as one step
@@ -1762,7 +1762,7 @@ viewHeader model board =
         [ h1 [] [ text titleText ]
         , span [ class ("status-badge status-" ++ statusSlug board.status) ]
             [ text (statusLabel board.status) ]
-        , span [ class "replica" ] [ text ("you are " ++ Crdt.Id.toString model.me) ]
+        , span [ class "replica" ] [ text ("you are " ++ Crdt.Id.replicaToString model.me) ]
         , span
             [ class
                 (if model.connected then
@@ -2337,7 +2337,7 @@ viewCheckpoint viewing cp =
             )
         ]
         [ span [ class "cp-msg" ] [ text (Doc.checkpointMessage cp) ]
-        , span [ class "cp-author" ] [ text (Crdt.Id.toString (Doc.checkpointAuthor cp)) ]
+        , span [ class "cp-author" ] [ text (Crdt.Id.replicaToString (Doc.checkpointAuthor cp)) ]
         , button [ onClick (PreviewVersion cpVersion) ] [ text "preview" ]
         ]
 

@@ -133,18 +133,18 @@ applyEdit edit doc =
                     C.set refs.title s doc |> ok
 
                 AddTag s ->
-                    C.append C.text s refs.tags doc |> ok
+                    C.append refs.tags C.text s doc |> ok
 
                 RemoveTag i ->
-                    C.remove i refs.tags doc |> ok
+                    C.remove refs.tags i doc |> ok
 
                 AddRoot s ->
-                    C.addChild nodeDoc.schema (NodeItem s) Nothing refs.outline doc |> ok
+                    C.addChild refs.outline nodeDoc.schema (NodeItem s) Nothing doc |> ok
 
                 AddChildOfFirst s ->
                     case List.head (rootIds doc) of
                         Just p ->
-                            C.addChild nodeDoc.schema (NodeItem s) (Just p) refs.outline doc |> ok
+                            C.addChild refs.outline nodeDoc.schema (NodeItem s) (Just p) doc |> ok
 
                         Nothing ->
                             doc
@@ -154,7 +154,7 @@ applyEdit edit doc =
                     -- redo class that lost inner text needs this to be fuzzed)
                     case List.head (allNodeIds doc) of
                         Just n ->
-                            C.set (refs.outline |> C.treeNode n nodeDoc.schema |> C.at nodeDoc.refs.label) s doc |> ok
+                            C.set (refs.outline |> C.node n nodeDoc.schema |> C.at nodeDoc.refs.label) s doc |> ok
 
                         Nothing ->
                             doc
@@ -166,7 +166,7 @@ applyEdit edit doc =
                                 doc
 
                             else
-                                C.moveInto first (Just last) refs.outline doc |> ok
+                                C.moveInto refs.outline first (Just last) doc |> ok
 
                         _ ->
                             doc
@@ -174,7 +174,7 @@ applyEdit edit doc =
                 DeleteFirstRoot ->
                     case List.head (rootIds doc) of
                         Just r ->
-                            C.removeNode r refs.outline doc |> ok
+                            C.removeNode refs.outline r doc |> ok
 
                         Nothing ->
                             doc

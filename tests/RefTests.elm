@@ -153,7 +153,7 @@ read =
 -}
 addTodo : String -> Doc Board -> Doc Board
 addTodo t doc =
-    C.append todo.schema (Todo t False) r.todos doc |> ok doc
+    C.append r.todos todo.schema (Todo t False) doc |> ok doc
 
 
 
@@ -271,7 +271,7 @@ suite =
                             doc0 |> addTodo "a" |> addTodo "b" |> addTodo "c"
 
                         d2 =
-                            C.move 0 2 r.todos d1 |> ok d1
+                            C.move r.todos 0 2 d1 |> ok d1
                     in
                     read d2 |> Result.map (.todos >> List.map .text) |> Expect.equal (Ok [ "b", "c", "a" ])
             , test "remove drops an element" <|
@@ -281,15 +281,15 @@ suite =
                             doc0 |> addTodo "a" |> addTodo "b"
 
                         d2 =
-                            C.remove 0 r.todos d1 |> ok d1
+                            C.remove r.todos 0 d1 |> ok d1
                     in
                     read d2 |> Result.map (.todos >> List.map .text) |> Expect.equal (Ok [ "b" ])
             , test "set a leaf list element directly (tags is List String)" <|
                 \_ ->
                     let
                         d1 =
-                            (C.append C.text "urgent" r.tags doc0 |> ok doc0)
-                                |> C.append C.text "later" r.tags
+                            (C.append r.tags C.text "urgent" doc0 |> ok doc0)
+                                |> C.append r.tags C.text "later"
                                 |> ok doc0
 
                         d2 =

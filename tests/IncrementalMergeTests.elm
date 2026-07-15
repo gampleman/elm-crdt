@@ -179,7 +179,7 @@ suite =
 
                     alice =
                         init "alice"
-                            |> (\d -> C.setKey C.richText "notes" [] refs.files d |> ok d)
+                            |> (\d -> C.setKey refs.files C.richText "notes" [] d |> ok d)
                             |> (\d -> C.setRich fileRef "hello" d |> ok d)
 
                     bob =
@@ -200,8 +200,8 @@ suite =
                 let
                     base =
                         init "seed"
-                            |> (\d -> C.addChild onodeDoc.schema (ONode "a") Nothing refs.outline d |> ok d)
-                            |> (\d -> C.addChild onodeDoc.schema (ONode "b") Nothing refs.outline d |> ok d)
+                            |> (\d -> C.addChild refs.outline onodeDoc.schema (ONode "a") Nothing d |> ok d)
+                            |> (\d -> C.addChild refs.outline onodeDoc.schema (ONode "b") Nothing d |> ok d)
 
                     idsOf doc =
                         read doc |> Result.map (.outline >> List.map Tree.itemId) |> Result.withDefault []
@@ -217,8 +217,8 @@ suite =
                     ( a, b ) =
                         case firstTwo base of
                             Just ( x, y ) ->
-                                ( peerOf "alice" base |> (\d -> C.moveInto y (Just x) refs.outline d |> ok d)
-                                , peerOf "bob" base |> (\d -> C.moveInto x (Just y) refs.outline d |> ok d)
+                                ( peerOf "alice" base |> (\d -> C.moveInto refs.outline y (Just x) d |> ok d)
+                                , peerOf "bob" base |> (\d -> C.moveInto refs.outline x (Just y) d |> ok d)
                                 )
 
                             Nothing ->
@@ -241,13 +241,13 @@ suite =
                 let
                     base =
                         List.range 1 4
-                            |> List.foldl (\i d -> C.append todoDoc.schema (Todo (String.fromInt i) False) refs.todos d |> ok d) (init "seed")
+                            |> List.foldl (\i d -> C.append refs.todos todoDoc.schema (Todo (String.fromInt i) False) d |> ok d) (init "seed")
 
                     a =
-                        peerOf "alice" base |> (\d -> C.move 3 0 refs.todos d |> ok d)
+                        peerOf "alice" base |> (\d -> C.move refs.todos 3 0 d |> ok d)
 
                     b =
-                        peerOf "bob" base |> (\d -> C.move 1 3 refs.todos d |> ok d)
+                        peerOf "bob" base |> (\d -> C.move refs.todos 1 3 d |> ok d)
 
                     ab =
                         mergeOp a b
@@ -316,13 +316,13 @@ suite =
                 -- fold correctly onto the incrementally-merged cache.
                 let
                     base =
-                        init "seed" |> (\d -> C.append todoDoc.schema (Todo "a" False) refs.todos d |> ok d)
+                        init "seed" |> (\d -> C.append refs.todos todoDoc.schema (Todo "a" False) d |> ok d)
 
                     peer =
-                        peerOf "alice" base |> (\d -> C.append todoDoc.schema (Todo "b" False) refs.todos d |> ok d)
+                        peerOf "alice" base |> (\d -> C.append refs.todos todoDoc.schema (Todo "b" False) d |> ok d)
 
                     merged =
-                        mergeOp base peer |> (\d -> C.append todoDoc.schema (Todo "c" False) refs.todos d |> ok d)
+                        mergeOp base peer |> (\d -> C.append refs.todos todoDoc.schema (Todo "c" False) d |> ok d)
                 in
                 Expect.all
                     [ \_ -> consistent merged

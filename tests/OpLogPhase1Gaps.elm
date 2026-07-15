@@ -66,8 +66,8 @@ suite =
         --   DONE: Doc.Version (a causal frontier) + version + readAt give
         --   collaborative time-travel — tested that a version captured before a
         --   merge excludes both the peer's concurrent ops and later local edits,
-        --   while the live doc has everything (DocTests). This is the thing the
-        --   local snapshot-stack Crdt.History could never do.
+        --   while the live doc has everything (DocTests). Collaborative,
+        --   op-DAG-derived time-travel — impossible with a local snapshot stack.
         -- Named checkpoints (DONE): Doc.Checkpoint (message + author + Version),
         --   Doc.checkpoint / checkpoints / checkpointMessage / -Author / -Version.
         --   Stored in the doc, emit no ops; readAt the version time-travels. Demo
@@ -82,8 +82,7 @@ suite =
         -- (tombstones permanent); undo/redo self-record so cycles stay valid. Tested
         -- tests/UndoTests.elm (16, incl. concurrent-survives, undo-syncs-to-peer,
         -- stacks-survive-merge). Demo: undo/redo buttons; typing session (focus→blur)
-        -- and a whole drag-reorder each collapse to one step. (Old state-based
-        -- Crdt.History.undo/redo still exists for the legacy Crdt.Doc flavor.)
+        -- and a whole drag-reorder each collapse to one step.
         , test "undo/redo emit inverse ops that sync (DONE — see UndoTests)" <|
             \_ -> Expect.pass
 

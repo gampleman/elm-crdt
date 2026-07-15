@@ -96,7 +96,7 @@ addRoot : String -> Doc Sample -> ( Maybe OpId, Doc Sample )
 addRoot label doc =
     let
         doc1 =
-            C.addChild itemDoc.schema (Item label) Nothing refs.outline doc |> ok doc
+            C.addChild refs.outline itemDoc.schema (Item label) Nothing doc |> ok doc
     in
     ( findId label doc1, doc1 )
 
@@ -105,7 +105,7 @@ addUnder : String -> OpId -> Doc Sample -> ( Maybe OpId, Doc Sample )
 addUnder label parent doc =
     let
         doc1 =
-            C.addChild itemDoc.schema (Item label) (Just parent) refs.outline doc |> ok doc
+            C.addChild refs.outline itemDoc.schema (Item label) (Just parent) doc |> ok doc
     in
     ( findId label doc1, doc1 )
 
@@ -174,13 +174,13 @@ suite =
                     d3 =
                         case ( mA, mB ) of
                             ( Just aId, Just bId ) ->
-                                C.moveInto bId (Just aId) refs.outline d2 |> ok d2
+                                C.moveInto refs.outline bId (Just aId) d2 |> ok d2
 
                             _ ->
                                 d2
                 in
                 shape (read d3) |> Expect.equal "A[B]"
-        , test "editing a node's payload via treeNode ref" <|
+        , test "editing a node's payload via a node ref" <|
             \_ ->
                 let
                     ( mA, d1 ) =
@@ -190,7 +190,7 @@ suite =
                     Just aId ->
                         let
                             d2 =
-                                C.set (refs.outline |> C.treeNode aId itemDoc.schema |> C.at itemDoc.refs.label) "A!" d1
+                                C.set (refs.outline |> C.node aId itemDoc.schema |> C.at itemDoc.refs.label) "A!" d1
                                     |> ok d1
                         in
                         shape (read d2) |> Expect.equal "A!"
@@ -214,7 +214,7 @@ suite =
                     d3 =
                         case mA of
                             Just aId ->
-                                C.removeNode aId refs.outline d2 |> ok d2
+                                C.removeNode refs.outline aId d2 |> ok d2
 
                             Nothing ->
                                 d2
@@ -236,7 +236,7 @@ suite =
                     d4 =
                         case ( findId "C" d3, findId "A" d3 ) of
                             ( Just cId, Just aId ) ->
-                                C.moveBefore cId aId refs.outline d3 |> ok d3
+                                C.moveBefore refs.outline cId aId d3 |> ok d3
 
                             _ ->
                                 d3
@@ -282,10 +282,10 @@ suite =
 
                                 -- alice moves A under B; bob moves B under A
                                 alice =
-                                    C.moveInto aId (Just bId) refs.outline start |> ok start
+                                    C.moveInto refs.outline aId (Just bId) start |> ok start
 
                                 bob =
-                                    C.moveInto bId (Just aId) refs.outline bobStart |> ok bobStart
+                                    C.moveInto refs.outline bId (Just aId) bobStart |> ok bobStart
 
                                 ab =
                                     Doc.decodeInto (Doc.encode bob) alice |> Result.withDefault alice
@@ -326,7 +326,7 @@ suite =
                         deleted =
                             case mA of
                                 Just aId ->
-                                    tracked (C.removeNode aId refs.outline) d3
+                                    tracked (C.removeNode refs.outline aId) d3
 
                                 Nothing ->
                                     d3
@@ -343,7 +343,7 @@ suite =
                 \_ ->
                     let
                         added =
-                            tracked (C.addChild itemDoc.schema (Item "X") Nothing refs.outline) (init "alice")
+                            tracked (C.addChild refs.outline itemDoc.schema (Item "X") Nothing) (init "alice")
                     in
                     Expect.all
                         [ \_ -> Expect.equal "X" (shape (read added))
@@ -362,7 +362,7 @@ suite =
                         moved =
                             case ( mA, mB ) of
                                 ( Just aId, Just bId ) ->
-                                    tracked (C.moveInto bId (Just aId) refs.outline) d2
+                                    tracked (C.moveInto refs.outline bId (Just aId)) d2
 
                                 _ ->
                                     d2
@@ -381,7 +381,7 @@ suite =
                         deleted =
                             case mA of
                                 Just aId ->
-                                    tracked (C.removeNode aId refs.outline) d1
+                                    tracked (C.removeNode refs.outline aId) d1
 
                                 Nothing ->
                                     d1
@@ -396,13 +396,13 @@ suite =
                     -- redo must rebuild the node AND its text, in order.
                     let
                         d1 =
-                            tracked (C.addChild itemDoc.schema (Item "A") Nothing refs.outline) (init "alice")
+                            tracked (C.addChild refs.outline itemDoc.schema (Item "A") Nothing) (init "alice")
 
                         edited =
                             case findId "A" d1 of
                                 Just aId ->
                                     tracked
-                                        (C.set (refs.outline |> C.treeNode aId itemDoc.schema |> C.at itemDoc.refs.label) "A!")
+                                        (C.set (refs.outline |> C.node aId itemDoc.schema |> C.at itemDoc.refs.label) "A!")
                                         d1
 
                                 Nothing ->

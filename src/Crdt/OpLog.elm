@@ -20,8 +20,8 @@ linearization is chosen. Causal order matters: a `DeleteElem` applied before its
 target's `InsertElem` would be a silent no-op, so only an order that honours
 `deps` is correct.
 
-This is the Phase 1 core from `docs/02-oplog.md`: real DAG + frontiers + causal
-materialize + checkout. It is not yet wired into the public `Crdt` module.
+The op-log core: real DAG + frontiers + causal materialize + checkout. `Crdt.Doc.Internal`
+drives it — every document is materialized from an `OpStore`.
 
 @docs Op, Action, Target, TargetStep, Frontier
 @docs OpStore, empty, insert, ops, member, merge

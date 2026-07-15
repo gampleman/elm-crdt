@@ -10,7 +10,7 @@ module Crdt.Doc exposing
 
 {-| A **document** — the live, collaborative value your application holds and edits.
 
-An `Doc` is a JSON-like document (records, lists, dictionaries, text, counters, and
+A `Doc` is a JSON-like document (records, lists, dictionaries, text, counters, and
 your own types — whatever your `Crdt` schema describes) that several people can edit at
 the same time, on different devices, even while offline, and always end up agreeing on
 the result. You never reconcile conflicts by hand: concurrent edits **merge**
@@ -77,7 +77,7 @@ itself just more edits, it syncs to everyone else too.
 # Undo and redo
 
 Undo here is **per-user**, and different from the time-travel above. Time-travel
-(`readAt` / `restoreTo`) works on the _whole shared timeline_ — every replica's edits
+(`Crdt.readAt` / `restoreTo`) works on the _whole shared timeline_ — every replica's edits
 together — and `restoreTo` rewinds the document for everyone. Undo instead walks back
 only **your own** recent actions, and leaves concurrent edits from other people alone: if
 you type a word while a collaborator deletes a paragraph elsewhere, your undo removes your

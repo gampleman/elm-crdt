@@ -22,8 +22,8 @@ A `Crdt a` carries three capabilities, all keyed off the uniform `Node`:
     "append this todo" can mint a whole subtree).
 
 There is deliberately no `encode : a -> Node` that reconciles with existing
-state — that is the hard diff problem. All in-place mutation goes through
-`Crdt.Edit`, which is decoupled from this layer.
+state — that is the hard diff problem. All in-place mutation goes through the
+op-log edit APIs in `Crdt.Doc.Internal` (surfaced as `Crdt`), decoupled from this layer.
 
 @docs Crdt, Error, Seed
 @docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
@@ -187,7 +187,7 @@ errorToString err =
 
 
 
--- DRIVERS (used by Crdt.elm / Crdt.Edit) -------------------------------------
+-- DRIVERS (used by Crdt.Doc.Internal) ----------------------------------------
 
 
 {-| Decode a node through a schema.
@@ -204,8 +204,8 @@ emptyNode (Crdt c) =
     c.empty
 
 
-{-| Seed a node from a value, producing an opaque `Seed` that `Crdt.Edit` /
-`Crdt.Doc` pass to `listAppend` / `setKey`.
+{-| Seed a node from a value, producing an opaque `Seed` that the `Crdt.Doc.Internal`
+edit APIs pass to `listAppend` / `setKey`.
 
     todoSchema |> S.with (Todo "pack" False)
 
@@ -518,8 +518,7 @@ map to from (Crdt inner) =
 
 {-| A PN-counter, read as its integer total. Unlike an `int` register (which is
 last-write-wins, so concurrent `+1`/`+1` collapses to 1), concurrent increments
-from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.Edit.increment`
-/ `Crdt.Doc.increment` to change it.
+from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.increment` to change it.
 -}
 counter : Crdt Counter Int
 counter =
@@ -1160,9 +1159,10 @@ catchAll ctor (CustomBuilder cb) =
         , decoders = cb.decoders
 
         -- The catch-all never supplies the fresh-document default: it contributes no
-        -- tag of its own, and a real variant declared before it already set the default.
-        -- If the catch-all is somehow the only/first variant, `buildCustom` seeds an
-        -- empty node, which reads back through the catch-all as the empty tag.
+        -- tag of its own, and a real variant declared before it already set the default
+        -- (via `keepFirst`). A custom type whose ONLY variant is a catch-all is
+        -- degenerate — it then has no default, so a fresh document has no `$tag` and
+        -- fails to read (`MissingField`); declare at least one real variant first.
         , default = cb.default
         , catchAll = Just ctor
         }

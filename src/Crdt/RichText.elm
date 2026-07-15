@@ -78,9 +78,10 @@ type alias Span =
   - `Value String` — a mark that carries a string, like a link's `href` or a highlight
     colour.
 
-You choose which kind a mark is when you apply it (`Crdt.mark ref "bold" RichText.Flag`
-versus `Crdt.mark ref "link" (RichText.Value "https://…")`). A mark that is not active
-over a span is simply absent from its `marks` — there is no "off" value to match on.
+You choose which kind a mark is when you apply it over a range — `Crdt.mark ref from to
+"bold" RichText.Flag doc` versus `Crdt.mark ref from to "link" (RichText.Value "https://…")
+doc`. A mark that is not active over a span is simply absent from its `marks` — there is
+no "off" value to match on.
 
 -}
 type MarkValue

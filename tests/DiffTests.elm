@@ -141,7 +141,7 @@ suite =
                         refs.files |> C.key "notes" C.richText
 
                     base =
-                        init "me" |> (\d -> C.setKey C.richText "notes" [] refs.files d |> ok d)
+                        init "me" |> (\d -> C.setKey refs.files C.richText "notes" [] d |> ok d)
 
                     peer =
                         peerOf "peer" base |> (\d -> C.setRich fileRef "hello" d |> ok d)
@@ -162,7 +162,7 @@ suite =
                         refs.files |> C.key "notes" C.richText
 
                     base =
-                        init "me" |> (\d -> C.setKey C.richText "notes" [] refs.files d |> ok d)
+                        init "me" |> (\d -> C.setKey refs.files C.richText "notes" [] d |> ok d)
 
                     peer =
                         peerOf "peer" base |> (\d -> C.setRich fileRef "many characters typed" d |> ok d)

@@ -133,7 +133,7 @@ setLocal : a -> Presence a -> Presence a
 setLocal value (Presence p) =
     let
         key =
-            Id.toString p.me
+            Id.replicaToString p.me
 
         seq =
             Dict.get key p.slots |> Maybe.map (\s -> s.seq + 1) |> Maybe.withDefault 0
@@ -161,7 +161,7 @@ updateLocal f pres =
 -}
 local : Presence a -> Maybe a
 local (Presence p) =
-    Dict.get (Id.toString p.me) p.slots |> Maybe.map .value
+    Dict.get (Id.replicaToString p.me) p.slots |> Maybe.map .value
 
 
 {-| Every known peer and its state, including yourself, ordered by replica id. This is
@@ -207,7 +207,7 @@ broadcasts again later.
 -}
 remove : ReplicaId -> Presence a -> Presence a
 remove rid (Presence p) =
-    Presence { p | slots = Dict.remove (Id.toString rid) p.slots }
+    Presence { p | slots = Dict.remove (Id.replicaToString rid) p.slots }
 
 
 

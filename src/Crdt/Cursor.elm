@@ -52,16 +52,16 @@ import Json.Decode exposing (Decoder)
 import Json.Encode as JE
 
 
-{-| A stable position within a text or list field. Build one with `Crdt.cursorAt`
-and resolve it back to a current offset with `Crdt.cursorOffset`. Opaque.
+{-| A stable position within a text field. Build one with `Crdt.cursorAt` and resolve it
+back to a current offset with `Crdt.cursorOffset`. Opaque.
 -}
 type alias Cursor =
     I.Cursor
 
 
-{-| The identity of the element a cursor sits on, if any (`Nothing` when it is at the
-very start). Use this for item-level presence — "which list item is this peer on" —
-which stays correct no matter how the list is reordered.
+{-| The identity of the character a cursor sits just after, if any (`Nothing` when it is
+at the very start). Because it is an identity rather than an offset, it keeps pointing at
+the same character as the text is edited around it.
 -}
 element : Cursor -> Maybe OpId
 element =

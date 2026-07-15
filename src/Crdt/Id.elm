@@ -1,5 +1,5 @@
 module Crdt.Id exposing
-    ( ReplicaId, replica, toString
+    ( ReplicaId, replica, replicaToString
     , OpId, opIdCounter, opIdReplica, compareOpId, opIdToString
     )
 
@@ -18,7 +18,7 @@ to use one as a dictionary key or to look a value up.
 
 # Replicas
 
-@docs ReplicaId, replica, toString
+@docs ReplicaId, replica, replicaToString
 
 
 # Operation ids
@@ -50,8 +50,8 @@ replica =
 
 {-| The underlying string of a `ReplicaId`, e.g. to show who made a change.
 -}
-toString : ReplicaId -> String
-toString =
+replicaToString : ReplicaId -> String
+replicaToString =
     I.toString
 
 
