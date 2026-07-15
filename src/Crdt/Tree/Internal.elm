@@ -3,7 +3,7 @@ module Crdt.Tree.Internal exposing
     , empty, fromParts, moves, payloads, deletedIds
     , move, moveOnly, updateValue, delete
     , merge
-    , roots, childrenOf, get, parentOf, siblingPos, maxCounter
+    , roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter
     , Move
     , Forest, Item, toForest, itemId, itemValue, itemChildren
     )
@@ -36,7 +36,7 @@ the tree is a pure function of it. `c` is the node payload (a `Node` in practice
 @docs empty, fromParts, moves, payloads, deletedIds
 @docs move, moveOnly, updateValue, delete
 @docs merge
-@docs roots, childrenOf, get, parentOf, siblingPos, maxCounter
+@docs roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter
 @docs Move
 @docs Forest, Item, toForest, itemId, itemValue, itemChildren
 
@@ -272,6 +272,43 @@ childrenOf parent tree =
     childIdsOf (Just parent) (resolve tree) tree
 
 
+{-| The highest sibling **position** among the live children of `parent` (`Nothing` =
+roots), or `Nothing` if there are none. Resolves the move-set **once** (versus
+`childrenOf` + `siblingPos`, which resolves twice) — for the append hot path, where a
+new child just needs a fractional position after the current last sibling. Only the max
+`pos` is needed (the read-time `(pos, id)` tiebreak doesn't affect where to append).
+-}
+lastChildPos : Maybe OpId -> Tree c -> Maybe Frac
+lastChildPos parent ((Tree t) as tree) =
+    let
+        parentKey =
+            Maybe.map Id.opIdToString parent
+    in
+    Dict.foldl
+        (\childKey r acc ->
+            if
+                (Maybe.map Id.opIdToString r.parent == parentKey)
+                    && isLive tree childKey
+                    && Dict.member childKey t.payload
+            then
+                case acc of
+                    Just best ->
+                        if Frac.compare r.pos best == GT then
+                            Just r.pos
+
+                        else
+                            acc
+
+                    Nothing ->
+                        Just r.pos
+
+            else
+                acc
+        )
+        Nothing
+        (resolve tree)
+
+
 {-| Live child ids under `parent` (Nothing = roots), sorted by (pos, childId), with
 tombstoned nodes removed.
 -}
@@ -422,15 +459,63 @@ itemChildren (Item _ _ cs) =
 {-| Materialize the tree as a `Forest`, mapping each live node's payload with `f`
 (the schema's decoder). Children are in sibling order; deleted subtrees are
 dropped. `f` returning `Nothing` drops that node (a decode error).
+
+Single-pass: `resolve` the move-set once, then bucket every node under its parent key
+(sorting each sibling group once) into a children-index, and walk that index top-down
+from the roots. The recursion only descends through live nodes, so a tombstoned node
+is dropped and its subtree is never visited — which is exactly the "no ancestor
+tombstoned" rule, without a per-node ancestor climb. This is O(N log N) overall, versus
+the O(N² log N) of resolving + scanning the whole node set once per node.
+
 -}
 toForest : (c -> Maybe a) -> Tree c -> Forest a
-toForest f tree =
-    roots tree |> List.filterMap (itemAt f tree)
+toForest f ((Tree t) as tree) =
+    let
+        resolved =
+            resolve tree
 
+        -- parentKey -> that parent's children, already in sibling order. Only nodes
+        -- that are live and have a payload are bucketed (the same admission test the
+        -- old `childIdsOf` applied); `""` is the key for roots (parent = Nothing).
+        rootKey =
+            ""
 
-itemAt : (c -> Maybe a) -> Tree c -> OpId -> Maybe (Item a)
-itemAt f tree id =
-    get id tree
-        |> Maybe.andThen f
-        |> Maybe.map
-            (\v -> Item id v (childrenOf id tree |> List.filterMap (itemAt f tree)))
+        childIndex : Dict String (List { child : OpId, pos : Frac })
+        childIndex =
+            Dict.foldl
+                (\childKey r acc ->
+                    if isLive tree childKey && Dict.member childKey t.payload then
+                        let
+                            pKey =
+                                Maybe.map Id.opIdToString r.parent |> Maybe.withDefault rootKey
+                        in
+                        Dict.update pKey
+                            (\existing ->
+                                Just ({ child = r.child, pos = r.pos } :: Maybe.withDefault [] existing)
+                            )
+                            acc
+
+                    else
+                        acc
+                )
+                Dict.empty
+                resolved
+
+        childrenSorted : String -> List OpId
+        childrenSorted pKey =
+            Dict.get pKey childIndex
+                |> Maybe.withDefault []
+                |> List.sortWith
+                    (\a b ->
+                        compareSibling ( Id.opIdToString a.child, a.pos ) ( Id.opIdToString b.child, b.pos )
+                    )
+                |> List.map .child
+
+        walk : OpId -> Maybe (Item a)
+        walk id =
+            Dict.get (Id.opIdToString id) t.payload
+                |> Maybe.andThen f
+                |> Maybe.map
+                    (\v -> Item id v (childrenSorted (Id.opIdToString id) |> List.filterMap walk))
+    in
+    childrenSorted rootKey |> List.filterMap walk

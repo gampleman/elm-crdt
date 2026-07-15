@@ -2,7 +2,7 @@ module Crdt.OpLog exposing
     ( Op, Action(..), Target, TargetStep(..), Frontier
     , OpStore, empty, insert, ops, member, merge
     , causalOrder, applyOps, materialize, addedOpsInOrder, checkout
-    , frontier, opsAfter, compact, ancestorKeys
+    , frontier, advanceFrontier, opsAfter, compact, ancestorKeys
     )
 
 {-| The operation log: the source of truth for an op-log-based document.
@@ -26,7 +26,7 @@ drives it — every document is materialized from an `OpStore`.
 @docs Op, Action, Target, TargetStep, Frontier
 @docs OpStore, empty, insert, ops, member, merge
 @docs causalOrder, applyOps, materialize, addedOpsInOrder, checkout
-@docs frontier, opsAfter, compact, ancestorKeys
+@docs frontier, advanceFrontier, opsAfter, compact, ancestorKeys
 
 -}
 
@@ -146,6 +146,36 @@ frontier (OpStore d) =
     Dict.values d
         |> List.map .id
         |> List.filter (\id -> not (Set.member (Id.opIdToString id) depended))
+
+
+{-| Advance a known frontier by a batch of newly-added ops, **without** rescanning the
+whole store: the new tips are the old ones plus the new ops' ids, minus everything any
+of the new ops depends on. `O(batch + |frontier|)` instead of `frontier`'s `O(store)`.
+
+Correct only when `newOps` are genuinely new (their ids aren't already tips) and their
+`deps` reference existing ops — which holds for both local `commit` (deps = the current
+frontier) and applying a delta. For a wholesale store rebuild use `frontier`.
+
+-}
+advanceFrontier : Frontier -> List Op -> Frontier
+advanceFrontier current newOps =
+    let
+        newDepended : Set String
+        newDepended =
+            List.foldl
+                (\op acc -> List.foldl (\dep s -> Set.insert (Id.opIdToString dep) s) acc op.deps)
+                Set.empty
+                newOps
+
+        keptOld =
+            List.filter (\id -> not (Set.member (Id.opIdToString id) newDepended)) current
+
+        addedTips =
+            newOps
+                |> List.map .id
+                |> List.filter (\id -> not (Set.member (Id.opIdToString id) newDepended))
+    in
+    keptOld ++ addedTips
 
 
 

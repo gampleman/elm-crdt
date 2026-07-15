@@ -31,6 +31,7 @@ function wire(workload, n) {
       reset: false,
       roundtrip: false,
       mode: "wire",
+      iters: 0,
     });
   });
 }

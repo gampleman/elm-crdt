@@ -1,0 +1,20 @@
+{
+  "name": "elm-crdt-benchmarks",
+  "private": true,
+  "description": "Performance/footprint harness + external comparison baselines for elm-crdt.",
+  "type": "commonjs",
+  "scripts": {
+    "build": "../node_modules/.bin/elm make src/Headless.elm --output headless.js --optimize",
+    "bench": "npm run build && node run-bench.js",
+    "merge": "npm run build && node run-merge.js",
+    "mem": "npm run build && node --expose-gc run-mem.js",
+    "wire": "npm run build && node run-wire.js",
+    "packed": "npm run build && node run-packed.js",
+    "compare": "npm run build && node run-compare.js",
+    "all": "npm run bench && npm run merge && npm run mem"
+  },
+  "dependencies": {
+    "@automerge/automerge": "^2.2.9",
+    "loro-crdt": "^1.0.0"
+  }
+}

@@ -173,9 +173,11 @@ npm run docs        # preview the package docs locally (elm-doc-preview)
 npm start           # run the demo
 ```
 
-## Acknowledgements
+## Acknowledgements and comparisons
 
 Inspired by [Loro](https://loro.dev) and [Automerge](https://automerge.org).
+
+Speaking of those libraries, we have some [performance comparisons](https://github.com/gampleman/elm-crdt/tree/main/benchmarks/results/COMPARISON.md).
 
 ## License
 

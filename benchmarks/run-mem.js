@@ -24,7 +24,7 @@ app.ports.done.subscribe((stat) => {
 function send(workload, n, { retain = false, reset = false, roundtrip = false } = {}) {
   return new Promise((resolve) => {
     resolveDone = resolve;
-    app.ports.command.send({ workload, n, retain, reset, roundtrip });
+    app.ports.command.send({ workload, n, retain, reset, roundtrip, mode: "", iters: 0 });
   });
 }
 

@@ -29,7 +29,7 @@ app.ports.done.subscribe((r) => {
 function wire(workload, n) {
   return new Promise((resolve) => {
     resolveDone = resolve;
-    app.ports.command.send({ workload, n, retain: false, reset: false, roundtrip: false, mode: "wire" });
+    app.ports.command.send({ workload, n, retain: false, reset: false, roundtrip: false, mode: "wire", iters: 0 });
   });
 }
 

@@ -100,6 +100,13 @@ type Doc a
         , ctx : Ctx
         , cached : Node
 
+        -- The store's causal frontier (tips), cached so a local edit doesn't rescan
+        -- the whole op set to stamp its `deps`. `commit` maintains it incrementally
+        -- (add the new op ids, drop everything they depend on); the bulk paths
+        -- (init/merge/rebuild/gc) recompute it once from the store. Was O(N) per edit
+        -- via `OpLog.frontier`, making an N-op build O(N²).
+        , frontier : OpLog.Frontier
+
         -- The causal cut that `base` already incorporates. Starts empty (base =
         -- the schema's empty tree). `compact` folds ops at-or-below a frontier into
         -- `base` and advances this; it's the boundary below which history (and
@@ -112,6 +119,14 @@ type Doc a
         -- never in Node/Rga, so it can't corrupt the convergence oracle. Any
         -- other mutation (`commit`) or a `merge` clears it.
         , lastAppend : Maybe ( List TargetStep, OpId )
+
+        -- Sibling of `lastAppend` for TREE `addChild`: the (tree target, parent id,
+        -- frac position) of the child we last appended under that parent. A run of
+        -- `addChild`s under one parent then skips the O(n) `resolve` in `endPos` — the
+        -- new child's position is just after the cached frac. Same discipline as
+        -- `lastAppend`: outside Node/Tree so it can't corrupt convergence; cleared by
+        -- `commit` and re-set by `treeAddChild`.
+        , lastTreeChild : Maybe ( List TargetStep, Maybe OpId, Crdt.Frac.Frac )
 
         -- Named checkpoints (most recent first). Each pins a `Version` (a causal
         -- frontier) with a label + author, so a checkpoint is collaborative
@@ -203,7 +218,9 @@ init replica schema =
         , store = OpLog.empty
         , ctx = ctx
         , cached = base
+        , frontier = []
         , lastAppend = Nothing
+        , lastTreeChild = Nothing
         , checkpoints = []
         , baseFrontier = []
         , undoStack = []
@@ -274,6 +291,7 @@ mergeWithDiff (Doc local) (Doc incoming) =
             | store = store
             , ctx = Id.observe (Node.maxCounter cached) local.ctx
             , cached = cached
+            , frontier = OpLog.advanceFrontier local.frontier added
             , lastAppend = Nothing
         }
     , diffFromOps (Id.ctxReplica local.ctx) added
@@ -732,6 +750,7 @@ rebuild store base baseFrontier (Doc d) =
             , base = base
             , baseFrontier = baseFrontier
             , cached = cached
+            , frontier = OpLog.frontier store
             , ctx = Id.observe (Node.maxCounter cached) d.ctx
             , lastAppend = Nothing
         }
@@ -757,6 +776,7 @@ rebuildIncremental store (Doc d) =
         { d
             | store = store
             , cached = cached
+            , frontier = OpLog.advanceFrontier d.frontier added
             , ctx = Id.observe (Node.maxCounter cached) d.ctx
             , lastAppend = Nothing
         }
@@ -2089,10 +2109,12 @@ commit newOps (Doc d) =
         { d
             | store = List.foldl OpLog.insert d.store newOps
             , cached = OpLog.applyOps d.cached newOps
+            , frontier = OpLog.advanceFrontier d.frontier newOps
 
-            -- any committed edit invalidates the append fast-path by default;
-            -- `emitAppend` re-establishes it for a genuine append.
+            -- any committed edit invalidates the append fast-paths by default;
+            -- `emitAppend` / `treeAddChild` re-establish them for a genuine append.
             , lastAppend = Nothing
+            , lastTreeChild = Nothing
         }
 
 
@@ -2986,11 +3008,15 @@ listAppend path seed doc =
             )
 
 
-{-| Whether a node is an ordered, id-addressed sequence (`Seq`/`Txt`/`Mov`).
+{-| Whether a node is an ordered, id-addressed sequence (`Seq`/`Txt`/`Mov`). O(1): a
+constructor test — never materialize the element order just to answer this (that made
+`listAppend` O(n) per append → O(n²) to build a list).
 -}
 isOrdered : Node -> Bool
 isOrdered node =
-    orderedIds node /= Nothing
+    (Node.asSeq node /= Nothing)
+        || (Node.asTxt node /= Nothing)
+        || (Node.asMov node /= Nothing)
 
 
 {-| The anchor to append after: the last visible element's id for `Seq`/`Txt`, or
@@ -3127,16 +3153,62 @@ treeAddChild path parent seed doc =
                     ( seedNode, ctx3 ) =
                         I.runSeed seed ctx2
 
+                    -- fast path: a run of `addChild`s under the same (container, parent)
+                    -- places each new child just after the previous one, so we can skip
+                    -- the O(n) `resolve` in `endPos` and step off the cached frac.
+                    prevFrac =
+                        case treeChildCacheFor target parent doc of
+                            Just cachedFrac ->
+                                Just cachedFrac
+
+                            Nothing ->
+                                Tree.lastChildPos parent t
+
                     pos =
-                        endPos parent t
+                        Crdt.Frac.between prevFrac Nothing
 
                     doc1 =
                         withCtx ctx3 doc
+
+                    committed =
+                        commit
+                            [ op moveOp (frontierOf doc1) (TreeMove { container = target, child = childId, parent = parent, pos = pos, seed = Just seedNode }) ]
+                            doc1
                 in
-                commit
-                    [ op moveOp (frontierOf doc1) (TreeMove { container = target, child = childId, parent = parent, pos = pos, seed = Just seedNode }) ]
-                    doc1
+                case committed of
+                    Doc cd ->
+                        Doc { cd | lastTreeChild = Just ( target, parent, pos ) }
             )
+
+
+{-| The cached last-child frac for `addChild` if the fast-path is live for exactly this
+(container, parent).
+-}
+treeChildCacheFor : List TargetStep -> Maybe OpId -> Doc a -> Maybe Crdt.Frac.Frac
+treeChildCacheFor target parent (Doc d) =
+    case d.lastTreeChild of
+        Just ( cachedTarget, cachedParent, frac ) ->
+            if cachedTarget == target && sameParent cachedParent parent then
+                Just frac
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+sameParent : Maybe OpId -> Maybe OpId -> Bool
+sameParent a b =
+    case ( a, b ) of
+        ( Just x, Just y ) ->
+            Id.opIdToString x == Id.opIdToString y
+
+        ( Nothing, Nothing ) ->
+            True
+
+        _ ->
+            False
 
 
 {-| Re-parent `child` to be the **last child** of `parent` (`Nothing` = a root).
@@ -3224,16 +3296,9 @@ currentParent path sibling doc =
 -}
 endPos : Maybe OpId -> Tree.Tree Node -> Crdt.Frac.Frac
 endPos parent t =
-    let
-        siblings =
-            childIds parent t
-    in
-    case List.reverse siblings |> List.head of
-        Just last ->
-            Crdt.Frac.between (Tree.siblingPos last t) Nothing
-
-        Nothing ->
-            Crdt.Frac.between Nothing Nothing
+    -- position after the current last child; `lastChildPos` resolves the move-set once
+    -- (the append hot path — `childIds` + `siblingPos` resolved it twice).
+    Crdt.Frac.between (Tree.lastChildPos parent t) Nothing
 
 
 {-| A position immediately before `sibling`.
@@ -3724,7 +3789,7 @@ op id deps action =
 
 frontierOf : Doc a -> OpLog.Frontier
 frontierOf (Doc d) =
-    OpLog.frontier d.store
+    d.frontier
 
 
 emptyMap : Node

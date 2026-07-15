@@ -1,13 +1,14 @@
 port module Headless exposing (main)
 
-{-| Headless **memory/size** harness, driven from Node (`run-mem.js`).
+{-| Headless **memory/size/latency** harness, driven from Node (`run-mem.js`,
+`run-merge.js`, `run-wire.js`, `run-bench.js`).
 
 For each requested workload it builds a document at scale `n` and reports structural
 proxies for its footprint — the number of ops in the log, and the encoded byte size
 (overall, and split by container). These proxies are deterministic (unlike a
 GC-dependent heap reading) and attribute cost to a *structure*, so we can see which
-one dominates. `run-mem.js` additionally brackets the calls with
-`process.memoryUsage()` to get an absolute heap figure.
+one dominates. The runners additionally bracket the calls with timing /
+`process.memoryUsage()`.
 
 Workloads:
 
@@ -19,16 +20,12 @@ Workloads:
   - `"dict"` — a dict of `n` short text entries.
   - `"tree"` — an outline tree of `n` nodes.
 
-Each reply is a JSON stat record `{ ops, bytes, textBytes, otherBytes }`, so the
-harness can tabulate size-per-op and the text share.
-
 -}
 
+import Crdt as C exposing (Ref)
+import Crdt.Doc as Doc exposing (Doc)
 import Crdt.Id as Id
-import Crdt.OpDoc as OpDoc exposing (OpDoc)
-import Crdt.Ref as Ref exposing (Ref)
-import Crdt.RichText exposing (MarkValue(..), Span)
-import Crdt.Schema as S exposing (Crdt)
+import Crdt.RichText exposing (Span)
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
 import Json.Encode as JE
@@ -44,6 +41,7 @@ type alias Board =
     , files : Dict String (List Span)
     , outline : Tree.Forest ONode
     , likes : Int
+    , tags : List String
     }
 
 
@@ -56,23 +54,25 @@ type alias ONode =
 
 
 type alias BoardRefs =
-    { title : Ref Board S.Settable String
-    , todos : Ref Board (S.ListK S.Movable S.Nested Todo) (List Todo)
-    , files : Ref Board (S.DictK S.RichK (List Span)) (Dict String (List Span))
-    , outline : Ref Board (S.TreeK S.Nested ONode) (Tree.Forest ONode)
-    , likes : Ref Board S.Counter Int
+    { title : Ref Board C.Settable String
+    , todos : Ref Board (C.ListK C.Movable C.Nested Todo) (List Todo)
+    , files : Ref Board (C.DictK C.RichK (List Span)) (Dict String (List Span))
+    , outline : Ref Board (C.TreeK C.Nested ONode) (Tree.Forest ONode)
+    , likes : Ref Board C.Counter Int
+    , tags : Ref Board (C.ListK C.Fixed C.Settable String) (List String)
     }
 
 
-boardDoc : Ref.RecordRefs Board BoardRefs
+boardDoc : C.RecordRefs Board BoardRefs
 boardDoc =
-    Ref.record Board BoardRefs
-        |> Ref.field "title" .title S.text
-        |> Ref.field "todos" .todos (S.movableList todoDoc.schema)
-        |> Ref.field "files" .files (S.dict S.richText)
-        |> Ref.field "outline" .outline (S.tree onodeDoc.schema)
-        |> Ref.field "likes" .likes S.counter
-        |> Ref.build
+    C.record Board BoardRefs
+        |> C.field "title" .title C.text
+        |> C.field "todos" .todos (C.movableList todoDoc.schema)
+        |> C.field "files" .files (C.dict C.richText)
+        |> C.field "outline" .outline (C.tree onodeDoc.schema)
+        |> C.field "likes" .likes C.counter
+        |> C.field "tags" .tags (C.list C.text)
+        |> C.build
 
 
 refs : BoardRefs
@@ -81,34 +81,34 @@ refs =
 
 
 type alias TodoRefs =
-    { text : Ref Todo S.Settable String, done : Ref Todo S.Settable Bool }
+    { text : Ref Todo C.Settable String, done : Ref Todo C.Settable Bool }
 
 
-todoDoc : Ref.RecordRefs Todo TodoRefs
+todoDoc : C.RecordRefs Todo TodoRefs
 todoDoc =
-    Ref.record Todo TodoRefs
-        |> Ref.field "text" .text S.text
-        |> Ref.field "done" .done S.bool
-        |> Ref.build
+    C.record Todo TodoRefs
+        |> C.field "text" .text C.text
+        |> C.field "done" .done C.bool
+        |> C.build
 
 
 type alias ONodeRefs =
-    { text : Ref ONode S.Settable String }
+    { text : Ref ONode C.Settable String }
 
 
-onodeDoc : Ref.RecordRefs ONode ONodeRefs
+onodeDoc : C.RecordRefs ONode ONodeRefs
 onodeDoc =
-    Ref.record ONode ONodeRefs
-        |> Ref.field "text" .text S.text
-        |> Ref.build
+    C.record ONode ONodeRefs
+        |> C.field "text" .text C.text
+        |> C.build
 
 
-init : OpDoc Board
+init : Doc Board
 init =
-    OpDoc.init (Id.replica "bench") boardDoc.schema
+    C.init (Id.replica "bench") boardDoc.schema
 
 
-ok : OpDoc Board -> Result OpDoc.Error (OpDoc Board) -> OpDoc Board
+ok : Doc Board -> Result C.EditError (Doc Board) -> Doc Board
 ok fb =
     Result.withDefault fb
 
@@ -120,16 +120,16 @@ ok fb =
 {-| Type `s` into a fresh file `name` via the demo's editor path (setRich diffs into
 per-character insert ops), so the char-node cost is realistic.
 -}
-typeFile : String -> String -> OpDoc Board -> OpDoc Board
+typeFile : String -> String -> Doc Board -> Doc Board
 typeFile name s doc =
     let
         d1 =
-            Ref.setKey S.richText name [] refs.files doc |> ok doc
+            C.setKey refs.files C.richText name [] doc |> ok doc
 
         fileRef =
-            refs.files |> Ref.key name S.richText
+            refs.files |> C.key name C.richText
     in
-    Ref.setRich fileRef s d1 |> ok d1
+    C.setRich fileRef s d1 |> ok d1
 
 
 {-| A short pseudo-random-ish word from an index, so text isn't degenerate.
@@ -150,48 +150,81 @@ sentence seed count =
         |> String.join " "
 
 
-buildText : Int -> OpDoc Board
+buildText : Int -> Doc Board
 buildText n =
     -- one file with ~n characters typed
     typeFile "doc.md" (sentence 0 (max 1 (n // 5))) init
 
 
-buildList : Int -> OpDoc Board
+buildList : Int -> Doc Board
 buildList n =
     List.range 1 n
         |> List.foldl
-            (\i doc -> Ref.append todoDoc.schema (Todo (word i) False) refs.todos doc |> ok doc)
+            (\i doc -> C.append refs.todos todoDoc.schema (Todo (word i) False) doc |> ok doc)
             init
 
 
-buildDict : Int -> OpDoc Board
+buildFlat : Int -> Doc Board
+buildFlat n =
+    List.range 1 n
+        |> List.foldl
+            (\i doc -> C.append refs.tags C.text (word i) doc |> ok doc)
+            init
+
+
+{-| No-CRDT baseline: N record-appends onto a plain immutable Elm `Board` (no `Doc`).
+Each append rebuilds the record and prepends to `.todos` — the idiomatic immutable Elm
+way, and a fair "cost of adding CRDTs" floor (immutable, unlike plain JS's mutable
+arrays). Returns a checksum so the build can't be elided.
+-}
+plainListBuild : Int -> Int
+plainListBuild n =
+    List.range 1 n
+        |> List.foldl
+            (\i acc -> { acc | todos = { text = word i, done = False } :: acc.todos })
+            { title = "", todos = [], files = Dict.empty, outline = [], likes = 0, tags = [] }
+        |> (\b -> List.length b.todos)
+
+
+{-| No-CRDT baseline: N single-char appends onto a plain immutable Elm `String` field.
+-}
+plainTextBuild : Int -> Int
+plainTextBuild n =
+    List.range 1 n
+        |> List.foldl
+            (\i acc -> { acc | title = acc.title ++ String.left 1 (word (modBy 10 i)) })
+            { title = "", todos = [], files = Dict.empty, outline = [], likes = 0, tags = [] }
+        |> (\b -> String.length b.title)
+
+
+buildDict : Int -> Doc Board
 buildDict n =
     List.range 1 n
         |> List.foldl
-            (\i doc -> Ref.setKey S.richText ("k" ++ String.fromInt i) [] refs.files doc |> ok doc)
+            (\i doc -> C.setKey refs.files C.richText ("k" ++ String.fromInt i) [] doc |> ok doc)
             init
 
 
-buildTree : Int -> OpDoc Board
+buildTree : Int -> Doc Board
 buildTree n =
     List.range 1 n
         |> List.foldl
-            (\i doc -> Ref.addChild onodeDoc.schema (ONode (word i)) Nothing refs.outline doc |> ok doc)
+            (\i doc -> C.addChild refs.outline onodeDoc.schema (ONode (word i)) Nothing doc |> ok doc)
             init
 
 
 {-| The realistic demo-like doc, scaled by `n`: `n` todos, `n/10` files each with a
 short sentence, `n` outline nodes, a title, and some likes.
 -}
-buildDemo : Int -> OpDoc Board
+buildDemo : Int -> Doc Board
 buildDemo n =
     let
         withTitle d =
-            Ref.set refs.title "Benchmark board" d |> ok d
+            C.set refs.title "Benchmark board" d |> ok d
 
         withTodos d =
             List.range 1 n
-                |> List.foldl (\i acc -> Ref.append todoDoc.schema (Todo (sentence i 4) False) refs.todos acc |> ok acc) d
+                |> List.foldl (\i acc -> C.append refs.todos todoDoc.schema (Todo (sentence i 4) False) acc |> ok acc) d
 
         withFiles d =
             List.range 1 (max 1 (n // 10))
@@ -199,16 +232,16 @@ buildDemo n =
 
         withTree d =
             List.range 1 n
-                |> List.foldl (\i acc -> Ref.addChild onodeDoc.schema (ONode (word i)) Nothing refs.outline acc |> ok acc) d
+                |> List.foldl (\i acc -> C.addChild refs.outline onodeDoc.schema (ONode (word i)) Nothing acc |> ok acc) d
 
         withLikes d =
             List.range 1 (max 1 (n // 5))
-                |> List.foldl (\_ acc -> Ref.increment refs.likes 1 acc |> ok acc) d
+                |> List.foldl (\_ acc -> C.increment refs.likes 1 acc |> ok acc) d
     in
     init |> withTitle |> withTodos |> withFiles |> withTree |> withLikes
 
 
-build : String -> Int -> OpDoc Board
+build : String -> Int -> Doc Board
 build workload n =
     case workload of
         "text" ->
@@ -216,6 +249,9 @@ build workload n =
 
         "list" ->
             buildList n
+
+        "flat" ->
+            buildFlat n
 
         "dict" ->
             buildDict n
@@ -231,31 +267,31 @@ build workload n =
 delta (`encodeSince`) is the small payload where gzip's cold dictionary hurts most.
 Returns the doc after the edit; the caller diffs it against the pre-edit version.
 -}
-oneMoreEdit : String -> OpDoc Board -> OpDoc Board
+oneMoreEdit : String -> Doc Board -> Doc Board
 oneMoreEdit workload doc =
     case workload of
         "text" ->
             -- type a few more characters into the existing file
             let
                 fileRef =
-                    refs.files |> Ref.key "doc.md" S.richText
+                    refs.files |> C.key "doc.md" C.richText
 
                 current =
-                    OpDoc.read doc |> Result.toMaybe |> Maybe.andThen (\b -> Dict.get "doc.md" b.files) |> Maybe.map plain |> Maybe.withDefault ""
+                    C.read doc |> Result.toMaybe |> Maybe.andThen (\b -> Dict.get "doc.md" b.files) |> Maybe.map plain |> Maybe.withDefault ""
             in
-            Ref.setRich fileRef (current ++ " more") doc |> ok doc
+            C.setRich fileRef (current ++ " more") doc |> ok doc
 
         "list" ->
-            Ref.append todoDoc.schema (Todo "one more" False) refs.todos doc |> ok doc
+            C.append refs.todos todoDoc.schema (Todo "one more" False) doc |> ok doc
 
         "dict" ->
-            Ref.setKey S.richText "newkey" [] refs.files doc |> ok doc
+            C.setKey refs.files C.richText "newkey" [] doc |> ok doc
 
         "tree" ->
-            Ref.addChild onodeDoc.schema (ONode "one more") Nothing refs.outline doc |> ok doc
+            C.addChild refs.outline onodeDoc.schema (ONode "one more") Nothing doc |> ok doc
 
         _ ->
-            Ref.append todoDoc.schema (Todo "one more" False) refs.todos doc |> ok doc
+            C.append refs.todos todoDoc.schema (Todo "one more" False) doc |> ok doc
 
 
 {-| Plain text of a rich-text span list, for `oneMoreEdit` on "text".
@@ -272,29 +308,24 @@ plain spans =
 {-| The encoded byte size of a document (its full wire form — a good proxy for the
 information content, and correlated with heap since every op/element is retained).
 -}
-encodedBytes : OpDoc Board -> Int
+encodedBytes : Doc Board -> Int
 encodedBytes doc =
-    OpDoc.encode doc |> JE.encode 0 |> String.length
+    Doc.encode doc |> JE.encode 0 |> String.length
 
 
-{-| A command: build `(workload, n)`. When `retain` is true, the built doc is kept
-alive in the model (so its Elm-side heap is held in the shared V8 process and shows
-up in `process.memoryUsage()`); `reset` clears the retained list first. This is how
-the JS harness gets a real absolute heap figure for the live document — the doc
-itself never crosses the port, so it must be retained on the Elm side.
+{-| A command. `mode` selects the harness: "" = build/retain (mem), "merge", "wire",
+"build" (latency of constructing the doc), "read" (latency of `iters` reads).
 -}
 type alias Command =
     { workload : String, n : Int, retain : Bool, reset : Bool, roundtrip : Bool, mode : String, iters : Int }
 
 
 type alias Model =
-    { retained : List (OpDoc Board) }
+    { retained : List (Doc Board) }
 
 
 {-| The wire payloads for a workload at size `n`: the full-document encoding, and the
-delta (`encodeSince`) of exactly one more typical edit on top. The JS harness gzips
-both to compare custom-format headroom against gzipped JSON — separately for the big
-full doc and the tiny steady-state delta (where gzip's cold dictionary hurts).
+delta (`encodeSince`) of exactly one more typical edit on top.
 -}
 wirePayloads : String -> Int -> ( String, String )
 wirePayloads workload n =
@@ -303,56 +334,48 @@ wirePayloads workload n =
             build workload n
 
         before =
-            OpDoc.version doc
+            Doc.version doc
 
         edited =
             oneMoreEdit workload doc
 
         full =
-            OpDoc.encode doc |> JE.encode 0
+            Doc.encode doc |> JE.encode 0
 
         delta =
-            OpDoc.encodeSince before edited |> JE.encode 0
+            Doc.encodeSince before edited |> JE.encode 0
     in
     ( full, delta )
 
 
 {-| A doc as it would arrive over the wire: encode then decode into a *fresh* replica.
-This is the case that matters for the replica-interning question — `opIdDecoder`
-mints a fresh `ReplicaId` per op, where a locally-built doc shares one reference.
 -}
-received : OpDoc Board -> OpDoc Board
+received : Doc Board -> Doc Board
 received doc =
-    OpDoc.decodeInto (OpDoc.encode doc) (OpDoc.init (Id.replica "recv") boardDoc.schema)
+    Doc.decodeInto (Doc.encode doc) (C.init (Id.replica "recv") boardDoc.schema)
         |> Result.withDefault doc
 
 
 {-| Merge-timing setup for a workload at size `n`: a `local` doc, and a `peer` doc
 that shares `local`'s history plus one extra edit on a DIFFERENT part of the tree — so
-the merge integrates a small remote delta into a large doc. This is the exact shape the
-demo hits on every incoming message, and the case incremental merge should speed up
-(and where referential stability matters — the untouched containers should survive).
+the merge integrates a small remote delta into a large doc.
 -}
-mergeSetup : String -> Int -> ( OpDoc Board, OpDoc Board )
+mergeSetup : String -> Int -> ( Doc Board, Doc Board )
 mergeSetup workload n =
     let
         local =
             build workload n
 
-        -- a peer at the same history, then one edit to the TITLE (a container the
-        -- workload's bulk did not touch), so most of the tree is unchanged by the merge.
         peer =
-            OpDoc.decodeInto (OpDoc.encode local) (OpDoc.init (Id.replica "peer") boardDoc.schema)
+            Doc.decodeInto (Doc.encode local) (C.init (Id.replica "peer") boardDoc.schema)
                 |> Result.withDefault local
-                |> (\d -> Ref.set refs.title "peer edit" d |> ok d)
+                |> (\d -> C.set refs.title "peer edit" d |> ok d)
     in
     ( local, peer )
 
 
-{-| Merge `peer` into `local` `iters` times (each from the same immutable inputs, so the
-work is identical and repeatable) and return a checksum that FORCES each merge's
-materialization (`opCount` reads the store; `encodedBytes` walks the merged tree). JS
-times the whole batch. Higher `iters` amortizes port overhead.
+{-| Merge `peer` into `local` `iters` times and return a checksum that FORCES each
+merge's materialization. JS times the whole batch.
 -}
 mergeBench : String -> Int -> Int -> Int
 mergeBench workload n iters =
@@ -361,15 +384,27 @@ mergeBench workload n iters =
             mergeSetup workload n
 
         once acc =
-            let
-                merged =
-                    OpDoc.merge local peer
-            in
-            -- Elm is eager, so `merge` fully computes the merged doc's `cached` (it walks
-            -- it via `Node.maxCounter`); `opCount` just reads the store so the result
-            -- can't be elided. NOT `encodedBytes` — a full JSON encode per iteration
-            -- would swamp the merge cost we're trying to measure.
-            acc + OpDoc.opCount merged
+            acc + Doc.opCount (Doc.merge local peer)
+    in
+    List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
+
+
+{-| Read-latency: `iters` reads of a size-`n` doc, returning a forced checksum. JS times
+the batch and subtracts the build cost (reported separately by "build" mode).
+-}
+readBench : String -> Int -> Int -> Int
+readBench workload n iters =
+    let
+        doc =
+            build workload n
+
+        once acc =
+            case C.read doc of
+                Ok b ->
+                    acc + List.length b.todos + Dict.size b.files + List.length b.outline
+
+                Err _ ->
+                    acc
     in
     List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
 
@@ -381,14 +416,9 @@ main =
         , update =
             \cmd model ->
                 if cmd.mode == "merge" then
-                    -- merge-timing mode: run `iters` merges of a small remote delta into
-                    -- a size-`n` doc and return a forced checksum. JS times the batch.
                     let
                         iters =
                             max 1 cmd.iters
-
-                        checksum =
-                            mergeBench cmd.workload cmd.n iters
                     in
                     ( model
                     , done
@@ -396,14 +426,58 @@ main =
                             [ ( "workload", JE.string cmd.workload )
                             , ( "n", JE.int cmd.n )
                             , ( "iters", JE.int iters )
-                            , ( "checksum", JE.int checksum )
+                            , ( "checksum", JE.int (mergeBench cmd.workload cmd.n iters) )
+                            ]
+                        )
+                    )
+
+                else if cmd.mode == "read" then
+                    let
+                        iters =
+                            max 1 cmd.iters
+                    in
+                    ( model
+                    , done
+                        (JE.object
+                            [ ( "workload", JE.string cmd.workload )
+                            , ( "n", JE.int cmd.n )
+                            , ( "iters", JE.int iters )
+                            , ( "checksum", JE.int (readBench cmd.workload cmd.n iters) )
+                            ]
+                        )
+                    )
+
+                else if cmd.mode == "build" then
+                    -- build-latency: JS times `iters` invocations of this command; the
+                    -- checksum forces the build. Keeps nothing.
+                    let
+                        ops =
+                            case cmd.workload of
+                                -- no-CRDT baselines: the same N edits on a plain immutable
+                                -- Elm record (no `Doc`), so "what does adding CRDTs to a
+                                -- normal Elm app cost" is measured through the identical
+                                -- harness. Plain Elm (immutable) is the honest floor —
+                                -- not plain JS's mutable arrays.
+                                "plainlist" ->
+                                    plainListBuild cmd.n
+
+                                "plaintext" ->
+                                    plainTextBuild cmd.n
+
+                                _ ->
+                                    Doc.opCount (build cmd.workload cmd.n)
+                    in
+                    ( model
+                    , done
+                        (JE.object
+                            [ ( "workload", JE.string cmd.workload )
+                            , ( "n", JE.int cmd.n )
+                            , ( "ops", JE.int ops )
                             ]
                         )
                     )
 
                 else if cmd.mode == "wire" then
-                    -- wire-size mode: hand back the JSON strings for JS to gzip. No
-                    -- retention; this measures serialized size, not heap.
                     let
                         ( full, delta ) =
                             wirePayloads cmd.workload cmd.n
@@ -447,7 +521,7 @@ main =
                         (JE.object
                             [ ( "workload", JE.string cmd.workload )
                             , ( "n", JE.int cmd.n )
-                            , ( "ops", JE.int (OpDoc.opCount doc) )
+                            , ( "ops", JE.int (Doc.opCount doc) )
                             , ( "bytes", JE.int (encodedBytes doc) )
                             , ( "retainedCount", JE.int (List.length retained) )
                             ]
