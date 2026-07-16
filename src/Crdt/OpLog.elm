@@ -64,6 +64,7 @@ type Action
     = SetReg Target Prim
     | SetPresence { target : Target, present : Bool, seed : Node }
     | InsertElem { container : Target, elemId : OpId, parent : Maybe OpId, side : Rga.Side, seed : Node }
+    | InsertText { container : Target, start : OpId, text : String, parent : Maybe OpId, side : Rga.Side }
     | DeleteElem { container : Target, elem : OpId }
     | MoveElem { container : Target, elem : OpId, after : Maybe OpId }
     | Increment { target : Target, delta : Int }
@@ -297,6 +298,11 @@ opMaxCounter op =
                 InsertElem { seed } ->
                     Node.maxCounter seed
 
+                InsertText { start, text } ->
+                    -- a run consumes `len` consecutive counters (start .. start+len-1),
+                    -- each a char element id; the clock must clear the whole span.
+                    Id.opIdCounter start + max 0 (String.length text - 1)
+
                 SetPresence { seed } ->
                     Node.maxCounter seed
 
@@ -520,6 +526,9 @@ applyOp { id, action } root =
         InsertElem { container, elemId, parent, side, seed } ->
             updateAt container id (insertElem elemId parent side seed) root
 
+        InsertText { container, start, text, parent, side } ->
+            updateAt container id (insertTextRun start text parent side) root
+
         DeleteElem { container, elem } ->
             updateAt container id (deleteElem elem) root
 
@@ -672,6 +681,72 @@ insertElem elemId parent side seed current =
 
         _ ->
             Seq (Rga.put (Rga.element elemId parent side seed False) Rga.empty)
+
+
+{-| **Explode a run-length text op** into the same per-character right-spine the store
+used to hold one op at a time. Char 0 anchors at `(parent, side)` with id `start`; char
+`i` (i≥1) has the derived id `(start.counter + i, start.replica)` and anchors as a
+**right-child of char i-1** — byte-for-byte the chain `applyCharDiff` emits.
+
+The derivation is what makes this safe with no split logic: a concurrent insert that
+anchors "after char i of this run" references exactly `start + i`, an id this explosion
+already materialises, so the two runs order by the ordinary Fugue rule and `==`
+convergence is preserved. Each char is a single-char `PString` register stamped with its
+own id (same as the old per-char seed), so the materialised `Node` is identical to the
+pre-change one.
+
+-}
+insertTextRun : OpId -> String -> Maybe OpId -> Rga.Side -> Node -> Node
+insertTextRun start text parent side current =
+    let
+        replica =
+            Id.opIdReplica start
+
+        base =
+            Id.opIdCounter start
+
+        -- fold the chars left→right into `rga0`, threading the previous char's id as the
+        -- next char's parent; the first char uses the op's own (parent, side).
+        putChars rga0 =
+            String.toList text
+                |> List.foldl
+                    (\ch ( i, prevId, rga ) ->
+                        let
+                            elemId =
+                                if i == 0 then
+                                    start
+
+                                else
+                                    Id.opId (base + i) replica
+
+                            ( p, s ) =
+                                case prevId of
+                                    Just prev ->
+                                        ( Just prev, Rga.Right )
+
+                                    Nothing ->
+                                        ( parent, side )
+
+                            seed =
+                                Node.reg (Node.PString (String.fromChar ch)) elemId
+                        in
+                        ( i + 1, Just elemId, Rga.put (Rga.element elemId p s seed False) rga )
+                    )
+                    ( 0, Nothing, rga0 )
+                |> (\( _, _, rga ) -> rga)
+    in
+    case current of
+        Txt rga ->
+            Txt (putChars rga)
+
+        Seq rga ->
+            Seq (putChars rga)
+
+        Rich r ->
+            Rich { r | text = putChars r.text }
+
+        _ ->
+            Txt (putChars Rga.empty)
 
 
 deleteElem : OpId -> Node -> Node

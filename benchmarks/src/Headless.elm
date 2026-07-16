@@ -16,6 +16,9 @@ Workloads:
     outline tree + settings (title/status/likes), scaled by `n`.
   - `"text"` — one rich-text file with `n` typed characters (the hypothesized
     memory hog: one `Node` per character).
+  - `"typing"` — the same ~n characters typed **one keystroke at a time** (one `set` per
+    char), so op count = chars. The interactive-typing contrast to `"text"` (whole-value
+    set = one run-length op): shows where run-length ops do NOT cut op count.
   - `"list"` — a movable list of `n` small records.
   - `"churn"` — a movable list of `n`, then `n` pseudo-random `move`s (the
     arbitrary-position edit path; a single move is O(n), a batch is O(n²)).
@@ -154,8 +157,28 @@ sentence seed count =
 
 buildText : Int -> Doc Board
 buildText n =
-    -- one file with ~n characters typed
+    -- one file with ~n characters typed IN ONE SHOT (paste / load / set-whole-value):
+    -- a single `setRich` diffs to one contiguous insert → ONE run-length op.
     typeFile "doc.md" (sentence 0 (max 1 (n // 5))) init
+
+
+{-| The INTERACTIVE-typing workload: type `n` characters **one keystroke at a time**, each
+a separate `C.set` on the title with the growing prefix (exactly what the demo's `onInput`
+does per keystroke). Each keystroke is a 1-char diff → a 1-char run → still ONE op per
+character, so this is the case where run-length ops do NOT reduce op count (they only make
+each op a bit smaller). Contrast `buildText`, which sets the whole value at once.
+-}
+buildTyping : Int -> Doc Board
+buildTyping n =
+    let
+        full =
+            sentence 0 (max 1 (n // 5))
+
+        chars =
+            String.length full
+    in
+    List.range 1 chars
+        |> List.foldl (\i doc -> C.set refs.title (String.left i full) doc |> ok doc) init
 
 
 buildList : Int -> Doc Board
@@ -287,6 +310,9 @@ build workload n =
         "text" ->
             buildText n
 
+        "typing" ->
+            buildTyping n
+
         "list" ->
             buildList n
 
@@ -323,6 +349,14 @@ oneMoreEdit workload doc =
                     C.read doc |> Result.toMaybe |> Maybe.andThen (\b -> Dict.get "doc.md" b.files) |> Maybe.map plain |> Maybe.withDefault ""
             in
             C.setRich fileRef (current ++ " more") doc |> ok doc
+
+        "typing" ->
+            -- one more keystroke: append a single char to the title (1-char run op)
+            let
+                current =
+                    C.read doc |> Result.toMaybe |> Maybe.map .title |> Maybe.withDefault ""
+            in
+            C.set refs.title (current ++ "x") doc |> ok doc
 
         "list" ->
             C.append refs.todos todoDoc.schema (Todo "one more" False) doc |> ok doc

@@ -290,14 +290,19 @@ suite =
                     , \_ -> read removed |> Result.map (.notes >> Dict.member "g") |> Expect.equal (Ok False)
                     ]
                     ()
-        , test "opCount reflects the emitted ops" <|
+        , test "a typed run is ONE run-length op (not one per character), and reads back whole" <|
             \_ ->
                 let
                     a =
                         Doc.setText titlePath "Hi" (initDoc "alice") |> ok (initDoc "alice")
                 in
-                -- "Hi" => two character-insert ops
-                Doc.opCount a |> Expect.equal 2
+                -- "Hi" is a single contiguous run → one `InsertText` op (run-length),
+                -- exploded to per-char elements only in the materialized value.
+                Expect.all
+                    [ \_ -> Doc.opCount a |> Expect.equal 1
+                    , \_ -> Doc.read a |> Result.map .title |> Expect.equal (Ok "Hi")
+                    ]
+                    ()
         , test "edit on a non-existent field reports PathNotFound" <|
             \_ ->
                 let

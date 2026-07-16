@@ -13,7 +13,11 @@ an action is tagged by `"k"`:
 
   - `{ "k": "reg", "t": <target>, "v": <prim> }`
   - `{ "k": "pres", "t": <target>, "p": <bool>, "s": <node> }`
-  - `{ "k": "ins", "t": <target>, "e": <opid>, "o": <opid>|null, "s": <node> }`
+  - `{ "k": "ins", "t": <target>, "e": <opid>, "p": <opid>|null, "sd": <side>, "s": <node> }`
+  - `{ "k": "itxt", "t": <target>, "e": <opid>, "x": <string>, "p": <opid>|null, "sd": <side> }`
+    — a run-length text insert: `x` is the whole run, `e` its first char's id (`start`);
+    char `i` gets the derived id `start+i` and chains as a right-spine (see
+    `OpLog.insertTextRun`). One op per typed run instead of one per character.
   - `{ "k": "del", "t": <target>, "e": <opid> }`
 
 A target is a list of steps: `{ "key": <string> }` or `{ "elem": <opid> }`.
@@ -78,6 +82,23 @@ encodeAction action =
                   )
                 , ( "sd", Json.encodeSide side )
                 , ( "s", Json.encodeNode seed )
+                ]
+
+        InsertText { container, start, text, parent, side } ->
+            JE.object
+                [ ( "k", JE.string "itxt" )
+                , ( "t", encodeTarget container )
+                , ( "e", Json.encodeOpId start )
+                , ( "x", JE.string text )
+                , ( "p"
+                  , case parent of
+                        Just p ->
+                            Json.encodeOpId p
+
+                        Nothing ->
+                            JE.null
+                  )
+                , ( "sd", Json.encodeSide side )
                 ]
 
         DeleteElem { container, elem } ->
@@ -201,6 +222,14 @@ actionDecoder =
                             (JD.field "p" (JD.nullable Json.opIdDecoder))
                             (JD.field "sd" Json.sideDecoder)
                             (JD.field "s" Json.nodeDecoder)
+
+                    "itxt" ->
+                        JD.map5 (\t e x p sd -> InsertText { container = t, start = e, text = x, parent = p, side = sd })
+                            (JD.field "t" targetDecoder)
+                            (JD.field "e" Json.opIdDecoder)
+                            (JD.field "x" JD.string)
+                            (JD.field "p" (JD.nullable Json.opIdDecoder))
+                            (JD.field "sd" Json.sideDecoder)
 
                     "del" ->
                         JD.map2 (\t e -> DeleteElem { container = t, elem = e })

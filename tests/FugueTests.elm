@@ -177,6 +177,61 @@ suite =
                                 (body ab == "XaaabbbY" || body ab == "XbbbaaaY")
                         ]
                         ()
+            , test "a peer editing INSIDE another's run anchors at a derived char id (run-length safety)" <|
+                \_ ->
+                    -- alice types "abcde" as ONE run-length op; its chars have derived ids
+                    -- start..start+4. Bob receives it, then inserts inside it (between c
+                    -- and d). Bob's insert anchors at the id of 'c' = alice's start+2, an
+                    -- id the run explosion materialised. It must land correctly and
+                    -- converge — the crux of storing runs but addressing chars.
+                    let
+                        alice =
+                            initDoc "alice" |> setBody "abcde"
+
+                        bob =
+                            mergeIn alice (initDoc "bob") |> setBody "abcXde"
+
+                        -- alice also edits concurrently elsewhere (prepend), to make the
+                        -- mid-run anchor survive a genuine concurrent merge
+                        alice2 =
+                            setBody "Zabcde" alice
+
+                        ab =
+                            mergeIn bob alice2
+
+                        ba =
+                            mergeIn alice2 bob
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (body ab) (body ba)
+                        , \_ -> Expect.equal "ZabcXde" (body ab)
+                        ]
+                        ()
+            , test "concurrent inserts at the SAME mid-run char converge without interleaving" <|
+                \_ ->
+                    -- both peers receive alice's run "abcde", then both insert a distinct
+                    -- run right after 'c' (same derived anchor id). Contiguity + convergence.
+                    let
+                        seed =
+                            initDoc "alice" |> setBody "abcde"
+
+                        p1 =
+                            mergeIn seed (initDoc "p1") |> setBody "abcXXde"
+
+                        p2 =
+                            mergeIn seed (initDoc "p2") |> setBody "abcYYde"
+
+                        ab =
+                            mergeIn p2 p1
+
+                        ba =
+                            mergeIn p1 p2
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (body ab) (body ba)
+                        , \_ -> Expect.equal True (body ab == "abcXXYYde" || body ab == "abcYYXXde")
+                        ]
+                        ()
             , fuzz2 runFuzz runFuzz "fuzzed: any two concurrent runs converge and never interleave" <|
                 \runA runB ->
                     let

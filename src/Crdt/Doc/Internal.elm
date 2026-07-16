@@ -415,6 +415,9 @@ targetOfAction action =
         InsertElem { container } ->
             container
 
+        InsertText { container } ->
+            container
+
         DeleteElem { container } ->
             container
 
@@ -1652,6 +1655,19 @@ inverseOf theOp preState =
         InsertElem { container, elemId } ->
             [ Rev (DeleteElem { container = container, elem = elemId }) ]
 
+        InsertText { container, start, text } ->
+            -- undo a run: delete each char it created. The run's char ids are the
+            -- derived span start .. start+len-1 (see `OpLog.insertTextRun`).
+            let
+                replica =
+                    Id.opIdReplica start
+
+                base =
+                    Id.opIdCounter start
+            in
+            List.range 0 (String.length text - 1)
+                |> List.map (\i -> Rev (DeleteElem { container = container, elem = Id.opId (base + i) replica }))
+
         MoveElem { container, elem } ->
             case navigateTarget container preState of
                 Just node ->
@@ -1856,6 +1872,9 @@ remapAction table action =
 
         InsertElem r ->
             InsertElem { r | container = remapTarget table r.container, elemId = remapId table r.elemId, parent = Maybe.map (remapId table) r.parent }
+
+        InsertText r ->
+            InsertText { r | container = remapTarget table r.container, parent = Maybe.map (remapId table) r.parent }
 
         DeleteElem r ->
             DeleteElem { container = remapTarget table r.container, elem = remapId table r.elem }
@@ -3030,33 +3049,61 @@ applyCharDiff target rga charElems fallbackLeft fallbackRight value doc =
                 ( doc, [], startDeps )
                 deleteIds
 
-        -- insert ops. The first char uses the Fugue placement; each subsequent char
-        -- chains as a RIGHT-CHILD of the previous one, so the whole run is a single
-        -- right-spine subtree — that is what keeps a concurrent run at the same gap
-        -- from interleaving with this one (it renders as one contiguous block).
-        -- `deps` chains the same way (`prevDep`), continuing from the deletes.
-        ( finalDoc, insertOpsRev, _ ) =
-            List.foldl
-                (\char ( d, acc, ( placement, prevDep ) ) ->
-                    let
-                        ( elemId, d1 ) =
-                            mint d
+        -- insert op. The whole inserted run is ONE `InsertText` op carrying the string,
+        -- rather than one `InsertElem` per character. `applyOp` explodes it into the same
+        -- per-char right-spine (char 0 at the Fugue placement, each subsequent char a
+        -- right-child of the previous — a contiguous subtree that won't interleave with a
+        -- concurrent run at the same gap). We reserve the whole counter span up front by
+        -- minting `len` ids, so the derived char ids (start .. start+len-1) can never
+        -- collide with a later local mint; only the first (`start`) is the op's own id.
+        insertLen =
+            List.length insertChars
 
-                        ( parent, side ) =
-                            placement
+        ( runStart, docAfterReserve ) =
+            reserveIds insertLen afterDeletes
 
-                        seedNode =
-                            Node.reg (PString (String.fromChar char)) elemId
-                    in
-                    ( d1
-                    , op elemId prevDep (InsertElem { container = target, elemId = elemId, parent = parent, side = side, seed = seedNode }) :: acc
-                    , ( ( Just elemId, Rga.Right ), [ elemId ] )
+        ( parent0, side0 ) =
+            startPlacement
+
+        insertOps =
+            if insertLen == 0 then
+                []
+
+            else
+                [ op runStart
+                    depsAfterDeletes
+                    (InsertText
+                        { container = target
+                        , start = runStart
+                        , text = String.fromList insertChars
+                        , parent = parent0
+                        , side = side0
+                        }
                     )
-                )
-                ( afterDeletes, [], ( startPlacement, depsAfterDeletes ) )
-                insertChars
+                ]
+
+        finalDoc =
+            docAfterReserve
     in
-    commit (deleteOps ++ List.reverse insertOpsRev) finalDoc
+    commit (deleteOps ++ insertOps) finalDoc
+
+
+{-| Reserve `n` consecutive op ids by advancing the clock `n` steps, returning the
+**first** id of the span (`start`) and the advanced doc. The run op uses `start` as its
+own id and derives the rest (`start+1 .. start+n-1`) implicitly; reserving them here keeps
+a later local mint from reusing a counter a run char already claimed. `n <= 0` mints one
+throwaway id (harmless) — callers guard the empty-run case before emitting.
+-}
+reserveIds : Int -> Doc a -> ( OpId, Doc a )
+reserveIds n doc =
+    let
+        ( start, doc1 ) =
+            mint doc
+
+        advanced =
+            List.foldl (\_ d -> mint d |> Tuple.second) doc1 (List.range 2 n)
+    in
+    ( start, advanced )
 
 
 {-| Choose a Fugue `(parent, side)` for a new element inserted between visible

@@ -159,3 +159,51 @@ Note: full-document `merge a b` is still O(n) — it unions two whole op stores
 (`Dict.union`) and rediscovers the added ops from the merged store, both intrinsic to
 merging two *complete* docs. The clock fix still roughly halved it (list @1000: 3.11→1.50
 ms). The demo's real transport is delta decode (above), which is now flat.
+
+---
+
+## Run-length text ops (`WORKLOADS=text`)
+
+Text used to store **one `InsertElem` op per character** (each a single-char `Reg` seed in
+the Fugue RGA). A new `InsertText` op stores a whole typed run as `{ start, text, parent,
+side }` and `applyOp` **explodes** it into the identical per-char right-spine at
+apply-time: char `i` gets the derived id `start+i`, so a concurrent insert anchoring
+mid-run references an id the explosion already created — no concurrent-split logic, `==`
+convergence preserved, and the materialized value / cursors / marks are byte-identical.
+
+The store shrinks (fewer, smaller ops) while the cache is unchanged — so CPU and memory
+BOTH improve; no trade. Bulk-text workload (a doc's text typed in one shot), before → after:
+
+| metric @ n=2000 | before (per-char) | after (run-length) | change |
+|-----------------|------------------:|-------------------:|--------|
+| build CPU (ms) | 2.74 | 0.91 | **3.0× faster** |
+| read CPU (ms) | 3.52 | 3.50 | unchanged (cache identical) |
+| delta-decode (ms) | 0.038 | 0.021 | 1.8× faster |
+| full merge (ms) | 4.26 | 0.032 | **~130× faster** |
+| ops stored | 1960 | 2 | ~1000× fewer |
+| raw wire (bytes) | 406 099 | 2 248 | ~180× smaller |
+| live heap (bytes) | 1 348 096 | 758 654 | **1.78× smaller** |
+
+### Where the win does and doesn't land (don't oversell it)
+
+The dramatic numbers above are the **bulk** case — a whole value set at once
+(load / paste / `set` a string / programmatic edit / decode), where one `set` diffs to one
+contiguous insert → **one** run-length op. **Interactive char-by-char typing** is
+different: each keystroke is its own `set` with a 1-char diff → a 1-char run → **still one
+op per character**. Run-length changes nothing about op *count* there; it only makes each
+op a little smaller (an `itxt` carries `start`+`text` vs an `ins`'s `elemId`+parent+`Reg`
+seed node), and read latency is unchanged in every case (the materialized per-char cache is
+identical).
+
+The `text` (bulk) vs `typing` (keystroke-by-keystroke) workloads make this explicit
+(`WORKLOADS=text,typing`), n=1000, same ~980 characters:
+
+| workload | ops stored | raw bytes | b/op |
+|----------|-----------:|----------:|-----:|
+| `text` (whole-value set) | **2** | 1 268 | run-length: one op for the whole run |
+| `typing` (per keystroke) | **979** | 143 078 | one op per char — run-length gives no count reduction |
+
+So: paste / load / bulk / programmatic text → order-of-magnitude store/heap/wire/merge wins;
+interactive typing → op count unchanged, ops marginally smaller, nothing slower. (Build-CPU
+for `typing` isn't tabulated: the harness re-diffs the growing string on every simulated
+keystroke, so that timing measures the O(n²) *harness loop*, not the library's op path.)
