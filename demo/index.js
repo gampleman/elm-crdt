@@ -40,10 +40,15 @@ function tabIdentity() {
     id = Math.random().toString(36).slice(2, 8);
     sessionStorage.setItem("crdt-replica", id);
   }
+  // Auto-compaction bound: the op log is compacted to the stable frontier once it exceeds
+  // this. `?historyCap=` overrides the 1000 default (tests use a tiny cap to trigger it).
+  const capParam = new URLSearchParams(location.search).get("historyCap");
+  const historyCap = capParam ? Math.max(1, parseInt(capParam, 10)) : 1000;
   return {
     replicaId: id,
     name: pick(ANIMALS) + "-" + id.slice(0, 3),
     color: pick(COLORS),
+    historyCap,
   };
 }
 

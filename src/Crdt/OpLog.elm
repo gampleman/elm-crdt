@@ -2,7 +2,7 @@ module Crdt.OpLog exposing
     ( Op, Action(..), Target, TargetStep(..), Frontier
     , OpStore, empty, insert, ops, member, merge
     , causalOrder, applyOps, opsMaxCounter, materialize, addedOpsInOrder, addedFromCandidates, checkout
-    , frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys
+    , frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys, stableFrontier
     )
 
 {-| The operation log: the source of truth for an op-log-based document.
@@ -26,7 +26,7 @@ drives it — every document is materialized from an `OpStore`.
 @docs Op, Action, Target, TargetStep, Frontier
 @docs OpStore, empty, insert, ops, member, merge
 @docs causalOrder, applyOps, opsMaxCounter, materialize, addedOpsInOrder, addedFromCandidates, checkout
-@docs frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys
+@docs frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys, stableFrontier
 
 -}
 
@@ -462,6 +462,41 @@ opsAfter known store =
     in
     ops store
         |> List.filter (\op -> not (Set.member (Id.opIdToString op.id) seen))
+
+
+{-| The **stable frontier** across a set of peer frontiers: the causal cut that _every_
+peer has delivered past. It is the frontier (tips) of the **intersection** of all the
+peers' ancestor sets — the ops that every listed peer holds — computed against this store.
+
+Compacting below it is safe across exactly those peers: any op missing from even one peer
+is absent from the intersection (so it survives), and concurrent work a peer hasn't shipped
+yet is nobody's ancestor (so it is never in the intersection). A peer **not** in the list
+(disconnected/behind) is not protected — it must be caught up by a snapshot transfer on
+reconnect, which the wire layer already does when a peer is behind `baseFrontier`.
+
+An empty list yields the empty frontier (nothing is common → compact nothing).
+
+-}
+stableFrontier : List Frontier -> OpStore -> Frontier
+stableFrontier peers ((OpStore d) as store) =
+    case peers of
+        [] ->
+            []
+
+        first :: rest ->
+            let
+                -- ops every peer has: intersect the ancestor-key sets.
+                common =
+                    List.foldl
+                        (\f acc -> Set.intersect acc (ancestorKeys f store))
+                        (ancestorKeys first store)
+                        rest
+
+                -- keep only ops in the common set, then take that sub-DAG's frontier.
+                commonStore =
+                    OpStore (Dict.filter (\k _ -> Set.member k common) d)
+            in
+            frontier commonStore
 
 
 {-| Compact the store at a causal `cut`: fold every op at-or-below `cut` into

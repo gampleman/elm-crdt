@@ -316,8 +316,8 @@ readAt =
 {-| A description of a piece of collaborative data — what Elm type it reads as, and how
 concurrent edits to it merge. Compose small `Schema` values (leaves and containers) into
 the shape of your whole document, the way you compose `elm/json` decoders. The `kind`
-tag records how the value may be edited (see the edit-capability markers); `a` is the Elm
-type it reads as. Opaque.
+tag records how the value may be edited (see [Edit-capability markers](#Settable)); `a` is
+the Elm type it reads as. Opaque.
 -}
 type alias Schema kind a =
     SI.Crdt kind a
@@ -383,8 +383,8 @@ type alias RichK =
     SI.RichK
 
 
-{-| Kind marker: a user-defined **op-set** CRDT over contribution type `c` (see `opSet`);
-edited only via `contribute`/`retract`.
+{-| Kind marker: a user-defined **op-set** CRDT over contribution type `c` (see
+[`opSet`](#opSet)); edited only via `contribute`/`retract`.
 -}
 type alias OpSetK c =
     SI.OpSetK c
@@ -840,7 +840,7 @@ setRich (Ref r) value doc =
 
 {-| Read a rich-text ref as **blocks** (type + depth + spans + marker id), rather
 than the flat `List Span` the schema decodes to. Used to resolve a block index to its
-marker `OpId` for the block edits. See `Crdt.RichText.Block`.
+marker `OpId` for the block edits. See [`Crdt.RichText.Block`](Crdt-RichText#Block).
 -}
 readBlocks : Ref r RichK (List Span) -> Doc doc -> Result EditError (List RichText.Block)
 readBlocks (Ref r) doc =
@@ -1152,8 +1152,8 @@ removeNode (Ref r) child doc =
 
 {-| Make a stable `Crdt.Cursor` at character `offset` in a text field. Because the cursor
 is anchored to the characters around it (not to the number), it keeps pointing at the
-same spot as the text is edited concurrently — see `Crdt.Cursor`. Broadcast it on the
-`Crdt.Presence` channel to show collaborators' carets.
+same spot as the text is edited concurrently — see [`Crdt.Cursor`](Crdt-Cursor). Broadcast
+it on the [`Crdt.Presence`](Crdt-Presence) channel to show collaborators' carets.
 -}
 cursorAt : Ref r Settable String -> Int -> Doc doc -> Result EditError Cursor
 cursorAt (Ref r) offset doc =
@@ -1218,7 +1218,7 @@ and its ref to the second, so at the end `build` hands you `{ schema, refs }`.
     -- now: `board.schema` for `Crdt.init`, `board.refs.title` to edit the title.
 
 Records nest: a field's schema can itself be another record's `.schema`, and you reach
-into it with `at` (see `at`).
+into it with [`at`](#at).
 
 -}
 record : (a -> b) -> refsAssembler -> RecordRefsBuilder r full (a -> b) refsAssembler

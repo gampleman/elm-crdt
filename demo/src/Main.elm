@@ -13,10 +13,15 @@ time-travel over the op DAG (`Doc.version` / `C.readAt`).
 It exercises the full JSON-like schema (record + movable list + dict + text + rich
 text + tree + sum type + counter + LWW), real WebSocket networking, live
 **presence** (who's here, their tab + cursor), **collaborative history** (named
-checkpoints + time-travel preview), and **branching** (`Doc.fork`): the History panel's
+checkpoints + time-travel preview), **branching** (`Doc.fork`): the History panel's
 "branch" button forks a private copy you edit without broadcasting, then `merge`s back
 (the branch keeps merging peers in the background via `mainline`, so concurrent work
-survives) or discards.
+survives) or discards — and **automatic history compaction** (`Doc.stableFrontier`): peers
+broadcast their `version`, and once the op log passes `historyCap` (~1000) the demo drops
+its ancient history (keeping a recent window) up to the point everyone has seen, so the
+scrubber and memory stay bounded over a long session without the user's recent edits ever
+vanishing (a straggler that missed a compaction is caught up by an automatic snapshot on
+reconnect). See `maybeAutoCompact`.
 
 -}
 
@@ -310,6 +315,14 @@ type alias Model =
     -- drops the branch and returns to `main`.
     , mainline : Maybe (Doc Board)
 
+    -- Stable-frontier GC (regime 2): each connected peer's last-broadcast `Version`, keyed
+    -- by replica id. We combine these with our own version via `Doc.stableFrontier` to find
+    -- the causal cut everyone has seen, which is safe to `compact` below (docs/04-gc.md).
+    -- `historyCap` bounds the op log: once it's exceeded we auto-compact to that cut, so the
+    -- scrubber (and memory) stay bounded no matter how long a session runs.
+    , peerVersions : Dict String Version
+    , historyCap : Int
+
     -- delta sync: the version up to which peers already have our ops, so each
     -- broadcast ships only `encodeSince lastSent` instead of the whole log.
     , lastSent : Version
@@ -378,6 +391,11 @@ type alias Flags =
     { replicaId : String
     , name : String
     , color : String
+
+    -- Auto-compaction bound: once the op log grows past this many ops, we compact to the
+    -- stable frontier so the history scrubber never exceeds it. Injected from JS (URL param
+    -- `?historyCap=` overrides the default, so tests can force a tiny cap).
+    , historyCap : Int
     }
 
 
@@ -410,6 +428,8 @@ init flags =
       , viewing = Nothing
       , connected = False
       , mainline = Nothing
+      , peerVersions = Dict.empty
+      , historyCap = Basics.max 1 flags.historyCap
       , lastSent = Doc.version doc
       , todosSlice = C.read doc |> Result.map .todos |> Result.withDefault []
       }
@@ -450,7 +470,7 @@ type Msg
     | AddOutlineRoot
     | AddOutlineChild OpId
     | IndentNode OpId (Maybe OpId)
-    | OutdentNode OpId (Maybe OpId)
+    | OutdentNode OpId (Maybe OpId) (List OpId)
     | RemoveNode OpId
       -- presence
     | FocusField String
@@ -673,9 +693,31 @@ update msg model =
                 Nothing ->
                     ( model, Cmd.none )
 
-        OutdentNode node maybeGrandparent ->
-            -- promote to sit under the parent's parent (Nothing = already a root)
-            outlineEdit (C.moveInto refs.outline node maybeGrandparent) model
+        OutdentNode node parent following ->
+            -- Promote one level, the standard outliner way (Workflowy/org-mode): move `node`
+            -- to sit immediately after its former parent, AND adopt `node`'s following
+            -- siblings as its own children. Adoption is what preserves the visual order — the
+            -- siblings that used to sit below `node` under the old parent would otherwise end
+            -- up ABOVE it once `node` jumps out. No-op at the top level (no parent).
+            case parent of
+                Just p ->
+                    let
+                        outdent doc =
+                            C.moveAfter refs.outline node p doc
+                                |> Result.andThen
+                                    (\d ->
+                                        -- reparent each following sibling under `node`, in order
+                                        -- (each `moveInto` appends, so order is preserved).
+                                        List.foldl
+                                            (\sib acc -> acc |> Result.andThen (C.moveInto refs.outline sib (Just node)))
+                                            (Ok d)
+                                            following
+                                    )
+                    in
+                    outlineEdit outdent model
+
+                Nothing ->
+                    ( model, Cmd.none )
 
         RemoveNode node ->
             outlineEdit (C.removeNode refs.outline node) model
@@ -887,8 +929,11 @@ update msg model =
                                                     m1
                                     in
                                     -- a remote edit may have changed the open file; push the
-                                    -- new spans to the editor so ProseMirror reconciles.
-                                    ( m2
+                                    -- new spans to the editor so ProseMirror reconciles. Bound
+                                    -- the op log after merging too (a burst of remote ops can
+                                    -- push us past the cap); compaction preserves the value, so
+                                    -- the editor diff below is unaffected.
+                                    ( maybeAutoCompact m2
                                     , renderEditorIfChanged model.selectedFile model.doc doc1
                                     )
 
@@ -905,18 +950,32 @@ update msg model =
                         Err _ ->
                             ( model, Cmd.none )
 
+                Ok (VersionMsg rid ver) ->
+                    -- a peer told us its current version; remember it so we can compute a
+                    -- safe stable-frontier compaction cut. No document change.
+                    ( { model | peerVersions = Dict.insert (Crdt.Id.replicaToString rid) ver model.peerVersions }
+                    , Cmd.none
+                    )
+
                 Ok HelloMsg ->
                     -- a peer just joined: send our full op set AND our presence so
                     -- they catch up on both the document and who's here / cursors. While
                     -- branched, share the MAINLINE (the shared doc), never our private branch.
+                    -- Also announce our version for stable-frontier GC.
                     ( model
-                    , Cmd.batch [ broadcastFull (syncDoc model), broadcastPresence model.presence ]
+                    , Cmd.batch [ broadcastFull (syncDoc model), broadcastPresence model.presence, broadcastVersion (syncDoc model) ]
                     )
 
                 Ok (LeftMsg rid) ->
                     -- the relay says this peer's socket closed: drop it from the
-                    -- presence view (and its caret with it).
-                    ( { model | peers = Presence.remove rid model.peers }, Cmd.none )
+                    -- presence view (and its caret), and forget its version — it's no
+                    -- longer a peer we must stay safe for (it'll snapshot-catch-up on return).
+                    ( { model
+                        | peers = Presence.remove rid model.peers
+                        , peerVersions = Dict.remove (Crdt.Id.replicaToString rid) model.peerVersions
+                      }
+                    , Cmd.none
+                    )
 
                 Err _ ->
                     ( model, Cmd.none )
@@ -1044,6 +1103,55 @@ syncDoc model =
     Maybe.withDefault model.doc model.mainline
 
 
+{-| Keep the op log bounded: once it grows past `historyCap`, regime-2 GC folds history up
+to the **stable frontier** (the cut every connected peer has seen) into the base and drops
+those ops, so the history scrubber and memory never grow without bound over a long session.
+
+Two ideas combine into the cut. First we only ever want to drop **ancient** history — never
+the recent tail, or the scrubber would appear to lose the user's own last edits. So the
+target is `versionAt (opCount - keepRecent)`: the point `keepRecent` edits back from the tip.
+Second, dropping ops is only safe below a cut every peer has already seen. `stableFrontier`
+is exactly "frontier of the intersection of these versions' ancestors", so feeding it the
+ancient target **alongside** the peer versions yields a cut that is at once no newer than the
+recent window _and_ no past any laggard — safety and the keep-recent policy in one call. (The
+stable frontier alone would be the wrong target: when everyone is synced it equals the tip,
+so compacting to it would wipe the whole scrubber.)
+
+`keepRecent` is half `historyCap`, so a compaction leaves ~half the cap and it takes that
+many more edits to trip again — hysteresis, so the O(n) compaction amortizes instead of
+firing every edit at steady state. A peer that reconnects below the cut is caught up by a
+snapshot. Skipped while time-travelling (`viewing`) or on a private branch, both of which
+hold the full op log. If a peer lags far enough that the safe cut sits inside the recent
+window, less (or nothing) is dropped — best-effort, never at the cost of safety.
+-}
+maybeAutoCompact : Model -> Model
+maybeAutoCompact model =
+    case ( model.viewing, model.mainline ) of
+        ( Nothing, Nothing ) ->
+            if Doc.opCount model.doc > model.historyCap then
+                let
+                    keepRecent =
+                        model.historyCap // 2
+
+                    -- the point `keepRecent` edits back from the tip: our target, i.e. the
+                    -- OLDEST version we're willing to drop below (keeps the recent tail).
+                    ancientTarget =
+                        Doc.versionAt (Doc.historyLength model.doc - keepRecent) model.doc
+
+                    -- clamp the target to what every peer has seen: the intersection of the
+                    -- ancient target with the peers is "≤ target AND ≤ everyone" — safe to drop.
+                    cut =
+                        Doc.stableFrontier (ancientTarget :: Dict.values model.peerVersions) model.doc
+                in
+                { model | doc = Doc.compact cut model.doc }
+
+            else
+                model
+
+        _ ->
+            model
+
+
 {-| After any local change, broadcast only the **delta** since our last
 broadcast, then advance `lastSent`. While connected every peer sees every
 broadcast, so this keeps everyone in sync at edit-size bandwidth; fresh peers are
@@ -1062,9 +1170,21 @@ pushDoc model =
             let
                 now =
                     Doc.version model.doc
+
+                -- build the outgoing delta from the CURRENT doc first, then bound the local
+                -- op log. Compaction preserves the tip frontier, so `now`/`lastSent` stay
+                -- valid, and peers still received the ordinary delta above.
+                delta =
+                    Ports.outgoing (envelope "doc" (Doc.encodeSince model.lastSent model.doc))
             in
-            ( { model | lastSent = now }
-            , Ports.outgoing (envelope "doc" (Doc.encodeSince model.lastSent model.doc))
+            ( maybeAutoCompact { model | lastSent = now }
+            , Cmd.batch
+                [ delta
+
+                -- announce our new version too, so peers can recompute the stable
+                -- frontier for safe compaction (tiny — just a frontier).
+                , broadcastVersion model.doc
+                ]
             )
 
 
@@ -1150,6 +1270,14 @@ broadcastPresence p =
     Ports.outgoing (envelope "presence" (Presence.encode p))
 
 
+{-| Broadcast our current version (a tiny frontier) so peers can compute the stable
+frontier for safe multi-replica compaction. Sent after every synced edit and on connect.
+-}
+broadcastVersion : Doc Board -> Cmd Msg
+broadcastVersion doc =
+    Ports.outgoing (envelope "version" (Doc.encodeVersion (Doc.version doc)))
+
+
 {-| Update which field we're editing: bump our local presence, fold it into the
 merged `peers` view so our own row stays current, and broadcast it to others.
 -}
@@ -1185,6 +1313,7 @@ setEditing field model =
 type Envelope
     = DocMsg JD.Value -- a batch of ops (delta or full)
     | PresenceMsg JD.Value
+    | VersionMsg ReplicaId Version -- a peer announcing its current version (for stable-frontier GC)
     | HelloMsg -- "I just joined — send me your full state"
     | LeftMsg ReplicaId -- the relay says this peer's socket closed
 
@@ -1206,6 +1335,21 @@ decodeEnvelope =
 
                         "presence" ->
                             JD.map PresenceMsg (JD.field "payload" JD.value)
+
+                        "version" ->
+                            JD.map2 VersionMsg
+                                (JD.field "from" JD.string |> JD.map Crdt.Id.replica)
+                                (JD.field "payload" JD.value
+                                    |> JD.andThen
+                                        (\v ->
+                                            case Doc.decodeVersion v of
+                                                Ok ver ->
+                                                    JD.succeed ver
+
+                                                Err e ->
+                                                    JD.fail e
+                                        )
+                                )
 
                         "hello" ->
                             JD.succeed HelloMsg
@@ -2190,14 +2334,14 @@ viewFileEditor readOnly blocks k =
 
 {-| The collaborative **outline** (movable tree). Renders the forest recursively;
 each node has an editable text field plus controls to indent (nest under the
-preceding sibling), outdent (promote to the grandparent), add a child, and remove.
-`indent`/`outdent` are computed from the node's position among its siblings, which
-is why the recursion threads the parent id and the sibling list.
+preceding sibling), outdent (promote one level, landing right after its former parent),
+add a child, and remove. `indent`/`outdent` are computed from the node's position among
+its siblings, which is why the recursion threads the parent id and the sibling list.
 -}
 viewOutline : Bool -> Model -> Tree.Forest Node -> Html Msg
 viewOutline readOnly model forest =
     div []
-        [ ul [ class "outline" ] (viewForest readOnly model Nothing forest)
+        [ ul [ class "outline outline-root" ] (viewForest readOnly model Nothing forest)
         , if readOnly then
             text ""
 
@@ -2207,8 +2351,10 @@ viewOutline readOnly model forest =
         ]
 
 
-{-| Render a sibling list under `parent`, passing each node its preceding sibling
-(for indent) and its parent's parent (for outdent).
+{-| Render a sibling list whose common parent is `parent`. Each node gets its preceding
+sibling (for **indent** — nest under it), `parent` (for **outdent**), and its **following
+siblings** (which outdent re-parents under the node, to preserve visual order). Top-level
+nodes have `parent = Nothing`, so their indent/outdent buttons are disabled.
 -}
 viewForest : Bool -> Model -> Maybe OpId -> Tree.Forest Node -> List (Html Msg)
 viewForest readOnly model parent forest =
@@ -2221,8 +2367,11 @@ viewForest readOnly model parent forest =
             let
                 prevSibling =
                     List.drop (i - 1) ids |> List.head |> maybeIf (i > 0)
+
+                following =
+                    List.drop (i + 1) ids
             in
-            viewOutlineNode readOnly model parent prevSibling item
+            viewOutlineNode readOnly model parent prevSibling following item
         )
         forest
 
@@ -2238,8 +2387,8 @@ maybeIf cond m =
         Nothing
 
 
-viewOutlineNode : Bool -> Model -> Maybe OpId -> Maybe OpId -> Tree.Item Node -> Html Msg
-viewOutlineNode readOnly model parent prevSibling item =
+viewOutlineNode : Bool -> Model -> Maybe OpId -> Maybe OpId -> List OpId -> Tree.Item Node -> Html Msg
+viewOutlineNode readOnly model parent prevSibling following item =
     let
         id =
             Tree.itemId item
@@ -2252,8 +2401,12 @@ viewOutlineNode readOnly model parent prevSibling item =
                 []
 
             else
+                -- indent → nest under the preceding sibling; outdent → promote out one level
+                -- (right after `parent`), adopting the following siblings so the visible order
+                -- is preserved. Both are disabled at the top level (no preceding sibling / no
+                -- parent).
                 [ button [ onClick (IndentNode id prevSibling), A.disabled (prevSibling == Nothing), A.title "indent (nest under previous)" ] [ text "→" ]
-                , button [ onClick (OutdentNode id parent), A.disabled (parent == Nothing), A.title "outdent" ] [ text "←" ]
+                , button [ onClick (OutdentNode id parent following), A.disabled (parent == Nothing), A.title "outdent (promote out one level)" ] [ text "←" ]
                 , button [ onClick (AddOutlineChild id), A.title "add child" ] [ text "+" ]
                 , button [ onClick (RemoveNode id), A.title "remove" ] [ text "✕" ]
                 ]
@@ -2261,6 +2414,8 @@ viewOutlineNode readOnly model parent prevSibling item =
     li [ class "outline-node" ]
         [ div [ class "outline-row" ]
             (viewTextInput readOnly model (outlineTextRef id) (outlineField id) node.text "untitled" :: controls)
+
+        -- children: their parent is this node.
         , ul [ class "outline" ] (viewForest readOnly model (Just id) (Tree.itemChildren item))
         ]
 
@@ -2344,7 +2499,29 @@ viewHistory model =
             Nothing ->
                 text ""
         , viewBranch model
+        , viewCompaction model
         ]
+
+
+{-| A passive op-log gauge. Compaction is **automatic** (`maybeAutoCompact` bounds the log
+at `historyCap` by folding history everyone has seen into the base), so there is no button —
+this just surfaces the current op count and the cap so the bounding is visible. Hidden while
+previewing history or on a branch (both hold the full op log).
+-}
+viewCompaction : Model -> Html Msg
+viewCompaction model =
+    case ( model.viewing, model.mainline ) of
+        ( Nothing, Nothing ) ->
+            div [ class "compact-row" ]
+                [ span
+                    [ class "op-count"
+                    , A.title "history is compacted automatically to the point every connected peer has seen, so the op log stays bounded"
+                    ]
+                    [ text (String.fromInt (Doc.opCount model.doc) ++ " / " ++ String.fromInt model.historyCap ++ " ops (auto-compacted)") ]
+                ]
+
+        _ ->
+            text ""
 
 
 {-| The branching panel. On the mainline it offers a "branch" button (fork the current

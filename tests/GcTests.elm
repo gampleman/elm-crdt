@@ -455,4 +455,286 @@ suite =
                         ]
                         ()
             ]
+        , describe "stable-frontier GC (regime 2): the multi-replica-safe cut"
+            [ test "two fully-synced peers: the stable frontier is their shared version" <|
+                \_ ->
+                    let
+                        -- alice builds; bob receives everything → both at the same version
+                        alice =
+                            sample
+
+                        bob =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encode alice)
+                                |> Result.withDefault (initDoc "bob")
+
+                        cut =
+                            Doc.stableFrontier [ Doc.version alice, Doc.version bob ] alice
+
+                        -- compacting alice below it drops ALL her ops (everyone has them)
+                        compacted =
+                            Doc.compact cut alice
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (read alice) (read compacted)
+                        , \_ -> Doc.opCount compacted |> Expect.equal 0
+                        ]
+                        ()
+            , test "a peer's UNSYNCED concurrent work is NOT below the stable cut (so it survives a merge)" <|
+                \_ ->
+                    let
+                        -- shared base both peers have
+                        base =
+                            initDoc "alice" |> setTitle "shared" |> addItem "one"
+
+                        bob =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encode base)
+                                |> Result.withDefault (initDoc "bob")
+
+                        -- both advance CONCURRENTLY without exchanging the new ops
+                        aliceAhead =
+                            base |> addItem "alice-item"
+
+                        bobAhead =
+                            bob |> addItem "bob-item"
+
+                        -- alice computes the stable cut from the versions she knows
+                        -- (her own + bob's LAST-KNOWN, which is the shared base version)
+                        cut =
+                            Doc.stableFrontier [ Doc.version aliceAhead, Doc.version base ] aliceAhead
+
+                        -- she compacts below it, then bob's concurrent op arrives
+                        aliceGc =
+                            Doc.compact cut aliceAhead
+
+                        aliceFinal =
+                            aliceGc |> Doc.decodeInto (Doc.encode bobAhead) |> Result.withDefault aliceGc
+
+                        bobFinal =
+                            bobAhead |> Doc.decodeInto (Doc.encode aliceAhead) |> Result.withDefault bobAhead
+                    in
+                    Expect.all
+                        [ -- alice kept her own new op (it was above the cut) and got bob's
+                          \_ -> Expect.equal (read aliceFinal |> Result.map (.items >> List.length)) (Ok 3)
+                        , -- both converge despite alice compacting on a stale peer version
+                          \_ -> Expect.equal (read aliceFinal) (read bobFinal)
+                        ]
+                        ()
+            , test "compacting below the stable frontier keeps both peers reading identically and converging" <|
+                \_ ->
+                    let
+                        alice =
+                            sample
+
+                        bob =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encode alice)
+                                |> Result.withDefault (initDoc "bob")
+
+                        cut =
+                            Doc.stableFrontier [ Doc.version alice, Doc.version bob ] alice
+
+                        aliceGc =
+                            Doc.compact cut alice
+
+                        -- alice edits post-GC; bob merges the delta
+                        aliceMore =
+                            setTitle "after stable gc" aliceGc
+
+                        bobFinal =
+                            bob |> Doc.decodeInto (Doc.encode aliceMore) |> Result.withDefault bob
+                    in
+                    Expect.equal (read aliceMore) (read bobFinal)
+            , test "a lagging peer (behind the cut) is caught up by a snapshot, not lost" <|
+                \_ ->
+                    let
+                        alice =
+                            sample
+
+                        -- lagging peer knows NOTHING (not in the stable-frontier list)
+                        lagging =
+                            initDoc "carol"
+
+                        -- alice + a synced bob agree; stable cut = their shared version.
+                        -- carol is deliberately omitted (she's offline).
+                        bob =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encode alice)
+                                |> Result.withDefault (initDoc "bob")
+
+                        cut =
+                            Doc.stableFrontier [ Doc.version alice, Doc.version bob ] alice
+
+                        aliceGc =
+                            Doc.compact cut alice
+
+                        -- carol reconnects: a plain delta can't catch her up (ops are
+                        -- gone), so `encode` sends a snapshot; `decodeInto` adopts it.
+                        caroCaught =
+                            lagging
+                                |> Doc.decodeInto (Doc.encode aliceGc)
+                                |> Result.withDefault lagging
+                    in
+                    Expect.equal (read aliceGc) (read caroCaught)
+            , test "an empty peer list compacts nothing (no cut without knowing anyone)" <|
+                \_ ->
+                    let
+                        cut =
+                            Doc.stableFrontier [] sample
+
+                        compacted =
+                            Doc.compact cut sample
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (read sample) (read compacted)
+                        , -- nothing dropped
+                          \_ -> Doc.opCount compacted |> Expect.equal (Doc.opCount sample)
+                        ]
+                        ()
+            , test "single-peer stable frontier equals that peer's own version (regime 1 as a special case)" <|
+                \_ ->
+                    let
+                        cut =
+                            Doc.stableFrontier [ Doc.version sample ] sample
+
+                        viaStable =
+                            Doc.compact cut sample
+
+                        viaOwn =
+                            Doc.compact (Doc.version sample) sample
+                    in
+                    Expect.equal (Doc.opCount viaStable) (Doc.opCount viaOwn)
+            ]
+        , describe "encodeFrom: shallow export at a cut (compaction you send, not self-mutation)"
+            [ test "the SOURCE doc is untouched — it keeps all its ops and history" <|
+                \_ ->
+                    let
+                        before =
+                            Doc.opCount sample
+
+                        -- the shallow export is smaller (proof it compacted)...
+                        peer =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encodeFrom (Doc.version sample) sample)
+                                |> Result.withDefault (initDoc "bob")
+                    in
+                    Expect.all
+                        [ -- ...yet the SOURCE still has every op — exporting doesn't shrink self
+                          \_ -> Doc.opCount sample |> Expect.equal before
+                        , \_ -> Expect.lessThan before (Doc.opCount peer)
+                        ]
+                        ()
+            , test "a peer decoding the shallow export reads identically to the source" <|
+                \_ ->
+                    let
+                        shallow =
+                            Doc.encodeFrom (Doc.version sample) sample
+
+                        peer =
+                            initDoc "bob"
+                                |> Doc.decodeInto shallow
+                                |> Result.withDefault (initDoc "bob")
+                    in
+                    Expect.equal (read sample) (read peer)
+            , test "the shallow export carries fewer ops than the full encode (history below the cut is gone)" <|
+                \_ ->
+                    let
+                        -- cut at the current version → the whole log folds into the base
+                        shallow =
+                            Doc.encodeFrom (Doc.version sample) sample
+
+                        peerShallow =
+                            initDoc "bob"
+                                |> Doc.decodeInto shallow
+                                |> Result.withDefault (initDoc "bob")
+
+                        peerFull =
+                            initDoc "carol"
+                                |> Doc.decodeInto (Doc.encode sample)
+                                |> Result.withDefault (initDoc "carol")
+                    in
+                    Expect.all
+                        [ -- same value both ways
+                          \_ -> Expect.equal (read peerShallow) (read peerFull)
+                        , -- but the shallow peer holds no pre-cut ops (history redacted)
+                          \_ -> Doc.opCount peerShallow |> Expect.equal 0
+                        , \_ -> Expect.greaterThan 0 (Doc.opCount peerFull)
+                        ]
+                        ()
+            , test "redaction: history below the cut can't be time-travelled by the recipient" <|
+                \_ ->
+                    let
+                        -- a doc whose title said something sensitive, then was replaced
+                        doc =
+                            initDoc "alice"
+                                |> setTitle "SECRET DRAFT"
+                                |> setTitle "Public title"
+
+                        -- export as-of now: the "SECRET DRAFT" edits are below the cut
+                        shallow =
+                            Doc.encodeFrom (Doc.version doc) doc
+
+                        peer =
+                            initDoc "bob"
+                                |> Doc.decodeInto shallow
+                                |> Result.withDefault (initDoc "bob")
+                    in
+                    Expect.all
+                        [ -- the live value is intact
+                          \_ -> Expect.equal (Ok "Public title") (read peer |> Result.map .title)
+                        , -- and there is NO earlier version to scrub back to
+                          \_ -> Doc.historyLength peer |> Expect.equal 0
+                        ]
+                        ()
+            , test "the recipient of a shallow export keeps converging on later edits" <|
+                \_ ->
+                    let
+                        shallow =
+                            Doc.encodeFrom (Doc.version sample) sample
+
+                        peer =
+                            initDoc "bob"
+                                |> Doc.decodeInto shallow
+                                |> Result.withDefault (initDoc "bob")
+
+                        -- source edits on, sends a delta; peer merges it
+                        sourceMore =
+                            setTitle "Trip plan v2" sample
+
+                        peerCaught =
+                            peer
+                                |> Doc.decodeInto (Doc.encodeSince (Doc.version peer) sourceMore)
+                                |> Result.withDefault peer
+                    in
+                    Expect.equal (read sourceMore) (read peerCaught)
+            , test "encodeFrom at a MID-history cut keeps the tail above it" <|
+                \_ ->
+                    let
+                        mid =
+                            initDoc "alice" |> setTitle "half"
+
+                        midV =
+                            Doc.version mid
+
+                        full =
+                            mid |> addItem "later" |> setTitle "half done"
+
+                        shallow =
+                            Doc.encodeFrom midV full
+
+                        peer =
+                            initDoc "bob"
+                                |> Doc.decodeInto shallow
+                                |> Result.withDefault (initDoc "bob")
+                    in
+                    Expect.all
+                        [ -- value identical to the source
+                          \_ -> Expect.equal (read full) (read peer)
+                        , -- some ops remain (the tail above the cut), but fewer than full
+                          \_ -> Expect.greaterThan 0 (Doc.opCount peer)
+                        , \_ -> Expect.lessThan (Doc.opCount full) (Doc.opCount peer)
+                        ]
+                        ()
+            ]
         ]

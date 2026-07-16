@@ -1,12 +1,13 @@
 module Crdt.Doc exposing
     ( Doc
-    , merge, encode, decodeInto, encodeSince
+    , merge, encode, decodeInto, encodeSince, encodeFrom
     , Diff, Origin, isLocal, originReplica, mergeWithDiff, decodeWithDiff, diffSince
     , Version, version, historyLength, versionAt, restoreTo
+    , encodeVersion, decodeVersion
     , fork, forkAt, Divergence, divergence
     , recordEdit, undo, redo, canUndo, canRedo
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
-    , compact, opCount
+    , compact, stableFrontier, opCount
     )
 
 {-| A **document** — the live, collaborative value your application holds and edits.
@@ -50,7 +51,7 @@ Convergence is the library's job; moving bytes is yours. `encode` a document (or
 `encodeSince` a small delta) to a peer over any channel — WebSocket, HTTP, a file — and
 `decodeInto` merges what arrives. Edits from any replica, in any order, converge.
 
-@docs merge, encode, decodeInto, encodeSince
+@docs merge, encode, decodeInto, encodeSince, encodeFrom
 
 
 # Reacting to what changed
@@ -73,6 +74,7 @@ scrub through the timeline, and restore an earlier version — and because a res
 itself just more edits, it syncs to everyone else too.
 
 @docs Version, version, historyLength, versionAt, restoreTo
+@docs encodeVersion, decodeVersion
 
 
 # Branching
@@ -85,7 +87,7 @@ is untouched. `divergence` tells you how far a branch and the mainline have drif
 (and hence whether a merge-back is fast-forward, already-merged, or truly divergent).
 
 A branch must edit under its **own** `ReplicaId` (you pass one to `fork`/`forkAt`), so its
-edits are concurrent with the mainline's and both survive the merge — see `fork`.
+edits are concurrent with the mainline's and both survive the merge — see [`fork`](#fork).
 
     -- try a change on a branch without disturbing the live doc:
     branch =
@@ -140,7 +142,47 @@ a whole drag collapse into one undo step.
 
 # Compacting history
 
-@docs compact, opCount
+Old history accumulates — every edit is an op the store keeps so you can time-travel and so
+a lagging peer can still merge. **Compaction** is the one operation that reclaims it: fold
+history up to a `Version` into a base and drop the ops below it. The materialized value is
+unchanged; what you lose is the fine-grained history (time-travel and per-op provenance)
+below the cut.
+
+Compaction comes in two forms — **shrink yourself** or **export a shallow copy** — sharing
+the same underlying transform:
+
+  - `compact` mutates _your_ document: it reclaims local space, at the cost of your own
+    ability to time-travel below the cut.
+  - `encodeFrom` leaves you untouched and produces a shallow snapshot to _send_: your live
+    doc keeps every op while a peer receives only the state at the cut plus the tail.
+
+Either way the key question is **which cut**. Below the cut, the history is gone — so it must
+be a point you (or your peers) will never need to merge from again. Three safe choices:
+
+  - **Local save / single replica** — compact up to your own `version`; there is no
+    concurrent peer for that store.
+
+  - **Multiple live replicas** — `stableFrontier` computes the safe cut from the connected
+    peers' versions (the point _all_ of them have seen); a peer that's offline is caught up
+    by an automatic snapshot when it reconnects.
+
+        -- shrink my own doc up to the point every peer has seen:
+        safe =
+            Doc.stableFrontier (myVersion :: peerVersions) model.doc
+
+        doc =
+            Doc.compact safe model.doc
+
+        -- OR keep my full history but hand peers a compacted copy:
+        payloadForPeers =
+            Doc.encodeFrom safe model.doc
+
+`encodeFrom` also enables **privacy redaction**: exporting above a cut yields a payload with
+no ops — hence no record of edits, authors, or superseded text — below it. (It scrubs
+_history_ below the cut, not data still live _at_ the cut, which remains in the exported
+base; see [`encodeFrom`](#encodeFrom).)
+
+@docs compact, stableFrontier, opCount
 
 -}
 
@@ -193,6 +235,36 @@ is already up to that point. Track the version you last sent each peer and ship
 encodeSince : Version -> Doc a -> JE.Value
 encodeSince =
     I.encodeSince
+
+
+{-| Serialize a **shallow** copy of the document, keeping the history that comes after the
+given `Version` but discarding the history before it.
+
+`encode` serializes the whole document — every operation, back to the first edit.
+`encodeFrom v` serializes the document's current value plus only the operations made after
+`v`; the earlier operations are collapsed into a starting snapshot. The result is smaller,
+and decodes to a document with the **same value** but a shorter history.
+
+Two uses:
+
+  - **Archive the full history, share a shallow copy.** Persist `encode doc` for yourself so
+    you keep undo and time-travel, but send peers `encodeFrom v doc` so they get a small
+    document without your entire edit log. A good `v` is [`stableFrontier`](#stableFrontier)
+    over the connected peers (the point they've all already reached).
+  - **Privacy redaction.** Because the operations before `v` are gone from the payload, so is
+    every trace of them — who edited, when, and any text that was later changed or deleted.
+    Pick a `v` late enough that the sensitive edits are all before it (and no longer visible
+    in the current value).
+
+Note the second point removes past _edits_, not the current _value_: anything still present
+in the document at `v` remains in the shallow copy. So choose a `v` after which the sensitive
+content is no longer part of the value. See [`compact`](#compact) and the module's
+**Compacting history** section.
+
+-}
+encodeFrom : Version -> Doc a -> JE.Value
+encodeFrom =
+    I.encodeFrom
 
 
 {-| What a merge changed, as an opaque value you query with your typed refs
@@ -289,6 +361,24 @@ versionAt =
     I.versionAt
 
 
+{-| Serialize a `Version` to JSON — a tiny payload (a causal frontier is a handful of op
+ids), for broadcasting your position to peers. The counterpart to `decodeVersion`. This is
+how a stable-frontier GC policy gathers everyone's version: each peer sends
+`encodeVersion (version doc)`, and `stableFrontier` turns the collected versions into a
+safe compaction cut.
+-}
+encodeVersion : Version -> JE.Value
+encodeVersion =
+    I.encodeVersion
+
+
+{-| Decode a `Version` from `encodeVersion`. `Err` on malformed input.
+-}
+decodeVersion : JE.Value -> Result String Version
+decodeVersion =
+    I.decodeVersion
+
+
 {-| Rewind the document to a past `Version` — but **as new edits**, so the revert itself
 syncs to every peer and converges (it doesn't silently rewind only your copy, which a
 later merge would undo). Survivors keep their identity; only things deleted since are
@@ -332,11 +422,11 @@ to merge back; `behind == 0` ⇒ a fast-forward; both `> 0` ⇒ genuinely diverg
 integrates concurrent work from both sides).
 -}
 type alias Divergence =
-    I.Divergence
+    { ahead : Int, behind : Int }
 
 
-{-| Compare a branch against the mainline — see `Divergence`. Pass them by name to keep
-the direction unambiguous:
+{-| Compare a branch against the mainline — see [`Divergence`](#Divergence). Pass them by
+name to keep the direction unambiguous:
 
     Doc.divergence { branch = experiment, mainline = model.doc }
 
@@ -435,6 +525,24 @@ Use it once old history is no longer needed for undo or time-travel.
 compact : Version -> Doc a -> Doc a
 compact =
     I.compact
+
+
+{-| The **multi-replica-safe** cut for `compact`: given the `Version`s of the replicas you
+might still merge with (typically every connected peer, plus your own `version`), returns
+the causal point all of them have already delivered past. Compacting below it drops no op
+any listed peer still needs — an op even one of them is missing is kept, and concurrent
+work nobody has shipped yet is never included.
+
+The library computes the frontier; **you** decide who is in the list. A peer left out
+(disconnected, or lagging) isn't protected by this cut, but that's safe: when it
+reconnects, being behind the compacted base, it is caught up by an automatic full-state
+snapshot rather than a delta. So the worst case of an aggressive cut is a heavier catch-up
+for a straggler, never lost data or divergence. An empty list compacts nothing.
+
+-}
+stableFrontier : List Version -> Doc a -> Version
+stableFrontier =
+    I.stableFrontier
 
 
 {-| How many operations the document holds — a rough size/complexity gauge (e.g. to decide

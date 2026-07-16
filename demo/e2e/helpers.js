@@ -12,13 +12,16 @@ import { expect } from "@playwright/test";
 const openContexts = new Set();
 
 /** Open a fresh client (independent replica) at the app root. Returns { context, page }. */
-export async function openClient(browser) {
+export async function openClient(browser, opts = {}) {
   const context = await browser.newContext();
   openContexts.add(context);
   const page = await context.newPage();
   // isolated relay port (8091) so a stray tab on the default 8080 relay can't leak its
   // document into this test replica (a real contamination we hit during development).
-  await page.goto("/?relayPort=8091");
+  // `opts.historyCap` forces a tiny auto-compaction bound (default is 1000 in the app).
+  const params = new URLSearchParams({ relayPort: "8091" });
+  if (opts.historyCap != null) params.set("historyCap", String(opts.historyCap));
+  await page.goto("/?" + params.toString());
   // wait for the Elm app + tab bar to render
   await page.locator(".tabs .tab", { hasText: "Files" }).waitFor();
   return { context, page };

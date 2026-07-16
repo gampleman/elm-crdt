@@ -266,7 +266,8 @@ type Codec a
         }
 
 
-{-| Describes one field of a presence value (see `string`/`bool`/`int`/`custom`).
+{-| Describes one field of a presence value (see [`string`](#string) / [`bool`](#bool) /
+[`int`](#int) / [`custom`](#custom)).
 -}
 type FieldCodec a
     = FieldCodec

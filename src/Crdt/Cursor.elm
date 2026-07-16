@@ -25,8 +25,9 @@ merge. A typical setup carries each peer's caret as an optional presence field:
             |> Presence.buildCodec
 
 A `Range` is a text selection: the pair of cursors marking its two ends — the **anchor**
-where the selection started and the **focus** where the caret now reaches (see `Range`
-for why the two ends aren't interchangeable). Each end resolves independently, so a
+where the selection started and the **focus** where the caret now reaches (see
+[`Range`](#Range) for why the two ends aren't interchangeable). Each end resolves
+independently, so a
 selection stretches and shifts correctly as the text changes underneath it.
 
 

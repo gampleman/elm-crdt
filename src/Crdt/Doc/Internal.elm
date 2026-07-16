@@ -8,13 +8,13 @@ module Crdt.Doc.Internal exposing
     , contribute, retract
     , opCount, cacheConsistent
     , cursorAt, cursorOffset, cursorRange
-    , Version, version, readAt
+    , Version, version, readAt, encodeVersion, decodeVersion
     , historyLength, versionAt, restoreTo
     , fork, forkAt, Divergence, divergence
     , recordEdit, undo, redo, canUndo, canRedo
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
-    , compact
-    , encode, encodeSince, decodeInto
+    , compact, stableFrontier
+    , encode, encodeSince, encodeFrom, decodeInto
     , seedNodeAt, subValue
     , treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
     , setRichText, setBlockText, mark, clearMark
@@ -41,13 +41,13 @@ supported write path — so they live here rather than in the published module.
 @docs contribute, retract
 @docs opCount, cacheConsistent
 @docs cursorAt, cursorOffset, cursorRange
-@docs Version, version, readAt
+@docs Version, version, readAt, encodeVersion, decodeVersion
 @docs historyLength, versionAt, restoreTo
 @docs fork, forkAt, Divergence, divergence
 @docs recordEdit, undo, redo, canUndo, canRedo
 @docs Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
-@docs compact
-@docs encode, encodeSince, decodeInto
+@docs compact, stableFrontier
+@docs encode, encodeSince, encodeFrom, decodeInto
 @docs seedNodeAt, subValue
 @docs treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
 @docs setRichText, setBlockText, mark, clearMark
@@ -621,6 +621,40 @@ encodeSince (Version known) (Doc d) =
         snapshotPayload d.base d.baseFrontier (OpLog.ops d.store)
 
 
+{-| Serialize a **shallow** copy of the document as of `cut`: history at or below `cut` is
+folded into the exported base and its ops are dropped from the export, while the tail above
+`cut` ships as ops. **The source document is untouched** — this is `compact` as a
+projection you _send_, not a mutation of yourself.
+
+Decoding it yields a document that **reads identically** to this one (the materialized value
+is unchanged) but carries none of the pre-`cut` history — no per-op provenance, no
+time-travel below `cut`, no intermediate/deleted-then-superseded content. Two uses:
+
+  - **Keep full history locally, hand peers a compacted view** — archive `encode doc` to
+    disk for yourself, but `encodeFrom (stableFrontier peers doc) doc` to peers so they get
+    a small doc without your whole edit log. Unlike `compact` + `encode`, your live doc keeps
+    every op (undo, time-travel).
+  - **Privacy redaction** — export at a `cut` above the history you must not disclose, so the
+    payload contains no ops (and thus no evidence of edits/authors/prior text) below it.
+
+**What it removes vs. keeps:** it drops the _ops/history_ below `cut`; it does **not** remove
+state that is still live at `cut`. Content that survived to the cut is in the exported base.
+So this scrubs "how the document got here before `cut`", not "data that is currently
+present". Pass a `cut` chosen so the sensitive edits are strictly below it and no longer
+reflected in the live value.
+
+-}
+encodeFrom : Version -> Doc a -> JE.Value
+encodeFrom (Version cut) (Doc d) =
+    let
+        -- pure compaction: fold ≤cut ops into a fresh base, keep the tail — WITHOUT
+        -- installing it back into `self` (the whole point vs. `compact`).
+        ( base1, store1 ) =
+            OpLog.compact d.base cut d.store
+    in
+    snapshotPayload base1 cut (OpLog.ops store1)
+
+
 {-| Whether `have` (a peer's frontier) already includes every op of `needed`
 (our base frontier) — i.e. the peer is not behind our compaction boundary. Each
 base-frontier id must appear in the peer's frontier; since frontiers are causal
@@ -836,6 +870,45 @@ version (Doc d) =
 
         f ->
             Version f
+
+
+{-| Serialize a `Version` (a causal frontier — a small list of op ids) to JSON, so peers
+can exchange their versions. This is what a stable-frontier GC policy needs: each replica
+broadcasts `encodeVersion (version doc)`, and the others feed the decoded versions to
+`stableFrontier` to pick a safe compaction cut. Tiny (a handful of ids), unlike `encode`.
+-}
+encodeVersion : Version -> JE.Value
+encodeVersion (Version frontier) =
+    JE.list Json.encodeOpId frontier
+
+
+{-| Decode a `Version` produced by `encodeVersion`. `Err` on malformed input.
+-}
+decodeVersion : JE.Value -> Result String Version
+decodeVersion value =
+    JD.decodeValue (JD.list Json.opIdDecoder) value
+        |> Result.map Version
+        |> Result.mapError JD.errorToString
+
+
+{-| The **stable frontier** across a set of peer `Version`s (typically the versions of
+every currently-connected replica, including your own): the causal cut every one of them
+has delivered past. Passing this to `compact` is the **multi-replica-safe** GC policy
+(regime 2 in `docs/04-gc.md`) — history below it can be dropped without losing anything a
+listed peer still needs, because an op even one peer is missing stays out of the cut, and
+not-yet-shipped concurrent work is nobody's ancestor.
+
+The library computes the frontier but does **not** decide who is in the list — the app
+gathers connected peers' versions (e.g. each broadcasts its `version`) and passes them.
+The safety is exactly "safe across the listed peers": a peer omitted from the list
+(offline/behind) is caught up by a snapshot transfer when it reconnects (the wire layer
+sends one automatically when a peer is behind `baseFrontier`), so omitting it is not a
+correctness bug, just a smaller cut. An empty list yields an empty cut (compact nothing).
+
+-}
+stableFrontier : List Version -> Doc a -> Version
+stableFrontier peers (Doc d) =
+    Version (OpLog.stableFrontier (List.map (\(Version f) -> f) peers) d.store)
 
 
 {-| Garbage-collect history at a causal cut: fold every op at-or-below `cut`
