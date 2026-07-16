@@ -102,3 +102,60 @@ Merge, ms/merge @400 (baseline → final): demo 22.6→13.1, list 2.07→0.50, t
 
 Everything is now **O(N) / O(N log N)** to build and read. No remaining O(N²) in the
 core container paths.
+
+---
+
+## Random-index churn (arbitrary-position `move`)
+
+The `churn` workload builds a movable list of `n`, then does `n` pseudo-random `move`s —
+each `move` resolves the item id at `from`, the destination anchor, and a home-cell map.
+A single `move` is O(n) (one Fugue-order walk); a batch of `n` is O(n²). This is the
+last O(n²) surface (`WORKLOADS=churn npm run bench`).
+
+Constant-factor fix — resolve the list order **once** per op (`MoveList.resolveOrder`)
+instead of walking it 2–3× (index-of-`from` + destination anchor + home cells):
+
+| n   | before (ms) | after (ms) |
+|-----|------------:|-----------:|
+| 100 |        49.7 |       22.8 |
+| 200 |       213.8 |       97.5 |
+| 400 |       966.4 |      431.5 |
+| 800 |      4303   |     1928   |
+
+~2.2× across the board; still O(n²) (quadruples per doubling). True O(log n) would need a
+balanced order-statistics tree on the convergence-critical Fugue-ordering path — deferred
+(see ROADMAP): single interactive edits are already O(n) and fine; only bulk programmatic
+churn hits the quadratic.
+
+---
+
+## Delta ingest — the demo's per-message path (`npm run delta`)
+
+`decodeInto` a one-edit `encodeSince` delta into a size-`n` doc. The incremental merge
+(docs/12) already folded only the added ops onto the cache, so the *fold* was delta-bound
+— but two pieces of bookkeeping still scanned the whole doc on every merge/decode:
+
+1. **Clock catch-up** — `Node.maxCounter cached` walked the entire materialized tree to
+   advance the Lamport clock (the top named hotspot in the merge profile).
+2. **Added-ops discovery** — `addedOpsInOrder` folded over the whole *merged store* to
+   find which ops were new.
+
+Both are now delta-bound. Clock: `merge` takes `max(local, incoming)` ctx counter (O(1) —
+each `Doc` keeps its `Ctx` ≥ its own stamps, seeds included); the decode path catches up
+over just the incoming ops' stamps (`OpLog.opsMaxCounter`, incl. seeds). Added ops: the
+decode path filters the incoming batch against the prior store (`addedFromCandidates`,
+O(delta)) instead of scanning the merged store.
+
+Delta-decode latency, ms (measured with build cost amortized — high `ITERS`):
+
+| workload | n=100 | n=500 | n=2000 | scaling |
+|----------|------:|------:|-------:|---------|
+| list | 0.012 | 0.015 | 0.030 | **flat (was ~0.08→0.24→1.15, O(n))** |
+| text | 0.018 | 0.019 | 0.030 | **flat** |
+| tree | 0.011 | 0.017 | 0.052 | **flat** |
+| demo | 0.032 | ~0.07 | ~0.07 | **flat** (converges as build amortizes) |
+
+Note: full-document `merge a b` is still O(n) — it unions two whole op stores
+(`Dict.union`) and rediscovers the added ops from the merged store, both intrinsic to
+merging two *complete* docs. The clock fix still roughly halved it (list @1000: 3.11→1.50
+ms). The demo's real transport is delta decode (above), which is now flat.

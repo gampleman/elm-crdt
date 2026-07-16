@@ -10,6 +10,7 @@ module Crdt.Doc.Internal exposing
     , cursorAt, cursorOffset, cursorRange
     , Version, version, readAt
     , historyLength, versionAt, restoreTo
+    , fork, forkAt, Divergence, divergence
     , recordEdit, undo, redo, canUndo, canRedo
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
     , compact
@@ -42,6 +43,7 @@ supported write path — so they live here rather than in the published module.
 @docs cursorAt, cursorOffset, cursorRange
 @docs Version, version, readAt
 @docs historyLength, versionAt, restoreTo
+@docs fork, forkAt, Divergence, divergence
 @docs recordEdit, undo, redo, canUndo, canRedo
 @docs Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
 @docs compact
@@ -282,14 +284,16 @@ mergeWithDiff (Doc local) (Doc incoming) =
             OpLog.applyOps local.cached added
     in
     -- a peer's concurrent append may now sit after our cached last id, so the append
-    -- fast-path is invalidated. The clock must advance past EVERY stamp, including
-    -- register stamps buried in insert-op seeds (which carry counters higher than the
-    -- insert op's own id) — otherwise a later local edit to a peer-created register
-    -- could mint a losing LWW stamp. `Node.maxCounter` walks all of them.
+    -- fast-path is invalidated. The clock must advance past EVERY stamp, else a later
+    -- local edit could mint a colliding/losing id. Both operands are in-memory `Doc`s
+    -- that already keep their `Ctx` counter `>=` every stamp they hold (including the
+    -- register stamps buried in insert-op seeds, which can exceed the insert op's own
+    -- id), so the merged clock is just the larger of the two counters — O(1), no
+    -- whole-tree `Node.maxCounter` scan.
     ( Doc
         { local
             | store = store
-            , ctx = Id.observe (Node.maxCounter cached) local.ctx
+            , ctx = Id.observe (Id.ctxCounter incoming.ctx) local.ctx
             , cached = cached
             , frontier = OpLog.advanceFrontier local.frontier added
             , lastAppend = Nothing
@@ -707,7 +711,7 @@ applyPayload payload (Doc d) =
         OpsPayload incomingOps ->
             -- base unchanged → INCREMENTAL: fold only the added ops onto the existing
             -- cache (preserving referential identity), like `merge`.
-            rebuildIncremental (List.foldl OpLog.insert d.store incomingOps) (Doc d)
+            rebuildIncremental incomingOps (Doc d)
 
         SnapshotPayload snapBase snapFrontier tailOps ->
             if frontierCovers snapFrontier d.baseFrontier && not (frontierCovers d.baseFrontier snapFrontier) then
@@ -727,7 +731,7 @@ applyPayload payload (Doc d) =
             else
                 -- we're at/ahead of the snapshot's base: ignore it, take the tail
                 -- incrementally (base unchanged).
-                rebuildIncremental (List.foldl OpLog.insert d.store tailOps) (Doc d)
+                rebuildIncremental tailOps (Doc d)
 
 
 {-| Re-materialize from a (possibly new) base + store and advance the clock. Used when
@@ -758,16 +762,26 @@ rebuild store base baseFrontier (Doc d) =
     )
 
 
-{-| Ingest `store` (a superset of the current store on the SAME base) by folding only
-the added ops onto the existing cache — the incremental, identity-preserving counterpart
-of `rebuild`, mirroring `merge`. `base`/`baseFrontier` are unchanged. Returns the diff of
-the added ops.
+{-| Ingest a batch of `incomingOps` (a delta, on the SAME base) by folding only the
+genuinely-new ones onto the existing cache — the incremental, identity-preserving
+counterpart of `rebuild`, mirroring `merge`. `base`/`baseFrontier` are unchanged. Returns
+the diff of the added ops.
+
+Everything scales with the **delta size** `k`, not the document `n`: the new ops are found
+by scanning the candidate batch (`addedFromCandidates`, O(k)) rather than the merged store
+(O(n)); the clock catches up over just those ops' stamps (`opsMaxCounter`, O(k)) rather
+than a whole-tree `Node.maxCounter` scan; the frontier advances incrementally. Inserting
+the batch into the store is the only O(k·log n) step, which is intrinsic.
+
 -}
-rebuildIncremental : OpStore -> Doc a -> ( Doc a, Diff )
-rebuildIncremental store (Doc d) =
+rebuildIncremental : List Op -> Doc a -> ( Doc a, Diff )
+rebuildIncremental incomingOps (Doc d) =
     let
         added =
-            OpLog.addedOpsInOrder d.store store
+            OpLog.addedFromCandidates d.store incomingOps
+
+        store =
+            List.foldl OpLog.insert d.store added
 
         cached =
             OpLog.applyOps d.cached added
@@ -777,7 +791,11 @@ rebuildIncremental store (Doc d) =
             | store = store
             , cached = cached
             , frontier = OpLog.advanceFrontier d.frontier added
-            , ctx = Id.observe (Node.maxCounter cached) d.ctx
+
+            -- catch the clock up past the delta's stamps only (O(delta), including seed
+            -- stamps) — not a whole-tree `Node.maxCounter` scan. `d.ctx` already covers
+            -- everything we held before.
+            , ctx = Id.observe (OpLog.opsMaxCounter added) d.ctx
             , lastAppend = Nothing
         }
     , diffFromOps (Id.ctxReplica d.ctx) added
@@ -837,15 +855,44 @@ compact (Version cut) (Doc d) =
     let
         ( base1, store1 ) =
             OpLog.compact d.base cut d.store
+
+        storeEmpty =
+            List.isEmpty (OpLog.ops store1)
+
+        -- When the cut folds in the WHOLE store (`store1` empty — e.g. `compact (version
+        -- doc) doc`), physically drop the now-settled sequence/text tombstones from `base`
+        -- too: no remaining op can anchor to them, so the right-spine rebuild is safe and
+        -- the read model is still identical. With a tail left (`store1` non-empty) a tail
+        -- op could still anchor after a dropped tombstone, so we keep tombstones then.
+        -- (Dropping tombstones has the SAME cross-replica soundness envelope as dropping
+        -- ops — safe below a stable cut; `compact`'s existing contract already owns that.)
+        base2 =
+            if storeEmpty then
+                Node.compactTombstones base1
+
+            else
+                base1
+
+        -- `cached == materialize base store`; with `store1` empty, `base1` IS that
+        -- materialization, so the tombstone-compacted `base2` is the new cache (visible
+        -- value unchanged). With a tail, base/cache are untouched by the tombstone pass.
+        cached1 =
+            if storeEmpty then
+                base2
+
+            else
+                d.cached
     in
     Doc
         { d
-            | base = base1
+            | base = base2
             , store = store1
             , baseFrontier = cut
+            , cached = cached1
 
-            -- `cached`/`ctx` are unchanged: read model is identical and every
-            -- stamp folded into `base1` still contributes to `Node.maxCounter`.
+            -- `ctx` is unchanged: it is stored independently and already exceeds every
+            -- stamp, so dropping tombstone stamps can only lower `Node.maxCounter`, never
+            -- make the clock unsafe.
             , lastAppend = Nothing
         }
 
@@ -923,6 +970,112 @@ are tombstoned forever. Restoring to the current version is a no-op.
 restoreTo : Version -> Doc a -> Doc a
 restoreTo v doc =
     restoreNode [] (stateAt v doc) (state doc) doc
+
+
+{-| Fork an **independent branch** from the current state, editing under a new
+`ReplicaId`. The branch shares this document's whole history, but its future edits
+diverge: edit it freely without touching the original, then bring the two back
+together with `merge` (op-union — a branch merge is just a document merge).
+
+The new replica id is essential. A `Doc` is immutable, so a plain copy would keep
+minting `OpId`s from the _same_ `(replica, counter)` sequence as the original — so an
+edit on the branch and an edit on the mainline would mint the **same id** and collide
+(one silently wins on merge). Re-keying to a distinct replica makes the two sides
+genuinely concurrent, so both survive the merge-back. Pick an id unique among your
+replicas (a fresh random id, or `"<base>-branch"`).
+
+-}
+fork : ReplicaId -> Doc a -> Doc a
+fork branchReplica doc =
+    forkAt branchReplica (version doc) doc
+
+
+{-| Fork a branch from a **past** `Version` rather than the current state — diverge from
+"the state as of then", editing under a new `ReplicaId`. The branch keeps only the ops
+that are causal ancestors of `at` (its history _is_ the mainline up to the fork point);
+everything after the fork point is dropped from the branch. Merge the branch back with
+`merge` when done.
+
+Unlike `restoreTo` (which rewinds the _live_ document onto its own timeline as new
+ops), `forkAt` produces a **separate** document you edit in isolation — the original is
+untouched. This is the building block for "try a change on a branch, compare, then keep
+or discard it".
+
+The branch's clock is preserved (kept ahead of every inherited stamp) but re-keyed to
+`branchReplica`, so its new edits are concurrent with the mainline's — see `fork`.
+Local-only state (undo/redo stacks, checkpoints, append fast-paths) resets: a branch
+starts its own local history.
+
+-}
+forkAt : ReplicaId -> Version -> Doc a -> Doc a
+forkAt branchReplica ((Version cut) as at) (Doc d) =
+    let
+        -- keep only the ops at-or-below the fork point; the branch's history is the
+        -- mainline up to `at`, and it diverges from there.
+        store =
+            OpLog.ancestorsOf cut d.store
+
+        cached =
+            stateAt at (Doc d)
+    in
+    Doc
+        { d
+            | store = store
+            , cached = cached
+            , frontier = OpLog.frontier store
+
+            -- re-key to the branch replica, keeping the clock ahead of every inherited
+            -- stamp so branch edits neither collide with nor lose to mainline edits.
+            , ctx = Id.withReplica branchReplica d.ctx
+
+            -- a branch starts its own local history; shared/replicated state (base,
+            -- baseFrontier, the ops themselves) carries over, local bookkeeping does not.
+            , checkpoints = []
+            , undoStack = []
+            , redoStack = []
+            , idRemap = Dict.empty
+            , lastAppend = Nothing
+            , lastTreeChild = Nothing
+        }
+
+
+{-| How far two documents have diverged: the ops each holds that the other lacks. `ahead`
+is what `branch` would contribute to `mainline` on a merge (the branch's new work);
+`behind` is what `mainline` has that `branch` hasn't seen yet. Both zero ⇒ the two are at
+the same version. Defined purely over the causal DAG, so it is symmetric and
+delivery-order-independent (see `OpLog.opsAfter`).
+-}
+type alias Divergence =
+    { ahead : Int, behind : Int }
+
+
+{-| Compare a `branch` against a `mainline` document: `ahead` = ops on the branch that
+mainline lacks, `behind` = ops on mainline the branch lacks. Use before a merge-back to
+preview the scope of a branch, or to tell whether it is fast-forward (`behind == 0`),
+already-merged (`ahead == 0`), or truly divergent (both nonzero).
+-}
+divergence : { branch : Doc a, mainline : Doc a } -> Divergence
+divergence { branch, mainline } =
+    let
+        (Doc b) =
+            branch
+
+        (Doc m) =
+            mainline
+
+        -- how many ops in `has` are absent from `other` — a plain store set-difference.
+        -- (Not `opsAfter`, which resolves a frontier *within a single store*: the two
+        -- docs have different stores and each other's tips are absent, so frontier
+        -- ancestry can't be walked across them. Op ids are globally unique, so
+        -- membership is the sound cross-store comparison.)
+        onlyIn has other =
+            OpLog.ops has
+                |> List.filter (\o -> not (OpLog.member o.id other))
+                |> List.length
+    in
+    { ahead = onlyIn b.store m.store
+    , behind = onlyIn m.store b.store
+    }
 
 
 {-| Emit one op against the current frontier, advancing the clock and folding it
@@ -3032,23 +3185,6 @@ appendAnchor node =
             lastElemId node
 
 
-{-| The cell/element to anchor _after_ when inserting/moving to visible index `i`
-(i.e. just after the item currently at `i-1`). `Nothing` = head.
--}
-anchorBefore : Int -> Node -> Maybe OpId
-anchorBefore i node =
-    if i <= 0 then
-        Nothing
-
-    else
-        case Node.asMov node of
-            Just ml ->
-                elemIdAt (i - 1) node |> Maybe.andThen (\vid -> MoveList.homeCell vid ml)
-
-            Nothing ->
-                elemIdAt (i - 1) node
-
-
 {-| The cached last-appended id for `target`, if the append fast-path is live for
 exactly this list.
 -}
@@ -3100,8 +3236,30 @@ listMove path from to doc =
         |> Result.andThen
             (\( target, node ) ->
                 case Node.asMov node of
-                    Just _ ->
-                        case elemIdAt from node of
+                    Just ml ->
+                        let
+                            -- Resolve the list order ONCE (a single Fugue walk +
+                            -- home-cell pass) and answer every index/anchor lookup
+                            -- below from these in-memory lists, rather than
+                            -- re-walking the cell order per lookup.
+                            { order, homes } =
+                                MoveList.resolveOrder ml
+
+                            idAt i =
+                                List.drop i order |> List.head
+
+                            -- The anchor to insert *after* the item at visible index
+                            -- `i - 1` (Nothing at the head): its home cell id.
+                            anchorAt i =
+                                if i <= 0 then
+                                    Nothing
+
+                                else
+                                    idAt (i - 1)
+                                        |> Maybe.andThen
+                                            (\vid -> Dict.get (Id.opIdToString vid) homes)
+                        in
+                        case idAt from of
                             Just valueId ->
                                 let
                                     -- We anchor the moved item *after* the item that
@@ -3117,10 +3275,10 @@ listMove path from to doc =
                                             Nothing
 
                                         else if to > from then
-                                            anchorBefore (to + 1) node
+                                            anchorAt (to + 1)
 
                                         else
-                                            anchorBefore to node
+                                            anchorAt to
 
                                     ( id, doc1 ) =
                                         mint doc

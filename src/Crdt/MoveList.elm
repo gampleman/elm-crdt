@@ -1,9 +1,9 @@
 module Crdt.MoveList exposing
     ( MoveList
     , empty, fromParts, cells, values, deletedIds
-    , insert, move, delete, updateValue
+    , insert, move, delete, updateValue, mapValues
     , merge
-    , toList, toEntries, get, homeCell, maxCounter
+    , toList, toEntries, resolveOrder, get, homeCell, maxCounter
     )
 
 {-| A list whose elements can be **moved** (reordered) while keeping their
@@ -29,9 +29,9 @@ argument.
 
 @docs MoveList
 @docs empty, fromParts, cells, values, deletedIds
-@docs insert, move, delete, updateValue
+@docs insert, move, delete, updateValue, mapValues
 @docs merge
-@docs toList, toEntries, get, homeCell, maxCounter
+@docs toList, toEntries, resolveOrder, get, homeCell, maxCounter
 
 -}
 
@@ -132,6 +132,14 @@ updateValue valueId f (MoveList m) =
     MoveList { m | valueOf = Dict.update (Id.opIdToString valueId) (Maybe.map f) m.valueOf }
 
 
+{-| Map `f` over every value's content. Used to recurse tombstone-compaction into nested
+sequences; the cell RGA (which encodes position/move order by id) is left untouched.
+-}
+mapValues : (c -> c) -> MoveList c -> MoveList c
+mapValues f (MoveList m) =
+    MoveList { m | valueOf = Dict.map (\_ v -> f v) m.valueOf }
+
+
 
 -- MERGE ----------------------------------------------------------------------
 
@@ -224,6 +232,43 @@ toEntries (MoveList m) =
 toList : MoveList c -> List c
 toList ml =
     toEntries ml |> List.map Tuple.second
+
+
+{-| The ordered **visible valueIds** together with the home-cell map, from a single
+pass over the cells. The edit layer resolves several visible indices to ids and
+anchors per op (e.g. a `move` needs the id at `from` _and_ the home cell of the item
+at the destination); doing that off one shared traversal avoids re-walking the cell
+order — which is `toElementsInOrder` — once per lookup.
+
+`order` is the visible valueIds in list order; `homes` maps each valueId string to
+its current home cell id (the anchor to insert/move _after_ that value).
+
+-}
+resolveOrder : MoveList c -> { order : List OpId, homes : Dict String OpId }
+resolveOrder (MoveList m) =
+    let
+        homes =
+            homeCells m.cellRga
+
+        order =
+            Rga.toElementsInOrder m.cellRga
+                |> List.filterMap
+                    (\cell ->
+                        let
+                            valueKey =
+                                Id.opIdToString cell.content
+                        in
+                        if
+                            (Dict.get valueKey homes == Just cell.id)
+                                && not (Set.member valueKey m.tombstones)
+                        then
+                            Just cell.content
+
+                        else
+                            Nothing
+                    )
+    in
+    { order = order, homes = homes }
 
 
 {-| A value's content by id (regardless of position; `Nothing` if deleted/absent).

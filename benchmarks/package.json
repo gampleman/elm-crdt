@@ -7,6 +7,7 @@
     "build": "../node_modules/.bin/elm make src/Headless.elm --output headless.js --optimize",
     "bench": "npm run build && node run-bench.js",
     "merge": "npm run build && node run-merge.js",
+    "delta": "npm run build && node run-delta.js",
     "mem": "npm run build && node --expose-gc run-mem.js",
     "wire": "npm run build && node run-wire.js",
     "packed": "npm run build && node run-packed.js",

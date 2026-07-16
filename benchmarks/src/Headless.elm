@@ -17,6 +17,8 @@ Workloads:
   - `"text"` — one rich-text file with `n` typed characters (the hypothesized
     memory hog: one `Node` per character).
   - `"list"` — a movable list of `n` small records.
+  - `"churn"` — a movable list of `n`, then `n` pseudo-random `move`s (the
+    arbitrary-position edit path; a single move is O(n), a batch is O(n²)).
   - `"dict"` — a dict of `n` short text entries.
   - `"tree"` — an outline tree of `n` nodes.
 
@@ -164,6 +166,44 @@ buildList n =
             init
 
 
+{-| Random-index churn: build a movable list of `n` records, then perform `n`
+pseudo-random `move`s. Each `move` resolves two visible indices to element ids and one
+insert-anchor — the arbitrary-position edit path that (before an order index) walks the
+whole RGA per op, so this is the workload that surfaces the O(n²) index-access tail.
+The moves keep the list at constant size, so only the per-op index cost scales with `n`.
+-}
+buildChurn : Int -> Doc Board
+buildChurn n =
+    let
+        list0 =
+            buildList n
+
+        -- a cheap deterministic LCG so the from/to indices roam the whole list
+        step s =
+            modBy 2147483647 (s * 1103515245 + 12345)
+    in
+    List.range 1 n
+        |> List.foldl
+            (\_ ( doc, s ) ->
+                let
+                    s1 =
+                        step s
+
+                    s2 =
+                        step s1
+
+                    from =
+                        modBy n s1
+
+                    to =
+                        modBy n s2
+                in
+                ( C.move refs.todos from to doc |> ok doc, s2 )
+            )
+            ( list0, 1 )
+        |> Tuple.first
+
+
 buildFlat : Int -> Doc Board
 buildFlat n =
     List.range 1 n
@@ -249,6 +289,9 @@ build workload n =
 
         "list" ->
             buildList n
+
+        "churn" ->
+            buildChurn n
 
         "flat" ->
             buildFlat n
@@ -389,6 +432,39 @@ mergeBench workload n iters =
     List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
 
 
+{-| Delta-ingest latency: decode a one-edit `encodeSince` delta into a size-`n` doc
+`iters` times (the demo's real per-incoming-message path — `decodeWithDiff`). Unlike
+full-doc `merge` (which unions two N-sized op stores, inherently O(N)), this is the case
+that _should_ cost O(delta): the payload carries one op. Returns a forced checksum.
+-}
+deltaBench : String -> Int -> Int -> Int
+deltaBench workload n iters =
+    let
+        local =
+            build workload n
+
+        before =
+            Doc.version local
+
+        -- the small wire delta of one more typical edit, as it goes over the socket
+        delta =
+            Doc.encodeSince before (oneMoreEdit workload local)
+
+        -- Elm is strict, so constructing the decoded `Doc` already forces its materialized
+        -- cache; `acc + 1` is enough to keep the decode from being elided. (Avoid
+        -- `Doc.opCount`, which is an O(store) walk that would swamp the O(delta) decode
+        -- we're trying to measure.)
+        once acc =
+            case Doc.decodeInto delta local of
+                Ok _ ->
+                    acc + 1
+
+                Err _ ->
+                    acc
+    in
+    List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
+
+
 {-| Read-latency: `iters` reads of a size-`n` doc, returning a forced checksum. JS times
 the batch and subtracts the build cost (reported separately by "build" mode).
 -}
@@ -427,6 +503,22 @@ main =
                             , ( "n", JE.int cmd.n )
                             , ( "iters", JE.int iters )
                             , ( "checksum", JE.int (mergeBench cmd.workload cmd.n iters) )
+                            ]
+                        )
+                    )
+
+                else if cmd.mode == "delta" then
+                    let
+                        iters =
+                            max 1 cmd.iters
+                    in
+                    ( model
+                    , done
+                        (JE.object
+                            [ ( "workload", JE.string cmd.workload )
+                            , ( "n", JE.int cmd.n )
+                            , ( "iters", JE.int iters )
+                            , ( "checksum", JE.int (deltaBench cmd.workload cmd.n iters) )
                             ]
                         )
                     )

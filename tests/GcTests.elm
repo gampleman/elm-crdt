@@ -16,6 +16,7 @@ import Crdt.Path as Path exposing (Path)
 import Crdt.Schema.Internal as S exposing (Crdt)
 import Expect
 import Fuzz
+import Json.Encode as JE
 import Test exposing (Test, describe, fuzz, test)
 
 
@@ -74,6 +75,16 @@ setTitle s doc =
 addItem : String -> Doc Sample -> Doc Sample
 addItem label doc =
     Doc.listAppend todosPath (itemSchema |> S.with (Item label)) doc |> ok doc
+
+
+removeItem : Int -> Doc Sample -> Doc Sample
+removeItem i doc =
+    Doc.listRemove todosPath i doc |> ok doc
+
+
+bytes : Doc Sample -> Int
+bytes doc =
+    Doc.encode doc |> JE.encode 0 |> String.length
 
 
 read : Doc Sample -> Result S.Error Sample
@@ -304,4 +315,144 @@ suite =
                         Doc.compact (Doc.version once) once
                 in
                 Expect.equal (read once) (read twice)
+        , describe "tombstone compaction (phase 4): a full compact physically drops dead tombstones"
+            [ test "read is unchanged after compacting a heavily-deleted list" <|
+                \_ ->
+                    let
+                        doc =
+                            List.range 1 30
+                                |> List.foldl (\i d -> addItem ("x" ++ String.fromInt i) d) (initDoc "alice")
+                                -- delete the first 25 (index 0 repeatedly), keep 5
+                                |> (\d -> List.range 1 25 |> List.foldl (\_ dd -> removeItem 0 dd) d)
+
+                        compacted =
+                            Doc.compact (Doc.version doc) doc
+                    in
+                    Expect.equal (read doc) (read compacted)
+            , test "byte size collapses to roughly a fresh doc with only the survivors" <|
+                \_ ->
+                    let
+                        deletedHeavy =
+                            List.range 1 30
+                                |> List.foldl (\i d -> addItem ("x" ++ String.fromInt i) d) (initDoc "alice")
+                                |> (\d -> List.range 1 25 |> List.foldl (\_ dd -> removeItem 0 dd) d)
+
+                        compacted =
+                            Doc.compact (Doc.version deletedHeavy) deletedHeavy
+
+                        -- a doc that only ever held the 5 survivors (x26..x30)
+                        freshFive =
+                            List.range 26 30
+                                |> List.foldl (\i d -> addItem ("x" ++ String.fromInt i) d) (initDoc "alice")
+                                |> (\d -> Doc.compact (Doc.version d) d)
+                    in
+                    Expect.all
+                        [ -- the compacted doc must be far smaller than before (tombstones gone)
+                          \_ -> Expect.lessThan (bytes deletedHeavy) (bytes compacted)
+                        , -- and within a small factor of the tombstone-free equivalent
+                          \_ -> Expect.lessThan (bytes freshFive * 2) (bytes compacted)
+                        ]
+                        ()
+            , test "text: deleting most characters then compacting drops the char tombstones" <|
+                \_ ->
+                    let
+                        -- type a long title, then shorten it drastically
+                        doc =
+                            initDoc "alice"
+                                |> setTitle "the quick brown fox jumps over the lazy dog"
+                                |> setTitle "hi"
+
+                        compacted =
+                            Doc.compact (Doc.version doc) doc
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (Ok "hi") (read compacted |> Result.map .title)
+                        , \_ -> Expect.lessThan (bytes doc) (bytes compacted)
+                        ]
+                        ()
+            , test "element identity survives: a cursor on a survivor still resolves after tombstone compaction" <|
+                \_ ->
+                    let
+                        doc =
+                            initDoc "alice"
+                                |> addItem "keep-me"
+                                |> addItem "delete-me"
+                                |> removeItem 1
+
+                        -- cursor into the surviving item's label text
+                        cur =
+                            Doc.cursorAt (Path.root |> Path.field "items" |> Path.index 0 |> Path.field "label") 4 doc
+                                |> Result.toMaybe
+
+                        compacted =
+                            Doc.compact (Doc.version doc) doc
+                    in
+                    case cur of
+                        Just c ->
+                            Doc.cursorOffset c compacted |> Expect.equal (Just 4)
+
+                        Nothing ->
+                            Expect.fail "cursorAt failed"
+            , test "a lagging peer still converges after the other compacted away tombstones" <|
+                \_ ->
+                    let
+                        base =
+                            initDoc "alice" |> addItem "a" |> addItem "b" |> addItem "c"
+
+                        bob =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encode base)
+                                |> Result.withDefault (initDoc "bob")
+
+                        -- alice deletes most, then fully compacts (dropping tombstones)
+                        aliceGc =
+                            base
+                                |> removeItem 0
+                                |> removeItem 0
+                                |> (\d -> Doc.compact (Doc.version d) d)
+
+                        -- bob edits concurrently, then they exchange full state
+                        bobEdit =
+                            bob |> addItem "bob-item"
+
+                        aliceFinal =
+                            aliceGc |> Doc.decodeInto (Doc.encode bobEdit) |> Result.withDefault aliceGc
+
+                        bobFinal =
+                            bobEdit |> Doc.decodeInto (Doc.encode aliceGc) |> Result.withDefault bobEdit
+                    in
+                    Expect.equal (read aliceFinal) (read bobFinal)
+            , test "the read cache stays consistent (== full re-materialize) after tombstone compaction" <|
+                \_ ->
+                    let
+                        doc =
+                            initDoc "alice"
+                                |> addItem "a"
+                                |> addItem "b"
+                                |> addItem "c"
+                                |> removeItem 0
+                                |> setTitle "hi"
+
+                        compacted =
+                            Doc.compact (Doc.version doc) doc
+                    in
+                    Doc.cacheConsistent compacted |> Expect.equal True
+            , fuzz (Fuzz.listOfLengthBetween 1 10 (Fuzz.intRange 0 20)) "fuzz: full compact preserves the read even with deletions mixed in" <|
+                \edits ->
+                    let
+                        doc =
+                            List.foldl applyEdit (initDoc "alice") edits
+                                -- delete whatever is at index 0 a few times (no-op if empty)
+                                |> removeItem 0
+                                |> removeItem 0
+
+                        compacted =
+                            Doc.compact (Doc.version doc) doc
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (read doc) (read compacted)
+                        , \_ -> Doc.cacheConsistent compacted |> Expect.equal True
+                        ]
+                        ()
+            ]
         ]

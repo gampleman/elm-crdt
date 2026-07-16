@@ -1,8 +1,8 @@
 module Crdt.OpLog exposing
     ( Op, Action(..), Target, TargetStep(..), Frontier
     , OpStore, empty, insert, ops, member, merge
-    , causalOrder, applyOps, materialize, addedOpsInOrder, checkout
-    , frontier, advanceFrontier, opsAfter, compact, ancestorKeys
+    , causalOrder, applyOps, opsMaxCounter, materialize, addedOpsInOrder, addedFromCandidates, checkout
+    , frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys
     )
 
 {-| The operation log: the source of truth for an op-log-based document.
@@ -25,8 +25,8 @@ drives it — every document is materialized from an `OpStore`.
 
 @docs Op, Action, Target, TargetStep, Frontier
 @docs OpStore, empty, insert, ops, member, merge
-@docs causalOrder, applyOps, materialize, addedOpsInOrder, checkout
-@docs frontier, advanceFrontier, opsAfter, compact, ancestorKeys
+@docs causalOrder, applyOps, opsMaxCounter, materialize, addedOpsInOrder, addedFromCandidates, checkout
+@docs frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys
 
 -}
 
@@ -274,6 +274,48 @@ applyOps base orderedOps =
     List.foldl applyOp base orderedOps
 
 
+{-| The largest Lamport counter referenced by a batch of ops: each op's own id, plus
+any stamps buried in an insert/move/tree/mark seed (a seed register can carry a counter
+_higher_ than the op's own id — it was minted by a later edit on the source replica).
+
+This is the O(batch) clock catch-up for ingesting a delta of untrusted wire ops, where
+no incoming `Ctx` is available — replacing an O(whole-tree) `Node.maxCounter` scan of the
+materialized result. (Merging two in-memory `Doc`s needs neither: each already keeps its
+`Ctx` past its own stamps, so `max` of the two counters suffices.)
+
+-}
+opsMaxCounter : List Op -> Int
+opsMaxCounter batch =
+    List.foldl (\op acc -> max acc (opMaxCounter op)) 0 batch
+
+
+opMaxCounter : Op -> Int
+opMaxCounter op =
+    let
+        seedMax =
+            case op.action of
+                InsertElem { seed } ->
+                    Node.maxCounter seed
+
+                SetPresence { seed } ->
+                    Node.maxCounter seed
+
+                TreeMove { seed } ->
+                    seed |> Maybe.map Node.maxCounter |> Maybe.withDefault 0
+
+                AddMark { start, end } ->
+                    let
+                        anchorMax a =
+                            a.ref |> Maybe.map Id.opIdCounter |> Maybe.withDefault 0
+                    in
+                    max (anchorMax start) (anchorMax end)
+
+                _ ->
+                    0
+    in
+    max (Id.opIdCounter op.id) seedMax
+
+
 {-| Materialize the whole store onto a base node (the schema's empty structure),
 folding in causal order.
 -}
@@ -315,6 +357,34 @@ addedOpsInOrder prior (OpStore merged) =
                 merged
     in
     causalOrder (OpStore added)
+
+
+{-| The genuinely-new ops among `candidates` (those not already in `prior`), in causal
+order. Like `addedOpsInOrder` but scanning only the **candidate list** rather than the
+whole merged store — so ingesting a delta of `k` ops into an `n`-op store is `O(k)` to
+find the new ops instead of `O(n)`. Use when the incoming ops are already in hand (the
+`decodeInto`/delta path); `addedOpsInOrder` is for when only the merged store is known
+(the `merge` path, which unions two full stores).
+
+Candidates are deduped by id first (idempotent re-delivery of the same op is harmless),
+then causally ordered among themselves — valid relative to the cache for the same reason
+`addedOpsInOrder` is: the deps we drop are exactly the `prior` ops already folded in.
+
+-}
+addedFromCandidates : OpStore -> List Op -> List Op
+addedFromCandidates prior candidates =
+    candidates
+        |> List.foldl
+            (\op acc ->
+                if member op.id prior then
+                    acc
+
+                else
+                    Dict.insert (Id.opIdToString op.id) op acc
+            )
+            Dict.empty
+        |> OpStore
+        |> causalOrder
 
 
 {-| Materialize the state as of a `Frontier`: only ops that are causal ancestors

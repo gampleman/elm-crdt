@@ -3,6 +3,7 @@ module Crdt.Doc exposing
     , merge, encode, decodeInto, encodeSince
     , Diff, Origin, isLocal, originReplica, mergeWithDiff, decodeWithDiff, diffSince
     , Version, version, historyLength, versionAt, restoreTo
+    , fork, forkAt, Divergence, divergence
     , recordEdit, undo, redo, canUndo, canRedo
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
     , compact, opCount
@@ -72,6 +73,30 @@ scrub through the timeline, and restore an earlier version — and because a res
 itself just more edits, it syncs to everyone else too.
 
 @docs Version, version, historyLength, versionAt, restoreTo
+
+
+# Branching
+
+Because history is a shared op DAG (not a linear snapshot), you can **fork** a document
+into an independent branch, edit it in isolation, and later **merge** it back — the merge
+is just an ordinary document merge (op-union converges). Fork from the current state
+(`fork`) or from any past `version` (`forkAt`), then edit the branch freely; the original
+is untouched. `divergence` tells you how far a branch and the mainline have drifted apart
+(and hence whether a merge-back is fast-forward, already-merged, or truly divergent).
+
+A branch must edit under its **own** `ReplicaId` (you pass one to `fork`/`forkAt`), so its
+edits are concurrent with the mainline's and both survive the merge — see `fork`.
+
+    -- try a change on a branch without disturbing the live doc:
+    branch =
+        Doc.fork (Crdt.Id.replica "experiment") model.doc
+            |> applySomeEdits
+
+    -- decide later: keep it (merge back) or just drop `branch` on the floor
+    merged =
+        Doc.merge model.doc branch
+
+@docs fork, forkAt, Divergence, divergence
 
 
 # Undo and redo
@@ -272,6 +297,53 @@ re-created fresh.
 restoreTo : Version -> Doc a -> Doc a
 restoreTo =
     I.restoreTo
+
+
+{-| Fork an **independent branch** from the current state, editing under a fresh
+`ReplicaId`. The branch shares this document's history but diverges from now on: edit it
+without touching the original, then `merge` the two back together.
+
+Give the branch its **own** replica id (distinct from this document's and from any peer's).
+A `Doc` is immutable, so without a new id the branch would keep minting `OpId`s from the
+same `(replica, counter)` sequence as the original — a branch edit and a mainline edit
+would mint the _same_ id and collide (one silently wins on merge). A distinct replica makes
+the two sides genuinely concurrent, so both survive the merge-back.
+
+-}
+fork : Crdt.Id.ReplicaId -> Doc a -> Doc a
+fork =
+    I.fork
+
+
+{-| Fork a branch from a **past** `version` instead of the current state — diverge from
+"the state as of then". The branch keeps the history up to the fork point and drops
+everything after it; the original document is untouched. Contrast `restoreTo`, which
+rewinds the _live_ document onto its own timeline. Edits under the given `ReplicaId` (see
+`fork` for why that matters); merge back with `merge`.
+-}
+forkAt : Crdt.Id.ReplicaId -> Version -> Doc a -> Doc a
+forkAt =
+    I.forkAt
+
+
+{-| How far a branch and the mainline have drifted: `ahead` = edits on the branch the
+mainline lacks, `behind` = edits on the mainline the branch lacks. `ahead == 0` ⇒ nothing
+to merge back; `behind == 0` ⇒ a fast-forward; both `> 0` ⇒ genuinely divergent (the merge
+integrates concurrent work from both sides).
+-}
+type alias Divergence =
+    I.Divergence
+
+
+{-| Compare a branch against the mainline — see `Divergence`. Pass them by name to keep
+the direction unambiguous:
+
+    Doc.divergence { branch = experiment, mainline = model.doc }
+
+-}
+divergence : { branch : Doc a, mainline : Doc a } -> Divergence
+divergence =
+    I.divergence
 
 
 {-| Mark an **undo boundary**: record that the edits between the given past `Version` and

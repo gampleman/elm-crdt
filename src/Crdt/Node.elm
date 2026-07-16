@@ -3,7 +3,7 @@ module Crdt.Node exposing
     , RichNode, MarkOp, MarkAnchor, AnchorSide(..)
     , reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
     , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
-    , merge, maxCounter
+    , merge, maxCounter, compactTombstones
     , reStamp, reStampWithMap
     , Element, RgaNode
     )
@@ -30,7 +30,7 @@ convergence correctness lives here and nowhere else.
 @docs RichNode, MarkOp, MarkAnchor, AnchorSide
 @docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
 @docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
-@docs merge, maxCounter
+@docs merge, maxCounter, compactTombstones
 @docs reStamp, reStampWithMap
 @docs Element, RgaNode
 
@@ -1085,3 +1085,47 @@ rgaMaxCounter rga =
         (\el acc -> max acc (maxCounter el.content))
         (Rga.maxCounter rga)
         (Rga.elements rga)
+
+
+{-| **Physically drop settled tombstones** from the sequence/text RGAs in this tree,
+recursing structurally. `Seq`, `Txt`, and rich-text `.text` are rebuilt from their live
+elements as a right-spine (see `Rga.compactTombstones`) — the visible value is byte-for-byte
+identical, element ids survive (cursors keep resolving), and the dead tombstones are gone.
+Nested sequences inside surviving elements (and inside map entries / movable-list values /
+tree payloads) are compacted too.
+
+**Only sound below a stable cut** every replica has incorporated — dropping a tombstone an
+incoming op still anchors after would dangle it (see `Rga.compactTombstones` /
+`docs/04-gc.md`). The caller (`Doc.gc`, regime 1) owns that.
+
+v1 scope: it does not yet prune a movable-list's or tree's own tombstone **sets** (deleted
+valueIds / nodeIds), only the RGA `.deleted` tombstones of `Seq`/`Txt`/`Rich` — which the
+footprint benchmark shows dominate. Nested content is still recursed into.
+
+-}
+compactTombstones : Node -> Node
+compactTombstones node =
+    case node of
+        Reg _ ->
+            node
+
+        Cnt _ ->
+            node
+
+        Map d ->
+            Map (Dict.map (\_ e -> { e | value = compactTombstones e.value }) d)
+
+        Seq rga ->
+            Seq (Rga.compactTombstones compactTombstones rga)
+
+        Txt rga ->
+            Txt (Rga.compactTombstones compactTombstones rga)
+
+        Rich r ->
+            Rich { r | text = Rga.compactTombstones compactTombstones r.text }
+
+        Mov ml ->
+            Mov (MoveList.mapValues compactTombstones ml)
+
+        Tree t ->
+            Tree (Tree.mapPayloads compactTombstones t)

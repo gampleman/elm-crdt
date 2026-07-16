@@ -1,7 +1,7 @@
 module Crdt.Tree.Internal exposing
     ( Tree
     , empty, fromParts, moves, payloads, deletedIds
-    , move, moveOnly, updateValue, delete
+    , move, moveOnly, updateValue, mapPayloads, delete
     , merge
     , roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter
     , Move
@@ -34,7 +34,7 @@ the tree is a pure function of it. `c` is the node payload (a `Node` in practice
 
 @docs Tree
 @docs empty, fromParts, moves, payloads, deletedIds
-@docs move, moveOnly, updateValue, delete
+@docs move, moveOnly, updateValue, mapPayloads, delete
 @docs merge
 @docs roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter
 @docs Move
@@ -151,6 +151,14 @@ moveOnly moveOp child parent pos (Tree t) =
 updateValue : OpId -> (c -> c) -> Tree c -> Tree c
 updateValue child f (Tree t) =
     Tree { t | payload = Dict.update (Id.opIdToString child) (Maybe.map f) t.payload }
+
+
+{-| Map `f` over every node's payload. Used to recurse tombstone-compaction into nested
+sequences; the move-set (which encodes structure/order) is left untouched.
+-}
+mapPayloads : (c -> c) -> Tree c -> Tree c
+mapPayloads f (Tree t) =
+    Tree { t | payload = Dict.map (\_ v -> f v) t.payload }
 
 
 {-| Delete a node by id (delete-wins; idempotent). Its subtree is dropped at read.

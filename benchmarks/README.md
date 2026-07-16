@@ -62,7 +62,8 @@ npm run all            # bench + merge + mem
 | script          | runner                | measures                                                        |
 | --------------- | --------------------- | --------------------------------------------------------------- |
 | `npm run bench` | `run-bench.js`        | build + read **latency** (ms/op) — the interactive path         |
-| `npm run merge` | `run-merge.js`        | `merge` time integrating a small remote delta                   |
+| `npm run merge` | `run-merge.js`        | full-doc `merge a b` time (unions two whole op stores — O(n))   |
+| `npm run delta` | `run-delta.js`        | `decodeInto` a one-edit delta — the demo's per-message path (O(delta)) |
 | `npm run mem`   | `run-mem.js`          | structural proxies (ops, bytes) + retained heap (`--expose-gc`) |
 | `npm run wire`  | `run-wire.js`         | wire size: raw JSON vs gzip(JSON)                               |
 | `npm run packed`| `run-packed.js`       | + a prototype packed binary format                              |
@@ -73,6 +74,11 @@ npm run all            # bench + merge + mem
 All take `SIZES`, `WORKLOADS` (and where relevant `ITERS`, `REPEAT`, `HEAP_COPIES`) env
 knobs, e.g. `SIZES=100,1000 WORKLOADS=list,tree npm run bench`. The plain-Elm no-CRDT
 baseline is `run-bench.js`'s `plainlist` / `plaintext` workloads.
+
+Note for `run-delta.js`: each measurement builds the size-`n` doc **once** and then times
+`ITERS` decodes against it, so the one-time build is amortized across `ITERS`. For an
+expensive-build workload (`demo`) at large `n`, use a high `ITERS` (e.g. 2000+) or the
+per-decode figure will be inflated by residual build cost, not decode cost.
 
 Results snapshots live in `results/`: `BASELINE.md` (the optimization before/after) and
 `COMPARISON.md` (the vs-Automerge/Loro/no-CRDT tables above, with method).

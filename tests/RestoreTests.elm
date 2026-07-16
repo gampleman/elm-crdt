@@ -339,6 +339,136 @@ suite =
                         (Doc.read ab |> Result.map (\b -> ( b.title, texts b )))
                         (Doc.read ba |> Result.map (\b -> ( b.title, texts b )))
             ]
+        , describe "fork / branch"
+            [ test "editing a branch does not touch the original document" <|
+                \_ ->
+                    let
+                        branch =
+                            Doc.fork (Id.replica "branch") abcDoc
+                                |> (\d -> Doc.listAppend todosPath (todo "X") d |> ok d)
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (Ok [ "A", "B", "C" ]) (Doc.read abcDoc |> Result.map texts)
+                        , \_ -> Expect.equal (Ok [ "A", "B", "C", "X" ]) (Doc.read branch |> Result.map texts)
+                        ]
+                        ()
+            , test "a branch merges back onto the mainline" <|
+                \_ ->
+                    let
+                        branch =
+                            Doc.fork (Id.replica "branch") abcDoc
+                                |> (\d -> Doc.listAppend todosPath (todo "X") d |> ok d)
+
+                        merged =
+                            Doc.merge abcDoc branch
+                    in
+                    Doc.read merged
+                        |> Result.map texts
+                        |> Expect.equal (Ok [ "A", "B", "C", "X" ])
+            , test "concurrent edits on branch and mainline BOTH survive (distinct replica — no id collision)" <|
+                \_ ->
+                    let
+                        -- fork, then edit BOTH sides after the fork point. Under a shared
+                        -- replica id these appends would mint the same OpId and one would
+                        -- be lost; the branch's fresh replica keeps them concurrent.
+                        branch =
+                            Doc.fork (Id.replica "branch") abcDoc
+                                |> (\d -> Doc.listAppend todosPath (todo "fromBranch") d |> ok d)
+
+                        mainline =
+                            Doc.listAppend todosPath (todo "fromMain") abcDoc |> ok abcDoc
+
+                        merged =
+                            Doc.merge mainline branch
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (Ok True) (Doc.read merged |> Result.map (texts >> List.member "fromBranch"))
+                        , \_ -> Expect.equal (Ok True) (Doc.read merged |> Result.map (texts >> List.member "fromMain"))
+                        , \_ -> Expect.equal (Ok 5) (Doc.read merged |> Result.map (.todos >> List.length))
+                        ]
+                        ()
+            , test "merge-back converges regardless of order" <|
+                \_ ->
+                    let
+                        branch =
+                            Doc.fork (Id.replica "branch") abcDoc
+                                |> (\d -> Doc.setText titlePath "Branched" d |> ok d)
+
+                        mainline =
+                            Doc.listAppend todosPath (todo "M") abcDoc |> ok abcDoc
+
+                        ab =
+                            Doc.merge mainline branch
+
+                        ba =
+                            Doc.merge branch mainline
+                    in
+                    Expect.equal
+                        (Doc.read ab |> Result.map (\b -> ( b.title, texts b )))
+                        (Doc.read ba |> Result.map (\b -> ( b.title, texts b )))
+            , test "forkAt a past version drops ops after the fork point, and the original is untouched" <|
+                \_ ->
+                    let
+                        -- fork point is after A,B,C; mainline then adds D
+                        v =
+                            Doc.version abcDoc
+
+                        mainline =
+                            Doc.listAppend todosPath (todo "D") abcDoc |> ok abcDoc
+
+                        -- branch from the pre-D version off the FULL (post-D) doc
+                        branch =
+                            Doc.forkAt (Id.replica "branch") v mainline
+                                |> (\d -> Doc.listAppend todosPath (todo "Y") d |> ok d)
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal (Ok [ "A", "B", "C", "D" ]) (Doc.read mainline |> Result.map texts)
+                        , \_ -> Expect.equal (Ok [ "A", "B", "C", "Y" ]) (Doc.read branch |> Result.map texts)
+                        ]
+                        ()
+            , test "a branch and its unedited origin have zero divergence" <|
+                \_ ->
+                    let
+                        branch =
+                            Doc.fork (Id.replica "branch") abcDoc
+                    in
+                    Doc.divergence { branch = branch, mainline = abcDoc }
+                        |> Expect.equal { ahead = 0, behind = 0 }
+            , test "divergence counts ops each side holds that the other lacks" <|
+                \_ ->
+                    let
+                        -- branch gets one new op (a title char would be several — use a bool)
+                        branch =
+                            Doc.fork (Id.replica "branch") abcDoc
+                                |> (\d -> Doc.listAppend todosPath (todo "X") d |> ok d)
+
+                        -- mainline gets two: append + a counter increment
+                        mainline =
+                            abcDoc
+                                |> (\d -> Doc.listAppend todosPath (todo "P") d |> ok d)
+                                |> (\d -> Doc.increment votesPath 1 d |> ok d)
+
+                        div =
+                            Doc.divergence { branch = branch, mainline = mainline }
+                    in
+                    Expect.all
+                        [ \_ -> Expect.equal 1 div.ahead
+                        , \_ -> Expect.equal 2 div.behind
+                        ]
+                        ()
+            , test "after merging the branch back, the branch is no longer ahead" <|
+                \_ ->
+                    let
+                        branch =
+                            Doc.fork (Id.replica "branch") abcDoc
+                                |> (\d -> Doc.listAppend todosPath (todo "X") d |> ok d)
+
+                        merged =
+                            Doc.merge abcDoc branch
+                    in
+                    (Doc.divergence { branch = branch, mainline = merged }).ahead
+                        |> Expect.equal 0
+            ]
         , describe "restoreTo — identity preservation"
             [ test "a cursor on an unchanged todo still resolves after a restore" <|
                 \_ ->

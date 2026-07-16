@@ -1,7 +1,7 @@
 module Crdt.Id.Internal exposing
     ( ReplicaId, replica, toString
     , OpId, opId, opIdCounter, opIdReplica, compareOpId, opIdToString
-    , Ctx, ctx, nextId, observe, ctxReplica
+    , Ctx, ctx, nextId, observe, ctxReplica, ctxCounter, withReplica
     )
 
 {-| Identity and causality primitives.
@@ -24,7 +24,7 @@ to break ties in last-write-wins registers.
 
 # Clocks
 
-@docs Ctx, ctx, nextId, observe, ctxReplica
+@docs Ctx, ctx, nextId, observe, ctxReplica, ctxCounter, withReplica
 
 -}
 
@@ -128,6 +128,27 @@ ctx r =
 ctxReplica : Ctx -> ReplicaId
 ctxReplica (Ctx r _) =
     r
+
+
+{-| The current Lamport counter of this context. A document keeps its `Ctx` counter
+`>=` every stamp it holds (edits mint from it; merges/decodes advance it past what they
+absorb), so this is an O(1) upper bound on all stamps — used to advance the clock on
+merge without re-scanning the whole materialized tree.
+-}
+ctxCounter : Ctx -> Int
+ctxCounter (Ctx _ c) =
+    c
+
+
+{-| Re-key a context to a different replica, **keeping its clock**. Used when forking a
+branch: the branch inherits the fork point's history (so its clock must stay ahead of
+every inherited stamp) but mints under a distinct replica id, so branch edits and
+mainline edits are concurrent `OpId`s that both survive a merge-back rather than
+colliding on a shared `(replica, counter)`.
+-}
+withReplica : ReplicaId -> Ctx -> Ctx
+withReplica r (Ctx _ c) =
+    Ctx r c
 
 
 {-| Mint a fresh `OpId` and advance the clock. The new id uses the _incremented_

@@ -2,7 +2,7 @@ module Crdt.Rga exposing
     ( Rga, Element, Side(..)
     , empty, element, fromElements, elements, put
     , insertAfter, delete, merge
-    , toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId
+    , toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId, compactTombstones
     , visibleIds, liveCountThrough
     , get, updateElement
     , maxCounter
@@ -40,7 +40,7 @@ equality (`==`) is a sound convergence oracle.
 @docs Rga, Element, Side
 @docs empty, element, fromElements, elements, put
 @docs insertAfter, delete, merge
-@docs toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId
+@docs toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId, compactTombstones
 @docs visibleIds, liveCountThrough
 @docs get, updateElement
 @docs maxCounter
@@ -250,6 +250,44 @@ toList rga =
     toElementsInOrder rga
         |> List.filter (not << .deleted)
         |> List.map .content
+
+
+{-| **Physically drop every tombstone**, re-anchoring the surviving live elements as a
+single **right-spine** — each becomes the right-child of the previous survivor, the first
+a head root. A right-spine is a one-child-per-node chain, so its in-order traversal is
+exactly the chain order: the visible order is preserved verbatim, and every element keeps
+its `id` (so cursors/targets anchored to a survivor still resolve). All `parent` pointers
+now reference another survivor, so nothing dangles. Each survivor's `content` is passed
+through `compactContent`, so nested sequences inside a live element compact too.
+
+This is **not** merge-safe on its own: an incoming op that anchors after a dropped
+tombstone would dangle (Fugue treats a missing parent as a head root, so it would jump to
+the front). Only sound below a **stable** cut every replica has already incorporated — the
+same envelope as `compact`/`gc` discarding ops (see `docs/04-gc.md`). The caller owns that;
+this function just performs the rewrite.
+
+-}
+compactTombstones : (c -> c) -> Rga c -> Rga c
+compactTombstones compactContent rga =
+    let
+        live =
+            toElementsInOrder rga |> List.filter (not << .deleted)
+
+        -- chain each live element after the previous survivor (first = head root),
+        -- keeping id; content recurses; all become Right-children so the spine reads
+        -- in visible order.
+        chained =
+            List.foldl
+                (\el ( prev, acc ) ->
+                    ( Just el.id
+                    , { el | parent = prev, side = Right, content = compactContent el.content } :: acc
+                    )
+                )
+                ( Nothing, [] )
+                live
+                |> Tuple.second
+    in
+    fromElements chained
 
 
 {-| One item of the explicit traversal stack: either **expand** an element's

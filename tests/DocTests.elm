@@ -462,6 +462,29 @@ suite =
                     read b
                         |> Result.map (.todos >> List.map .done)
                         |> Expect.equal (Ok [ True ])
+            , test "same, via in-memory Doc.merge (clock = max of ctx counters, not a tree scan)" <|
+                \_ ->
+                    let
+                        -- A appends a todo; its seed registers carry counters higher
+                        -- than the insert op's own id.
+                        a =
+                            initDoc "alice"
+                                |> (\d -> Doc.listAppend todosPath (todoSchema |> S.with (Todo "from-alice" False)) d |> ok d)
+
+                        donePath =
+                            Path.root |> Path.field "todos" |> Path.index 0 |> Path.field "done"
+
+                        -- B merges A *in memory* (not decode), then toggles `done`. B's
+                        -- clock must have advanced past A's seed stamps or the toggle
+                        -- loses LWW. This exercises the O(1) `max(ctx)` merge clock rule
+                        -- (which must be >= every stamp, including buried seeds).
+                        b =
+                            Doc.merge (initDoc "bob") a
+                                |> (\d -> Doc.setBool donePath True d |> ok d)
+                    in
+                    read b
+                        |> Result.map (.todos >> List.map .done)
+                        |> Expect.equal (Ok [ True ])
             ]
         , describe "counter (PN-counter)"
             [ test "increments accumulate locally" <|

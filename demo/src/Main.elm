@@ -12,8 +12,11 @@ time-travel over the op DAG (`Doc.version` / `C.readAt`).
 
 It exercises the full JSON-like schema (record + movable list + dict + text + rich
 text + tree + sum type + counter + LWW), real WebSocket networking, live
-**presence** (who's here, their tab + cursor), and **collaborative history** (named
-checkpoints + time-travel preview).
+**presence** (who's here, their tab + cursor), **collaborative history** (named
+checkpoints + time-travel preview), and **branching** (`Doc.fork`): the History panel's
+"branch" button forks a private copy you edit without broadcasting, then `merge`s back
+(the branch keeps merging peers in the background via `mainline`, so concurrent work
+survives) or discards.
 
 -}
 
@@ -300,6 +303,13 @@ type alias Model =
     , viewing : Maybe Version -- Just v => time-travel preview (read-only)
     , connected : Bool
 
+    -- Branching (Doc.fork). `Nothing` = normal: `doc` is the live, syncing document.
+    -- `Just main` = we're on a private branch — `doc` is the branch (edited locally but
+    -- NOT broadcast), and `main` holds the mainline aside, still merging peers' ops in
+    -- the background. "Merge to main" folds the branch back and resumes syncing; "discard"
+    -- drops the branch and returns to `main`.
+    , mainline : Maybe (Doc Board)
+
     -- delta sync: the version up to which peers already have our ops, so each
     -- broadcast ships only `encodeSince lastSent` instead of the whole log.
     , lastSent : Version
@@ -399,6 +409,7 @@ init flags =
       , checkpointMsg = ""
       , viewing = Nothing
       , connected = False
+      , mainline = Nothing
       , lastSent = Doc.version doc
       , todosSlice = C.read doc |> Result.map .todos |> Result.withDefault []
       }
@@ -453,6 +464,10 @@ type Msg
     | RestoreHere
     | Undo
     | Redo
+      -- branching (Doc.fork)
+    | ForkBranch
+    | MergeBranch
+    | DiscardBranch
       -- tabs (local view state)
     | SwitchTab Tab
       -- rich-text editor (ProseMirror via custom element)
@@ -739,6 +754,56 @@ update msg model =
                 Nothing ->
                     ( model, Cmd.none )
 
+        ForkBranch ->
+            -- start a private branch off the current state: `doc` becomes the branch
+            -- (edited locally, not broadcast), `mainline` holds the live doc aside so it
+            -- keeps merging peers in the background. Re-key to a distinct replica so
+            -- branch edits don't collide with the mainline's on merge-back.
+            case model.mainline of
+                Just _ ->
+                    ( model, Cmd.none )
+
+                Nothing ->
+                    let
+                        branchReplica =
+                            Crdt.Id.replica (Crdt.Id.replicaToString model.me ++ "-branch")
+                    in
+                    ( { model
+                        | mainline = Just model.doc
+                        , doc = Doc.fork branchReplica model.doc
+                        , viewing = Nothing
+                      }
+                    , Cmd.none
+                    )
+
+        MergeBranch ->
+            -- fold the branch back into the mainline (op-union), resume syncing, and
+            -- broadcast the branch's ops so peers get them too.
+            case model.mainline of
+                Just mainDoc ->
+                    let
+                        merged =
+                            Doc.merge mainDoc model.doc
+                    in
+                    pushDocRerendering model.doc
+                        (refreshSlices (Doc.version mainDoc)
+                            { model | doc = merged, mainline = Nothing }
+                        )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        DiscardBranch ->
+            -- throw the branch away and return to the mainline (which kept syncing).
+            case model.mainline of
+                Just mainDoc ->
+                    ( { model | doc = mainDoc, mainline = Nothing }
+                    , renderEditorIfChanged model.selectedFile model.doc mainDoc
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
         SwitchTab tab ->
             -- flip the visible tab (the viewer's own choice) AND broadcast it as
             -- presence so peers see where we are. If we're opening the Files tab with
@@ -788,33 +853,47 @@ update msg model =
         GotMessage raw ->
             case decodeEnvelope raw of
                 Ok (DocMsg incomingJson) ->
-                    -- decodeInto merges the peer's ops into our log (idempotent).
-                    -- These ops were broadcast to everyone, so advance `lastSent`
-                    -- to avoid echoing them back on our next delta. `decodeWithDiff`
-                    -- also hands back WHAT the peer changed, so we refresh only the
-                    -- touched slices (keeping the rest referentially stable for lazy).
-                    case Doc.decodeWithDiff incomingJson model.doc of
-                        Ok ( doc1, diff ) ->
-                            let
-                                m1 =
-                                    { model | doc = doc1, lastSent = Doc.version doc1 }
+                    case model.mainline of
+                        Just mainDoc ->
+                            -- while branched, a peer's ops belong to the MAINLINE, not our
+                            -- private branch. Merge them into `mainDoc` (held aside) so it
+                            -- stays current; the branch is untouched until we merge/discard.
+                            -- Nothing on screen changes (we're viewing the branch).
+                            case Doc.decodeInto incomingJson mainDoc of
+                                Ok main1 ->
+                                    ( { model | mainline = Just main1 }, Cmd.none )
 
-                                m2 =
-                                    case C.touched refs.todos doc1 diff of
-                                        Just _ ->
-                                            { m1 | todosSlice = C.read doc1 |> Result.map .todos |> Result.withDefault m1.todosSlice }
+                                Err _ ->
+                                    ( model, Cmd.none )
 
-                                        Nothing ->
-                                            m1
-                            in
-                            -- a remote edit may have changed the open file; push the
-                            -- new spans to the editor so ProseMirror reconciles.
-                            ( m2
-                            , renderEditorIfChanged model.selectedFile model.doc doc1
-                            )
+                        Nothing ->
+                            -- decodeInto merges the peer's ops into our log (idempotent).
+                            -- These ops were broadcast to everyone, so advance `lastSent`
+                            -- to avoid echoing them back on our next delta. `decodeWithDiff`
+                            -- also hands back WHAT the peer changed, so we refresh only the
+                            -- touched slices (keeping the rest referentially stable for lazy).
+                            case Doc.decodeWithDiff incomingJson model.doc of
+                                Ok ( doc1, diff ) ->
+                                    let
+                                        m1 =
+                                            { model | doc = doc1, lastSent = Doc.version doc1 }
 
-                        Err _ ->
-                            ( model, Cmd.none )
+                                        m2 =
+                                            case C.touched refs.todos doc1 diff of
+                                                Just _ ->
+                                                    { m1 | todosSlice = C.read doc1 |> Result.map .todos |> Result.withDefault m1.todosSlice }
+
+                                                Nothing ->
+                                                    m1
+                                    in
+                                    -- a remote edit may have changed the open file; push the
+                                    -- new spans to the editor so ProseMirror reconciles.
+                                    ( m2
+                                    , renderEditorIfChanged model.selectedFile model.doc doc1
+                                    )
+
+                                Err _ ->
+                                    ( model, Cmd.none )
 
                 Ok (PresenceMsg incomingJson) ->
                     case Presence.decode peerCodec incomingJson of
@@ -828,9 +907,10 @@ update msg model =
 
                 Ok HelloMsg ->
                     -- a peer just joined: send our full op set AND our presence so
-                    -- they catch up on both the document and who's here / cursors.
+                    -- they catch up on both the document and who's here / cursors. While
+                    -- branched, share the MAINLINE (the shared doc), never our private branch.
                     ( model
-                    , Cmd.batch [ broadcastFull model.doc, broadcastPresence model.presence ]
+                    , Cmd.batch [ broadcastFull (syncDoc model), broadcastPresence model.presence ]
                     )
 
                 Ok (LeftMsg rid) ->
@@ -844,11 +924,12 @@ update msg model =
         ConnectionChanged isUp ->
             -- On (re)connect, exchange full state both ways: push our entire op
             -- set (so peers get anything we did offline) and `hello` (so they
-            -- push theirs). After this, steady-state edits are deltas again.
-            ( { model | connected = isUp, lastSent = Doc.version model.doc }
+            -- push theirs). After this, steady-state edits are deltas again. While
+            -- branched, exchange the MAINLINE, never the private branch.
+            ( { model | connected = isUp, lastSent = Doc.version (syncDoc model) }
             , if isUp then
                 Cmd.batch
-                    [ broadcastFull model.doc
+                    [ broadcastFull (syncDoc model)
                     , sayHello
                     , broadcastPresence model.presence
                     ]
@@ -954,6 +1035,15 @@ outlineEdit edit model =
     recordPush before { model | doc = edit model.doc |> orKeep model.doc }
 
 
+{-| The document that represents our **shared** (syncable) state: the mainline when we're
+on a private branch, otherwise the live `doc`. Used everywhere we send state to peers, so
+an in-progress branch is never leaked over the wire.
+-}
+syncDoc : Model -> Doc Board
+syncDoc model =
+    Maybe.withDefault model.doc model.mainline
+
+
 {-| After any local change, broadcast only the **delta** since our last
 broadcast, then advance `lastSent`. While connected every peer sees every
 broadcast, so this keeps everyone in sync at edit-size bandwidth; fresh peers are
@@ -962,13 +1052,20 @@ caught up by the full-state exchange on connect (see `ConnectionChanged` /
 -}
 pushDoc : Model -> ( Model, Cmd Msg )
 pushDoc model =
-    let
-        now =
-            Doc.version model.doc
-    in
-    ( { model | lastSent = now }
-    , Ports.outgoing (envelope "doc" (Doc.encodeSince model.lastSent model.doc))
-    )
+    case model.mainline of
+        Just _ ->
+            -- on a private branch: keep edits local, don't broadcast. `lastSent` is left
+            -- untouched so the accumulated branch delta ships in one go on merge-back.
+            ( model, Cmd.none )
+
+        Nothing ->
+            let
+                now =
+                    Doc.version model.doc
+            in
+            ( { model | lastSent = now }
+            , Ports.outgoing (envelope "doc" (Doc.encodeSince model.lastSent model.doc))
+            )
 
 
 {-| Like `pushDoc`, but also re-render the editor if the **open file's** contents
@@ -1762,7 +1859,6 @@ viewHeader model board =
         [ h1 [] [ text titleText ]
         , span [ class ("status-badge status-" ++ statusSlug board.status) ]
             [ text (statusLabel board.status) ]
-        , span [ class "replica" ] [ text ("you are " ++ Crdt.Id.replicaToString model.me) ]
         , span
             [ class
                 (if model.connected then
@@ -1810,13 +1906,20 @@ viewTodos readOnly model board =
     div []
         [ h2 [] [ text "Todos" ]
 
-        -- Referential-stability demo: a summary rendered by `Html.Lazy` from the
-        -- STABLE `model.todosSlice` (refreshed only when a change actually touched the
-        -- todos — see `refreshSlices`). Because an unrelated edit (title, a file, the
-        -- counter, a peer's settings change) leaves `todosSlice` referentially
-        -- unchanged, `lazy` skips this view entirely — visible as the ABSENCE of a
-        -- "render:todo-summary" line in the console. Editing the todos DOES re-run it.
-        , Html.Lazy.lazy viewTodoSummary model.todosSlice
+        -- Referential-stability demo: on the LIVE path the summary is rendered by
+        -- `Html.Lazy` from the STABLE `model.todosSlice` (refreshed only when a change
+        -- actually touched the todos — see `refreshSlices`). Because an unrelated edit
+        -- (title, a file, the counter, a peer's settings change) leaves `todosSlice`
+        -- referentially unchanged, `lazy` skips this view entirely — visible as the
+        -- ABSENCE of a "render:todo-summary" line in the console. Editing the todos DOES
+        -- re-run it. During a time-travel PREVIEW (`readOnly`) the slice still tracks the
+        -- live doc, so we summarise the *shown* `board.todos` instead — otherwise the
+        -- count wouldn't match the previewed list below it.
+        , if readOnly then
+            viewTodoSummary board.todos
+
+          else
+            Html.Lazy.lazy viewTodoSummary model.todosSlice
         , ul [ class "todos" ] (List.indexedMap (viewTodo readOnly model) board.todos)
         , if readOnly then
             text ""
@@ -2240,7 +2343,52 @@ viewHistory model =
 
             Nothing ->
                 text ""
+        , viewBranch model
         ]
+
+
+{-| The branching panel. On the mainline it offers a "branch" button (fork the current
+state into a private, non-syncing scratch copy). On a branch it shows a banner, how far
+the branch has diverged from the mainline (`Doc.divergence`), and merge-back / discard
+actions. Edits made while the banner is showing stay local until you merge.
+-}
+viewBranch : Model -> Html Msg
+viewBranch model =
+    case model.mainline of
+        Nothing ->
+            div [ class "branch-row" ]
+                [ button
+                    [ onClick ForkBranch
+                    , A.title "fork a private branch you can edit without affecting others, then merge or discard"
+                    ]
+                    [ text "⑃ branch" ]
+                ]
+
+        Just mainDoc ->
+            let
+                div_ =
+                    Doc.divergence { branch = model.doc, mainline = mainDoc }
+            in
+            div [ class "branch-banner" ]
+                [ div [ class "branch-title" ] [ text "on a private branch" ]
+                , div [ class "branch-detail" ]
+                    [ text
+                        ("your edits are local — "
+                            ++ String.fromInt div_.ahead
+                            ++ " ahead"
+                            ++ (if div_.behind > 0 then
+                                    ", " ++ String.fromInt div_.behind ++ " behind main"
+
+                                else
+                                    ""
+                               )
+                        )
+                    ]
+                , div [ class "branch-actions" ]
+                    [ button [ onClick MergeBranch ] [ text "merge to main" ]
+                    , button [ class "discard-btn", onClick DiscardBranch ] [ text "discard" ]
+                    ]
+                ]
 
 
 {-| A slider over the document's linear op history. Dragging it previews the state
