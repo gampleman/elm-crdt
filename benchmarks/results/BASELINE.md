@@ -207,3 +207,25 @@ So: paste / load / bulk / programmatic text → order-of-magnitude store/heap/wi
 interactive typing → op count unchanged, ops marginally smaller, nothing slower. (Build-CPU
 for `typing` isn't tabulated: the harness re-diffs the growing string on every simulated
 keystroke, so that timing measures the O(n²) *harness loop*, not the library's op path.)
+
+---
+
+## Causal-order linearization (`OpLog.causalOrder`) — history scrubbing
+
+`causalOrder` linearizes the op store for `materialize` / `checkout` / `versionAt`. It was a
+Kahn topological sort whose per-step "find all ready ops" did a `Dict.filter` + a
+dependent-decrement `Dict.map` over the whole store — **O(n²)**. `versionAt` and
+`historyLength` each call it, so history scrubbing (which calls `versionAt` per drag tick)
+crawled once the log passed a few hundred ops.
+
+Replaced with a single ascending-`OpId` sort — **O(n log n)**. This is a valid causal order
+by construction: an op's `deps` are the frontier it was minted against, and `Id.nextId`
+takes a counter strictly greater than everything observed (deps included), so every dep has
+a smaller `OpId` than the op. Ascending id order therefore places every op after its deps —
+exactly a causal order — and equals the old sort's output (which also emitted lowest-ready-id
+each step, and fell back to "remaining by id" for the Lamport-impossible cycle case).
+Convergence/law/fuzz suites stay green.
+
+(The demo compounded this: `scrubPosition` inverted version→step by calling `versionAt`
+across every step each render — O(n) × the sort. Fixed separately by storing the scrub step
+in the model, making it O(1); the library fix above is what makes each `versionAt` cheap.)

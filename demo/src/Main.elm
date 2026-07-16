@@ -306,6 +306,12 @@ type alias Model =
     -- history / version control (checkpoints now live in the doc itself)
     , checkpointMsg : String
     , viewing : Maybe Version -- Just v => time-travel preview (read-only)
+
+    -- The scrubber slider's step, when previewing a version reached by dragging it. Stored
+    -- so the slider thumb is positioned in O(1); inverting version→step by scanning every
+    -- step (`versionAt` each) was O(n²) per render and made scrubbing crawl. `Nothing` while
+    -- live, or while previewing a checkpoint that isn't a scrub step (thumb sits at the end).
+    , scrubStep : Maybe Int
     , connected : Bool
 
     -- Branching (Doc.fork). `Nothing` = normal: `doc` is the live, syncing document.
@@ -426,6 +432,7 @@ init flags =
       , editStartVersion = Nothing
       , checkpointMsg = ""
       , viewing = Nothing
+      , scrubStep = Nothing
       , connected = False
       , mainline = Nothing
       , peerVersions = Dict.empty
@@ -742,14 +749,14 @@ update msg model =
 
         Undo ->
             if Doc.canUndo model.doc then
-                pushDocRerendering model.doc { model | doc = Doc.undo model.doc, viewing = Nothing }
+                pushDocRerendering model.doc { model | doc = Doc.undo model.doc, viewing = Nothing, scrubStep = Nothing }
 
             else
                 ( model, Cmd.none )
 
         Redo ->
             if Doc.canRedo model.doc then
-                pushDocRerendering model.doc { model | doc = Doc.redo model.doc, viewing = Nothing }
+                pushDocRerendering model.doc { model | doc = Doc.redo model.doc, viewing = Nothing, scrubStep = Nothing }
 
             else
                 ( model, Cmd.none )
@@ -772,26 +779,28 @@ update msg model =
             )
 
         PreviewVersion v ->
-            ( { model | viewing = Just v }, Cmd.none )
+            -- previewing a checkpoint: no scrub step (the thumb rests at the live end)
+            ( { model | viewing = Just v, scrubStep = Nothing }, Cmd.none )
 
         LeavePreview ->
-            ( { model | viewing = Nothing }, Cmd.none )
+            ( { model | viewing = Nothing, scrubStep = Nothing }, Cmd.none )
 
         Scrub n ->
             -- scrubbing previews the version after the first `n` ops; dragging to
-            -- the end (n == historyLength) drops back to the live document
+            -- the end (n == historyLength) drops back to the live document. Record `n` as
+            -- the slider position so the view doesn't have to invert version→step.
             if n >= Doc.historyLength model.doc then
-                ( { model | viewing = Nothing }, Cmd.none )
+                ( { model | viewing = Nothing, scrubStep = Nothing }, Cmd.none )
 
             else
-                ( { model | viewing = Just (Doc.versionAt n model.doc) }, Cmd.none )
+                ( { model | viewing = Just (Doc.versionAt n model.doc), scrubStep = Just n }, Cmd.none )
 
         RestoreHere ->
             case model.viewing of
                 Just v ->
                     -- restore emits fresh winning ops, so it syncs like any edit;
                     -- leave the preview and broadcast the revert
-                    pushDocRerendering model.doc { model | doc = Doc.restoreTo v model.doc, viewing = Nothing }
+                    pushDocRerendering model.doc { model | doc = Doc.restoreTo v model.doc, viewing = Nothing, scrubStep = Nothing }
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -814,6 +823,7 @@ update msg model =
                         | mainline = Just model.doc
                         , doc = Doc.fork branchReplica model.doc
                         , viewing = Nothing
+                        , scrubStep = Nothing
                       }
                     , Cmd.none
                     )
@@ -2622,25 +2632,18 @@ viewScrubber model =
             ]
 
 
-{-| The slider's current step: the live end unless we're previewing a version
-reachable by scrubbing, in which case the matching step. (Checkpoint previews that
-don't line up with a scrub step just leave the thumb at the live end.)
+{-| The slider's current step: the recorded `scrubStep` when we're mid-scrub, otherwise
+the live end (also used for a checkpoint preview, which has no scrub step). Reads the stored
+step directly — O(1) — instead of scanning every step to invert version→step.
 -}
 scrubPosition : Model -> Int
 scrubPosition model =
-    let
-        len =
-            Doc.historyLength model.doc
-    in
-    case model.viewing of
-        Nothing ->
-            len
+    case model.scrubStep of
+        Just n ->
+            n
 
-        Just v ->
-            List.range 0 len
-                |> List.filter (\n -> Doc.versionAt n model.doc == v)
-                |> List.head
-                |> Maybe.withDefault len
+        Nothing ->
+            Doc.historyLength model.doc
 
 
 viewCheckpoint : Maybe Version -> Checkpoint -> Html Msg

@@ -194,73 +194,20 @@ once their _present_ deps are satisfied, so a partial store still materializes.
 -}
 causalOrder : OpStore -> List Op
 causalOrder (OpStore d) =
-    let
-        present : Set String
-        present =
-            Set.fromList (Dict.keys d)
-
-        -- count of still-unprocessed deps that are actually in the store
-        initialPending : Op -> Int
-        initialPending op =
-            op.deps
-                |> List.filter (\dep -> Set.member (Id.opIdToString dep) present)
-                |> List.length
-    in
-    kahn d (Dict.map (\_ op -> initialPending op) d) []
-
-
-{-| Kahn's algorithm. `pending` maps each op key to how many in-store deps remain
-unprocessed; we repeatedly emit the lowest-`OpId` op with zero pending and
-decrement its dependents.
--}
-kahn : Dict String Op -> Dict String Int -> List Op -> List Op
-kahn allOps pending acc =
-    let
-        ready =
-            pending
-                |> Dict.filter (\_ n -> n <= 0)
-                |> Dict.keys
-                |> List.filterMap (\k -> Dict.get k allOps)
-                |> List.sortWith (\x y -> Id.compareOpId x.id y.id)
-    in
-    case ready of
-        [] ->
-            -- nothing ready: either done, or a cycle (impossible under Lamport
-            -- deps). Emit any remaining by id to stay total.
-            List.reverse acc
-                ++ (Dict.values (Dict.filter (\k _ -> not (processed acc k)) allOps)
-                        |> List.sortWith (\x y -> Id.compareOpId x.id y.id)
-                   )
-
-        next :: _ ->
-            let
-                nextKey =
-                    Id.opIdToString next.id
-
-                -- remove `next` from pending and decrement everyone depending on it
-                pending1 =
-                    pending
-                        |> Dict.remove nextKey
-                        |> Dict.map
-                            (\k n ->
-                                case Dict.get k allOps of
-                                    Just op ->
-                                        if List.any (\dep -> Id.opIdToString dep == nextKey) op.deps then
-                                            n - 1
-
-                                        else
-                                            n
-
-                                    Nothing ->
-                                        n
-                            )
-            in
-            kahn allOps pending1 (next :: acc)
-
-
-processed : List Op -> String -> Bool
-processed acc key =
-    List.any (\op -> Id.opIdToString op.id == key) acc
+    -- Sorting ascending by `OpId` (counter-major) IS a valid causal linearization, in
+    -- O(n log n). An op's `deps` are the frontier it was minted against, so by Lamport's
+    -- rule (`Id.nextId` takes a counter strictly greater than everything observed, which
+    -- includes all deps) **every dep has a strictly smaller counter than the op** — hence a
+    -- smaller `OpId`. So in ascending-id order every op appears after all its deps, exactly
+    -- what a causal order requires; and among concurrent ops it ties by id, deterministically.
+    --
+    -- This equals the old topological sort's output for well-formed input: that sort emitted
+    -- the lowest-id *ready* op each step, and by the invariant the lowest-id unemitted op is
+    -- always ready (its deps, all smaller-id, are already emitted). Its own fallback for the
+    -- "impossible under Lamport deps" cycle case was likewise "emit remaining by id". So the
+    -- id sort is faithful in every case and drops the O(n²) per-step rescans.
+    Dict.values d
+        |> List.sortWith (\x y -> Id.compareOpId x.id y.id)
 
 
 
