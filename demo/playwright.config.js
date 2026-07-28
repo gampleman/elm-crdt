@@ -6,9 +6,13 @@
 // layer the pure-Elm suite can't reach: the TipTap binding, the caret/reconcile JS,
 // the port round-trip, and genuine two-client convergence over a socket.
 //
-// `webServer` boots two processes before the suite: the WebSocket relay (8080) and a
-// static file server for the built app (8000). The build itself is a global-setup
+// `webServer` boots two processes before the suite: the WebSocket relay (8091) and a
+// static file server for the built app (8100). The build itself is a global-setup
 // step (see global-setup.js) so we always test fresh artifacts.
+//
+// Port 8100 (not 8000) so the suite doesn't collide with a docs-preview server people
+// commonly run on 8000 — reusing that would serve the docs, not the demo, and every test
+// would see a blank app. Both `reuseExistingServer: false` so we always spin up our own.
 
 import { defineConfig, devices } from "@playwright/test";
 
@@ -22,7 +26,7 @@ export default defineConfig({
   reporter: process.env.CI ? "line" : [["list"]],
   globalSetup: "./e2e/global-setup.js",
   use: {
-    baseURL: "http://localhost:8000",
+    baseURL: "http://localhost:8100",
     trace: "retain-on-failure",
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
@@ -34,10 +38,11 @@ export default defineConfig({
       stdout: "ignore",
     },
     {
-      // serve the built app statically; the build runs in global-setup first
-      command: "npx http-server -p 8000 -c-1 --silent .",
-      port: 8000,
-      reuseExistingServer: !process.env.CI,
+      // serve the built app statically on 8100 (not 8000 — see header note); the build
+      // runs in global-setup first. Never reuse an existing server on this port.
+      command: "npx http-server -p 8100 -c-1 --silent .",
+      port: 8100,
+      reuseExistingServer: false,
       stdout: "ignore",
     },
   ],

@@ -481,6 +481,37 @@
       .pm-mount a {
         color: #0984e3;
       }
+      /* Remote peers' carets inside the rich-text editor: a thin colored bar drawn
+         as an inline widget (see remoteCaretsPlugin in crdt-richtext.js), with a small
+         name flag above it that fades unless you hover the editor. `pointer-events:none`
+         so it never intercepts clicks meant for the text. */
+      .pm-mount .ProseMirror {
+        position: relative;
+      }
+      .remote-caret-rt {
+        position: relative;
+        display: inline;
+        margin-left: -1px;
+        border-left: 2px solid;
+        pointer-events: none;
+      }
+      .remote-caret-rt-flag {
+        position: absolute;
+        top: -1.05rem;
+        left: -1px;
+        white-space: nowrap;
+        font-size: 0.65rem;
+        line-height: 1;
+        padding: 1px 4px;
+        border-radius: 3px 3px 3px 0;
+        color: #fff;
+        opacity: 0;
+        transition: opacity 0.15s;
+      }
+      .pm-mount:hover .remote-caret-rt-flag,
+      .remote-caret-rt:hover .remote-caret-rt-flag {
+        opacity: 1;
+      }
       .pm-toolbar-sep {
         width: 1px;
         background: #ddd;

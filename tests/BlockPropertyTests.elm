@@ -26,6 +26,7 @@ indices by one in the wild.
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc.Internal as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id
 import Crdt.Path as Path exposing (Path)
 import Crdt.RichText exposing (Block, Span)
@@ -42,20 +43,22 @@ type alias Sample =
     { body : List Span }
 
 
-type alias DocRefs =
-    { body : Ref Sample C.RichK (List Span) }
+type alias DocDoc =
+    { body : Ref Sample C.RichK (List Span)
+    , schema : C.Schema C.Nested Sample
+    }
 
 
-docDoc : C.RecordRefs Sample DocRefs
+docDoc : DocDoc
 docDoc =
-    C.record Sample DocRefs
+    C.record Sample DocDoc
         |> C.field "body" .body C.richText
         |> C.build
 
 
-refs : DocRefs
+refs : DocDoc
 refs =
-    docDoc.refs
+    docDoc
 
 
 bodyPath : Path
@@ -68,7 +71,7 @@ init =
     Doc.init (Id.replica "prop") docDoc.schema
 
 
-ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
+ok : Doc Sample -> Result Edit.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
@@ -143,13 +146,13 @@ applyEdit edit doc =
                     else
                         modBy (blockLen bi + 1) (abs off)
             in
-            C.splitBlock refs.body bi charOffset doc |> ok doc
+            Edit.splitBlock refs.body bi charOffset doc |> ok doc
 
         MergeAt i ->
-            C.mergeBlock refs.body (clampIndex i) doc |> ok doc
+            Edit.mergeBlock refs.body (clampIndex i) doc |> ok doc
 
         SetType i t ->
-            C.setBlockType refs.body
+            Edit.setBlockType refs.body
                 (clampIndex i)
                 (if t == "" then
                     Nothing
@@ -161,13 +164,13 @@ applyEdit edit doc =
                 |> ok doc
 
         Indent i ->
-            C.indentBlock refs.body (clampIndex i) doc |> ok doc
+            Edit.indentBlock refs.body (clampIndex i) doc |> ok doc
 
         Outdent i ->
-            C.outdentBlock refs.body (clampIndex i) doc |> ok doc
+            Edit.outdentBlock refs.body (clampIndex i) doc |> ok doc
 
         SetBlockText i s ->
-            C.setBlockText refs.body (clampIndex i) s doc |> ok doc
+            Edit.setBlockText refs.body (clampIndex i) s doc |> ok doc
 
 
 runFrom : Doc Sample -> List Edit -> Doc Sample
@@ -179,7 +182,7 @@ runFrom start es =
 -}
 plainStart : Doc Sample
 plainStart =
-    C.setRich refs.body "hello world" init |> ok init
+    Edit.setRich refs.body "hello world" init |> ok init
 
 
 {-| Same text, but block 0 pre-formatted so the **leading marker** exists — the state
@@ -187,7 +190,7 @@ that shifted split indices by one before the fix.
 -}
 formattedStart : Doc Sample
 formattedStart =
-    C.setBlockType refs.body 0 (Just "h1") plainStart |> ok plainStart
+    Edit.setBlockType refs.body 0 (Just "h1") plainStart |> ok plainStart
 
 
 
@@ -291,7 +294,7 @@ invariants start =
 
                     -- set a sentinel that differs from whatever is there
                     edited =
-                        C.setBlockText refs.body target "ZZZ-sentinel" doc |> ok doc
+                        Edit.setBlockText refs.body target "ZZZ-sentinel" doc |> ok doc
 
                     after =
                         blockTexts edited
@@ -333,11 +336,11 @@ invariants start =
                         modBy (len + 1) (abs rawOffset)
 
                 split =
-                    C.splitBlock refs.body bi off start |> ok start
+                    Edit.splitBlock refs.body bi off start |> ok start
 
                 -- the split created a new block at bi+1; merging it back rejoins them
                 mergedBack =
-                    C.mergeBlock refs.body (bi + 1) split |> ok split
+                    Edit.mergeBlock refs.body (bi + 1) split |> ok split
             in
             plainText mergedBack |> Expect.equal (plainText start)
     ]

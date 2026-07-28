@@ -9,6 +9,7 @@ undo of a mark.
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id
 import Crdt.RichText exposing (MarkValue(..), Span)
 import Dict
@@ -20,20 +21,22 @@ type alias Sample =
     { body : List Span }
 
 
-type alias DocRefs =
-    { body : Ref Sample C.RichK (List Span) }
+type alias DocDoc =
+    { body : Ref Sample C.RichK (List Span)
+    , schema : C.Schema C.Nested Sample
+    }
 
 
-docDoc : C.RecordRefs Sample DocRefs
+docDoc : DocDoc
 docDoc =
-    C.record Sample DocRefs
+    C.record Sample DocDoc
         |> C.field "body" .body C.richText
         |> C.build
 
 
-refs : DocRefs
+refs : DocDoc
 refs =
-    docDoc.refs
+    docDoc
 
 
 init : String -> Doc Sample
@@ -41,14 +44,14 @@ init name =
     C.init (Id.replica name) docDoc.schema
 
 
-ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
+ok : Doc Sample -> Result Edit.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
 spans : Doc Sample -> List Span
 spans doc =
-    C.read doc |> Result.map .body |> Result.withDefault []
+    Doc.read doc |> Result.map .body |> Result.withDefault []
 
 
 {-| Compact render: `text{mark,mark=val}` per span, joined by `|`.
@@ -98,7 +101,7 @@ mergeIn from to =
 -}
 withText : String -> Doc Sample
 withText s =
-    C.setRich refs.body s (init "a") |> ok (init "a")
+    Edit.setRich refs.body s (init "a") |> ok (init "a")
 
 
 suite : Test
@@ -110,7 +113,7 @@ suite =
                     let
                         d =
                             withText "hello"
-                                |> (\doc -> C.mark refs.body 1 4 "bold" Flag doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 1 4 "bold" Flag doc |> ok doc)
                     in
                     render d |> Expect.equal "h|ell{bold}|o"
             , test "unmark a sub-range (LWW: the later clear wins)" <|
@@ -118,8 +121,8 @@ suite =
                     let
                         d =
                             withText "hello"
-                                |> (\doc -> C.mark refs.body 0 5 "bold" Flag doc |> ok doc)
-                                |> (\doc -> C.unmark refs.body 2 4 "bold" doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 5 "bold" Flag doc |> ok doc)
+                                |> (\doc -> Edit.unmark refs.body 2 4 "bold" doc |> ok doc)
                     in
                     render d |> Expect.equal "he{bold}|ll|o{bold}"
             , test "two mark types stack" <|
@@ -127,8 +130,8 @@ suite =
                     let
                         d =
                             withText "hi"
-                                |> (\doc -> C.mark refs.body 0 2 "bold" Flag doc |> ok doc)
-                                |> (\doc -> C.mark refs.body 0 2 "italic" Flag doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 2 "bold" Flag doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 2 "italic" Flag doc |> ok doc)
                     in
                     render d |> Expect.equal "hi{bold,italic}"
             ]
@@ -138,7 +141,7 @@ suite =
                     let
                         d =
                             withText "click"
-                                |> (\doc -> C.mark refs.body 0 5 "link" (Value "x.com") doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 5 "link" (Value "x.com") doc |> ok doc)
                     in
                     render d |> Expect.equal "click{link=x.com}"
             , test "concurrent different links converge to the higher-id one" <|
@@ -149,11 +152,11 @@ suite =
 
                         alice =
                             mergeIn base (init "alice")
-                                |> (\doc -> C.mark refs.body 0 4 "link" (Value "alice.com") doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 4 "link" (Value "alice.com") doc |> ok doc)
 
                         bob =
                             mergeIn base (init "bob")
-                                |> (\doc -> C.mark refs.body 0 4 "link" (Value "bob.com") doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 4 "link" (Value "bob.com") doc |> ok doc)
 
                         ab =
                             mergeIn bob alice
@@ -179,11 +182,11 @@ suite =
                     let
                         base =
                             withText "ac"
-                                |> (\doc -> C.mark refs.body 0 2 "bold" Flag doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 2 "bold" Flag doc |> ok doc)
 
                         peer =
                             mergeIn base (init "peer")
-                                |> (\doc -> C.setRich refs.body "abc" doc |> ok doc)
+                                |> (\doc -> Edit.setRich refs.body "abc" doc |> ok doc)
 
                         merged =
                             mergeIn peer base
@@ -195,8 +198,8 @@ suite =
                     let
                         d =
                             withText "hello"
-                                |> (\doc -> C.mark refs.body 1 4 "bold" Flag doc |> ok doc)
-                                |> (\doc -> C.setRich refs.body "ello" doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 1 4 "bold" Flag doc |> ok doc)
+                                |> (\doc -> Edit.setRich refs.body "ello" doc |> ok doc)
                     in
                     render d |> Expect.equal "ell{bold}|o"
             ]
@@ -206,7 +209,7 @@ suite =
                     let
                         alice =
                             withText "hello"
-                                |> (\doc -> C.mark refs.body 0 5 "bold" Flag doc |> ok doc)
+                                |> (\doc -> Edit.mark refs.body 0 5 "bold" Flag doc |> ok doc)
 
                         bob =
                             Doc.decodeInto (Doc.encode alice) (init "bob") |> Result.withDefault (init "bob")
@@ -222,7 +225,7 @@ suite =
                             Doc.version base
 
                         alice =
-                            C.mark refs.body 0 5 "italic" Flag base |> ok base
+                            Edit.mark refs.body 0 5 "italic" Flag base |> ok base
 
                         bob =
                             Doc.decodeInto (Doc.encodeSince before alice) (mergeIn base (init "bob"))
@@ -239,7 +242,7 @@ suite =
 
                         marked =
                             Doc.recordEdit (Doc.version base)
-                                (C.mark refs.body 0 5 "bold" Flag base |> ok base)
+                                (Edit.mark refs.body 0 5 "bold" Flag base |> ok base)
                     in
                     Expect.all
                         [ \_ -> Expect.equal "hello{bold}" (render marked)
@@ -254,7 +257,7 @@ suite =
 
                         marked =
                             Doc.recordEdit (Doc.version base)
-                                (C.mark refs.body 0 5 "bold" Flag base |> ok base)
+                                (Edit.mark refs.body 0 5 "bold" Flag base |> ok base)
 
                         cycled =
                             marked |> Doc.undo |> Doc.redo
@@ -267,7 +270,7 @@ suite =
                     let
                         typed =
                             Doc.recordEdit (Doc.version (init "a"))
-                                (C.setRich refs.body "f" (init "a") |> ok (init "a"))
+                                (Edit.setRich refs.body "f" (init "a") |> ok (init "a"))
 
                         undone =
                             Doc.undo typed
@@ -286,7 +289,7 @@ suite =
                     let
                         typed =
                             Doc.recordEdit (Doc.version (init "a"))
-                                (C.setRich refs.body "hello" (init "a") |> ok (init "a"))
+                                (Edit.setRich refs.body "hello" (init "a") |> ok (init "a"))
 
                         cycled =
                             typed |> Doc.undo |> Doc.redo

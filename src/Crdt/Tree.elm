@@ -78,7 +78,7 @@ type alias Item a =
 
 
 {-| The node's stable id. Pass this to the tree-editing functions in the `Crdt` module
-(`Crdt.moveInto`, `Crdt.removeNode`, …) to say which node you mean; it does not change
+(`Crdt.Edit.moveInto`, `Crdt.Edit.removeNode`, …) to say which node you mean; it does not change
 when the node is moved or edited.
 -}
 itemId : Item a -> OpId

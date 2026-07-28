@@ -76,11 +76,18 @@ export async function readBlocks(page) {
   return page.evaluate(() => {
     const root = document.querySelector("crdt-richtext .ProseMirror");
     if (!root) return [];
-    return Array.from(root.querySelectorAll(":scope > .block")).map((el) => ({
-      type: el.getAttribute("data-type") || "",
-      depth: parseInt(el.getAttribute("data-depth") || "0", 10) || 0,
-      text: el.textContent,
-    }));
+    return Array.from(root.querySelectorAll(":scope > .block")).map((el) => {
+      // Remote-peer caret widgets (`.remote-caret-rt`) are decorations, not document
+      // text — strip them from a clone so their name labels don't pollute the read.
+      // (The CRDT sync reads PM nodes, not DOM, so it's unaffected either way.)
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll(".remote-caret-rt").forEach((c) => c.remove());
+      return {
+        type: el.getAttribute("data-type") || "",
+        depth: parseInt(el.getAttribute("data-depth") || "0", 10) || 0,
+        text: clone.textContent,
+      };
+    });
   });
 }
 

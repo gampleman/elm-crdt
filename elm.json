@@ -7,6 +7,7 @@
     "exposed-modules": [
         "Crdt",
         "Crdt.Doc",
+        "Crdt.Edit",
         "Crdt.Id",
         "Crdt.Cursor",
         "Crdt.Presence",

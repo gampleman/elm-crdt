@@ -1,166 +1,155 @@
 module Crdt exposing
-    ( init, read, readAt
-    , Schema
+    ( Schema
     , int, float, string, bool, counter, register
     , text, richText
     , list, movableList, dict, tree
     , opSet
-    , Ref
-    , RecordRefs, record, field, build
-    , CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
-    , optional, withDefault, map
+    , record, field, build
+    , tuple
+    , custom, variant0, variant1, variant2, variant3, buildCustom
+    , map
+    , optional, withDefault
     , aliasedField, catchAll
+    , init
+    , Ref, Leaf
+    , at
     , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
     , VariantSeed
-    , set, over, increment, switch
-    , append, remove, move
-    , setKey, removeKey
-    , node, addChild, moveInto, moveBefore, moveAfter, removeNode
-    , setRich, mark, unmark
-    , readBlocks, setBlockText, splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock
-    , contribute, retract
-    , at, index, key
-    , cursorAt, cursorOffset
-    , touched, origins
-    , EditError(..), editErrorToString
-    , ReadError, readErrorToString
     )
 
-{-| **Describe your collaborative document, and edit it type-safely.** This is the main
-module: you meet it first and reach for it most.
+{-| **Describe your collaborative document, and edit it type-safely.** By document we generally
+mean the part of your application model you want to sync/collaborate on.
 
-Working with a document is two activities, and they fit together here:
+**Describe its shape as a schema.** A `Schema` value says both what Elm type a
+piece of data reads as and how concurrent edits to it merge. Think of it as the collaborative
+analogue of a JSON decoder.
 
-1.  **Describe its shape once, as a schema.** A `Schema` value says both what Elm type a
-    piece of data reads as and how concurrent edits to it merge — the collaborative
-    analogue of a JSON decoder. You build it from **leaves** (`text`, `counter`, `int`,
-    …) and **containers** (`list`, `dict`, `tree`, …), assembled into **records**
-    (`record`/`field`/`build`) and **custom types** (`custom`/`variant…`).
+**Edit through refs.** The record and custom builders hand you back typed `Ref`s
+alongside the schema — one per field or payload. A `Ref` is a pointer to one editable
+spot, and you edit by passing it to a function like `set` or `increment`.
 
-2.  **Edit through refs.** The record and custom builders hand you back typed **`Ref`s**
-    alongside the schema — one per field or payload. A `Ref` is a pointer to one editable
-    spot, and you edit by passing it to a function like `set` or `increment`.
-
-**Why not just edit the plain record and hand it back?** Because you can't recover an
+_Why not just edit the plain record and hand it back?_ Because you can't recover an
 edit's _intent_ from before/after values, and a CRDT needs that intent to merge. If a
 list goes from `[ a, b ]` to `[ a, c, b ]`, did you insert `c`, or replace `b` with `c`
 and append `b`? Concurrent replicas resolve those two stories differently, so a value
-diff would guess — and peers could guess differently and diverge. If a counter reads `5`
+diff would guess and you might end up with odd results. If a counter reads `5`
 both before and after, was there no edit, or a `+3` and a `-3` that a teammate's
 concurrent `+1` must still be added to? Only the _operation_ (`insert c after a`,
 `increment by 3`) carries what merge needs. A `Ref` names the spot and the edit function
 names the operation, so the library records intent directly instead of reverse-engineering
-it — which is also why there is no `a -> Doc a` "save" function.
+it, which is also why there is no `a -> Doc a` "save" function.
 
-Threading edits through refs also makes them **safe**: each ref carries the kind of data
-it points at, so the compiler rejects a nonsensical edit — `increment` on text, `move` on
-a non-movable list, `set` with the wrong value type — and a field name, written once in
-the schema, can never be mistyped. Mistakes are compile errors, not runtime surprises.
+Threading edits through refs also makes them safe: each ref carries the kind of data
+it points at, so the compiler rejects a nonsensical edit, such as an `increment` on text,
+and a field name, written once in the schema, can never be mistyped.
 
     import Crdt
+    import Crdt.Edit as Edit
 
     type alias Board =
         { title : String, votes : Int }
 
-    type alias BoardRefs =
+    -- one flat bundle: a Ref per field plus a reserved `schema`
+    type alias BoardDoc =
         { title : Crdt.Ref Board Crdt.Settable String
         , votes : Crdt.Ref Board Crdt.Counter Int
+        , schema : Crdt.Schema Crdt.Nested Board
         }
 
-    board : Crdt.RecordRefs Board BoardRefs
+    board : BoardDoc
     board =
-        Crdt.record Board BoardRefs
+        Crdt.record Board BoardDoc
             |> Crdt.field "title" .title Crdt.text
             |> Crdt.field "votes" .votes Crdt.counter
             |> Crdt.build
 
-    -- `board.schema` creates the document; `board.refs` are your edit handles:
+    -- `board.schema` creates the document
+    -- `board.title` / `board.votes` are your edit handles:
     doc =
         Crdt.init (Crdt.Id.replica "alice") board.schema
 
     doc1 =
-        Crdt.set board.refs.title "Trip plan" doc
+        Edit.set board.title "Trip plan" doc
 
     doc2 =
-        Crdt.increment board.refs.votes 1 doc1
+        Edit.increment board.votes 1 doc1
 
-    -- Crdt.increment board.refs.title  =>  a compile error
-
-The one thing to understand about **choosing a leaf** is how it merges when two people
-edit it at once: an `int`/`string`/`bool` is _last-write-wins_ (the latest edit wins), a
-`counter` _sums_ concurrent increments, and `text`/`richText` merge _character by
-character_ so two people typing never clobber each other.
-
-Every editing function returns a `Result EditError (Doc doc)`; the compile-time checks
-make failures rare, and you can usually `Result.withDefault` past one.
+    -- Edit.increment board.title  =>  a compile error
 
 
-# Creating and reading a document
+# Schema
 
-`init` turns a schema into a live document for one replica; `read` gets the current typed
-value back out; `readAt` reads it as it stood at a past `Crdt.Doc.Version`. Everything
-else you do with a document — syncing, history, undo — lives in `Crdt.Doc`.
+A difference between this schema and a typical codec library is that you have
+to decide the correct merge semantics for your data types. The basic `int`, `string`,
+`bool` are _last-write-wins (LWW) registers_, meaning that if there are concurrent edits,
+the last edit wins (and the previous one is overwritten, although it is still accessible
+through history). A `counter` on the other hand _sums_ concurrent modifications.
 
-@docs init, read, readAt
+For example if you are modelling a position in a graphic editor, a LWW register is probably
+what you want: if I move a box to x=40px, and you move it to x=20px at the same time,
+either 40px or 20px are reasonable outcomes, but 60px is not. However, if you have a shared
+shopping cart and I want 2 tacos and you want 3 tacos, we do want to end up with 5 tacos
+in total.
 
-
-# Describing the shape: the schema
+The same applies for `string` vs `text` - both are represented as a simple string, but
+`string` is a LWW register, vs `text` merges edits. `string` is useful for things like
+IDs or URLs, where having both just breaks, `text` is much better for human readable text.
 
 @docs Schema
 
 
-# Simple values
-
-The building blocks. Registers (`int`/`float`/`string`/`bool`) are last-write-wins — a
-concurrent edit is resolved by keeping the most recent write. `counter` instead sums
-concurrent changes, and `register` stores a value of **any** type as a single
-last-write-wins cell.
-
-Registers are the simplest thing to make collaborative, and a good way to adopt CRDTs
-incrementally: take an existing model and, field by field, describe each as a register in
-a `record`. Reach for `register` when a field's type isn't one of the built-in leaves (a
-custom enum, a tuple, a small record you're happy to treat as one indivisible unit).
+## Simple values
 
 @docs int, float, string, bool, counter, register
 
 
-# Collaborative text
+## Collaborative text
 
 @docs text, richText
 
 
-# Collections
+## Collections
 
 @docs list, movableList, dict, tree
 
 
-# Defining your own CRDT
+## Defining your own CRDT
 
 @docs opSet
 
 
-# The ref type
+## Building a record
 
-@docs Ref
-
-
-# Building a record
-
-@docs RecordRefs, record, field, build
+@docs record, field, build
 
 
-# Building a custom type
+## Pairing two schemas
 
-@docs CustomRefs, custom, variant0, variant1, variant2, variant3, buildCustom
+@docs tuple
 
 
-# Evolving a schema over time
+## Building a custom type
 
-Once you have a schema, releases will change it — but with local-first sync, documents
-written by **every past version** are still out there, and peers on old and new schemas
-edit the same document at once. So a schema change can't be a one-shot migration: a newer
-schema must read older documents, an older schema must survive newer ones, and both must
-converge. These combinators make a read **tolerant** of a shape it didn't expect, rather
+@docs custom, variant0, variant1, variant2, variant3, buildCustom
+
+
+## Giving a field your own type
+
+@docs map
+
+
+## Evolving a schema over time
+
+Once you have a schema, releases will change it.
+
+If you are writing an application with a centralized server, incrementing a protocol version
+field and forcing clients to reload may well be the easiest option.
+
+However, if you want true offline capability or decentralization, documents
+written by past versions are still out there, and peers on old and new schemas
+may edit the same document at once. So a schema change shouldn't be a one-shot migration: a newer
+schema should read older documents, an older schema must survive newer ones, and both must
+converge. These combinators make a read _tolerant_ of a shape it didn't expect, rather
 than failing.
 
 The safe, non-breaking changes and the tool for each:
@@ -172,18 +161,42 @@ The safe, non-breaking changes and the tool for each:
     share one document.
   - **Add a variant to a custom type** — declare a `catchAll` so an older peer reads a
     newer variant's tag as a fallback (preserving it) instead of erroring.
-  - **Change a value's representation** (rename an enum, `Int` ↔ `String`) — `map` it in
-    both directions.
+  - **Change a value's representation** (rename an enum, `Int` ↔ `String`) — `map` between
+    the old stored form and the new one.
 
 Removing a field or variant, or changing a field's merge semantics (e.g. `counter` →
-register), are **not** safe to do in place — old peers keep writing the old shape. Treat
-those as a new field alongside the old one.
+register), are _not_ safe to do in place. Treat those as a new field alongside the old one.
 
-@docs optional, withDefault, map
+@docs optional, withDefault
 @docs aliasedField, catchAll
 
 
-# Edit-capability markers
+# Creating a document
+
+`init` turns a schema into a live document for one replica. Reading the value back out
+(`Crdt.Doc.read` / `readAt`) and everything else you do with a document — syncing, history,
+undo — lives in `Crdt.Doc`; changing it lives in `Crdt.Edit`.
+
+@docs init
+
+
+# Pointing into a document
+
+A `Ref` names a spot inside a document — the title field, a list element, a tree node's
+payload. The builders hand you a flat bundle: your field refs, a reserved `.schema`, and —
+for containers — a composer (`.index` / `.key` / `.node`) that points at an element with
+its schema already captured. You compose deeper with `at`, then pass the ref to a
+`Crdt.Edit` function. A ref carries a phantom `kind` marker, so the compiler rejects a
+nonsensical edit (`increment` on text, `move` on a plain list) before it runs.
+
+    refs.todos |> todoList.index 0 |> Crdt.at todo.done
+
+@docs Ref, Leaf
+
+@docs at
+
+
+## Edit-capability markers
 
 Each schema is tagged with a marker describing how its value may be **edited** (a counter
 can be `increment`ed, text typed into, and so on). You rarely write these yourself — they
@@ -193,81 +206,14 @@ a nonsensical edit. They never affect how data reads or merges.
 @docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
 @docs VariantSeed
 
-
-# Editing simple values
-
-@docs set, over, increment, switch
-
-
-# Editing lists
-
-New elements are added at the end with `append`. **To insert elsewhere**, use a
-`movableList` and follow the `append` with a `move` to the target index — the element is
-created at the end, then slid into place, and because a `movableList` element keeps its
-identity the move survives concurrent edits. (A plain `list` has no `move`, so it only
-grows at the end; reach for `movableList` whenever order is something users control.)
-
-    -- insert `todo` as the new element at index 2 of a movable list:
-    doc
-        |> Crdt.append todosRef todoSchema todo
-        |> Result.andThen
-            (\d ->
-                Crdt.move todosRef (List.length (currentTodos d) - 1) 2 d
-            )
-
-@docs append, remove, move
-
-
-# Editing dictionaries
-
-@docs setKey, removeKey
-
-
-# Editing trees
-
-@docs node, addChild, moveInto, moveBefore, moveAfter, removeNode
-
-
-# Editing text and rich text
-
-@docs setRich, mark, unmark
-@docs readBlocks, setBlockText, splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock
-
-
-# Editing your own CRDT types
-
-@docs contribute, retract
-
-
-# Pointing into parts of the document
-
-@docs at, index, key
-
-
-# Cursors that survive concurrent edits
-
-@docs cursorAt, cursorOffset
-
-
-# Reacting to what a merge changed
-
-@docs touched, origins
-
-
-# Errors
-
-@docs EditError, editErrorToString
-@docs ReadError, readErrorToString
-
 -}
 
-import Crdt.Cursor exposing (Cursor)
-import Crdt.Doc as Doc exposing (Diff, Doc, Origin)
+import Crdt.Doc exposing (Doc)
 import Crdt.Doc.Internal as DocI
 import Crdt.Id as Id
-import Crdt.Node as Node
 import Crdt.Path as Path exposing (Path)
-import Crdt.RichText as RichText exposing (MarkValue, Span)
+import Crdt.Ref.Internal as RefI exposing (Ref(..))
+import Crdt.RichText as RichText
 import Crdt.Schema.Internal as SI
 import Crdt.Tree as Tree
 import Dict exposing (Dict)
@@ -276,7 +222,7 @@ import Json.Encode as JE
 
 
 
--- CREATING AND READING A DOCUMENT ---------------------------------------------
+-- CREATING A DOCUMENT ---------------------------------------------------------
 
 
 {-| Create a fresh, empty document from a schema, owned by a replica. Give each
@@ -292,32 +238,15 @@ init =
     DocI.init
 
 
-{-| Read the document's current value through its schema. `Err` only if the stored data
-can't be interpreted by the schema (a genuinely corrupt document); render the error with
-`readErrorToString`.
--}
-read : Doc a -> Result ReadError a
-read =
-    DocI.read
-
-
-{-| Read the value as it stood at a past `Crdt.Doc.Version` — true time-travel, without
-disturbing the live document. Great for previews and history views.
--}
-readAt : Doc.Version -> Doc a -> Result ReadError a
-readAt =
-    DocI.readAt
-
-
 
 -- SCHEMA: DESCRIBING THE DOCUMENT ---------------------------------------------
 
 
 {-| A description of a piece of collaborative data — what Elm type it reads as, and how
 concurrent edits to it merge. Compose small `Schema` values (leaves and containers) into
-the shape of your whole document, the way you compose `elm/json` decoders. The `kind`
-tag records how the value may be edited (see [Edit-capability markers](#Settable)); `a` is
-the Elm type it reads as. Opaque.
+the shape of your whole document. The `kind`
+phantom tag records how the value may be edited (see [Edit-capability markers](#Settable)); `a` is
+the Elm type it reads as.
 -}
 type alias Schema kind a =
     SI.Crdt kind a
@@ -398,63 +327,85 @@ type alias VariantSeed =
     SI.VariantSeed
 
 
+{-| A **leaf bundle** — a schema with nothing to compose into. Every primitive
+(`int`, `text`, `counter`, …) is one. It carries just `.schema`, so it drops into a record
+`field`, a container, or `Crdt.init` the same way any bundle does.
+-}
+type alias Leaf kind a =
+    { schema : Schema kind a }
+
+
+leaf : Schema kind a -> Leaf kind a
+leaf s =
+    { schema = s }
+
+
 {-| An integer LWW register.
 -}
-int : Schema Settable Int
+int : Leaf Settable Int
 int =
-    SI.int
+    leaf SI.int
 
 
 {-| A float LWW register.
 -}
-float : Schema Settable Float
+float : Leaf Settable Float
 float =
-    SI.float
+    leaf SI.float
 
 
 {-| A string LWW register. For collaborative editing use `text`.
 -}
-string : Schema Settable String
+string : Leaf Settable String
 string =
-    SI.string
+    leaf SI.string
 
 
 {-| A boolean LWW register.
 -}
-bool : Schema Settable Bool
+bool : Leaf Settable Bool
 bool =
-    SI.bool
+    leaf SI.bool
 
 
-{-| Collaborative text, read as a `String`, backed by an RGA so concurrent edits merge
-character-wise.
+{-| Collaborative plain text, read as a `String`. Every character is tracked
+individually, so two people typing at once merge character by character rather than
+one overwriting the other — the thing a `string` register (last-write-wins) can't do.
+You edit it like any other field, with `set` to the new whole string; the library diffs
+old→new into the minimal insert/delete operations, so a `set` from `"cat"` to `"cart"`
+is understood as "insert `r`", not a wholesale replace.
+
+Ordering is [Fugue](https://arxiv.org/abs/2305.00583) (Weidner & Kleppmann, 2023),
+which guarantees maximal non-interleaving: when two people type a run of characters at
+the same spot concurrently, each run stays a contiguous block after merging. You get
+`"helloworld"`, never `"hwoelrllod"`. (Fugue refines the classic
+[RGA](https://doi.org/10.1016/j.jpdc.2010.12.006) sequence CRDT, whose single anchor per
+element permits that interleaving.)
+
 -}
-text : Schema Settable String
+text : Leaf Settable String
 text =
-    SI.text
+    leaf SI.text
 
 
 {-| A counter — an integer edited only with `increment` (add or subtract a delta), read
 as its running total.
 
-Reach for it instead of `int` when the value is a **running tally that several people
-change at once** — a vote count, a stock level, a like button. Concurrent increments
-**add up**: if two people each `increment` by 1 at the same time, the total goes up by 2.
+Reach for it instead of `int` when the value is a running tally that several people
+change at once: a vote count, a stock level, a like button. Concurrent increments
+add up: if two people each `increment` by 1 at the same time, the total goes up by 2.
 An `int` register is last-write-wins, so under the same race one of the two `+1`s would be
-silently lost — fine for a value someone _sets_ (a title, a status), wrong for one that
-accumulates. If you never have concurrent changes, or you want to set an exact number
-rather than nudge it, use `int`.
+silently lost.
 
-(It's a [PN-counter](https://crdt.tech/counters) — "positive-negative", since deltas can
-go either way.)
+Implemented as a [PN-counter](https://www.cs.utexas.edu/~rossbach/cs380p/papers/Counters.html#pn-counter---increment-and-decrement-counter).
 
 -}
-counter : Schema Counter Int
+counter : Leaf Counter Int
 counter =
-    SI.counter
+    leaf SI.counter
 
 
-{-| A last-write-wins register holding a value of **any** type, stored as JSON. Give a
+{-| A last-write-wins register holding a value of any type, stored as JSON. Give a
 `default` (what a fresh document reads before anyone writes the field), a JSON encoder,
 and a decoder:
 
@@ -470,189 +421,217 @@ and a decoder:
         Crdt.register Low encodePriority priorityDecoder
 
 The whole value is one cell: two people editing it concurrently don't merge field by
-field — the most recent write wins wholesale. Use it for a field whose type isn't a
-built-in leaf, or that you're happy to treat as one indivisible unit; reach for `record`,
-`list`, `dict` or `text` when you want the parts to merge independently.
+field. Use it for a field whose type isn't a
+built-in primitive, or that you're happy to treat as one indivisible unit.
+
+This can be used as a way to start slowly making an existing application collaborative.
+Start from the top of the document, and make a record there, with all values registers.
+Then you can keep doing this conversion until your whole app can do granular merges.
 
 -}
-register : a -> (a -> JE.Value) -> JD.Decoder a -> Schema Settable a
-register =
-    SI.register
+register : a -> (a -> JE.Value) -> JD.Decoder a -> Leaf Settable a
+register default encode decoder =
+    leaf (SI.register default encode decoder)
 
 
-{-| Make a field's schema **optional** for schema evolution: it reads `Nothing` when the
+{-| Make a field's schema optional for schema evolution: it reads `Nothing` when the
 field is absent (a document written before the field existed) instead of failing, and
 `Just v` when present. Seeding `Nothing` writes no value.
 
     |> Crdt.field "priority" .priority (Crdt.optional prioritySchema)
 
 -}
-optional : Schema kind a -> Schema kind (Maybe a)
-optional =
-    SI.optional
+optional : { s | schema : Schema kind a } -> Leaf kind (Maybe a)
+optional bundle =
+    leaf (SI.optional bundle.schema)
 
 
-{-| Give a field's schema a **default** read when the field is absent: it reads `default`
+{-| Give a field's schema a default read when the field is absent: it reads `default`
 instead of failing, without changing the value type. The real value is minted on first
 write.
 
     |> Crdt.field "priority" .priority (Crdt.withDefault Medium prioritySchema)
 
-It also absorbs the other "the shape evolved" case: if `default` wraps a **custom type**
+It also absorbs the other "the shape evolved" case: if `default` wraps a custom type
 and the stored value is a variant this schema doesn't know (a newer peer added it), the
-read is `default` rather than an error — the collapse-to-a-usable-value strategy for
-forward compatibility. (`catchAll` is the alternative that keeps the unknown tag instead.
+read is `default` rather than an error. (`catchAll` is the alternative that keeps the unknown tag instead.
 Note that re-saving a collapsed value with `switch` loses the original tag, whereas simply
 holding and syncing it preserves it.) Genuinely malformed data still errors.
 
 -}
-withDefault : a -> Schema kind a -> Schema kind a
-withDefault =
-    SI.withDefault
+withDefault : a -> { s | schema : Schema kind a } -> Leaf kind a
+withDefault default bundle =
+    leaf (SI.withDefault default bundle.schema)
 
 
 {-| Transform the value a schema reads and seeds, in **both** directions (`to` on read,
-`from` on seed) — for evolving a value's shape (re-spell an enum, int↔string) while the
-stored data is unchanged. Both directions are required so seeding round-trips.
+`from` on seed). It's the general tool for raising one of the built-in representations
+into a domain type of your own (and lowering it back to store), so you can model a field
+as the type your app actually uses while it merges as a primitive underneath.
 
-    Crdt.map statusFromString statusToString Crdt.string
+    -- store an instant as milliseconds (a plain LWW `int`),
+    -- read it as a `Time.Posix`:
+    time : Crdt.Schema Crdt.Settable Time.Posix
+    time =
+        Crdt.map Time.millisToPosix
+            Time.posixToMillis
+            Crdt.int
+
+The merge semantics are the underlying schema's: mapping `int` gives a last-write-wins
+instant; mapping `counter` would give something that still sums. Both directions are
+required so a seeded value round-trips (`from` then `to` must be identity).
+
+`map` also serves schema evolution re-spelling an enum, or moving a field from `Int`
+to `String` while the stored bytes stay put by mapping between the old representation and
+the new domain type.
 
 -}
-map : (a -> b) -> (b -> a) -> Schema kind a -> Schema kind b
-map =
-    SI.map
+map : (a -> b) -> (b -> a) -> { s | schema : Schema kind a } -> Leaf kind b
+map to from bundle =
+    leaf (SI.map to from bundle.schema)
 
 
-{-| An ordered list of `a`, backed by an RGA.
+{-| An ordered, growable list of `a` (each element is itself described by a sub-schemas). Elements keep a stable identity,
+so a nested edit or a cursor into one survives other people's concurrent insertions and
+deletions elsewhere in the list.
+
+Ordering (and concurrent-insert convergence) is [Fugue](https://arxiv.org/abs/2305.00583),
+the same sequence CRDT `text` uses: two people appending at the same spot get both
+elements, in a deterministic order, with each contiguous run kept intact. Elements can't be
+reordered either, that's what `movableList` is for.
+
 -}
-list : Schema ek a -> Schema (ListK Fixed ek a) (List a)
-list =
-    SI.list
+list :
+    { s | schema : Schema ek a }
+    ->
+        { schema : Schema (ListK Fixed ek a) (List a)
+        , index : Int -> Ref r (ListK mv ek a) (List a) -> Ref r ek a
+        }
+list elem =
+    { schema = SI.list elem.schema
+    , index = \i (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.index i, schema = elem.schema }
+    }
 
 
-{-| A reorderable list of `a` (elements can be moved with `move`, keeping identity).
+{-| Like `list`, but elements can also be reordered with `move` while keeping their
+identity. A nested edit, or a cursor, anchored to an item follows it to its new position.
+Use it for a hand-orderable list (a Kanban column, a playlist, a to-do list you drag to
+rank); use plain `list` when order is fixed by insertion and you never move items
+(`movableList` consumes roughly twice the per item in-memory bookkeeping of `list`,
+so if you don't need it it is more efficient to just use `list`).
+
+Moves converge without the cycles a naive "re-point the previous element" scheme would
+create: an element's position is a stable value, and the latest move wins by
+last-write-wins. Concurrent moves of the same element resolve to one deterministic
+position.
+
 -}
-movableList : Schema ek a -> Schema (ListK Movable ek a) (List a)
-movableList =
-    SI.movableList
+movableList :
+    { s | schema : Schema ek a }
+    ->
+        { schema : Schema (ListK Movable ek a) (List a)
+        , index : Int -> Ref r (ListK mv ek a) (List a) -> Ref r ek a
+        }
+movableList elem =
+    { schema = SI.movableList elem.schema
+    , index = \i (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.index i, schema = elem.schema }
+    }
 
 
-{-| A dictionary of string keys to `a`. Key presence is LWW.
+{-| A dictionary from string keys to values of `a`, read as an Elm `Dict`. Set and remove
+keys with `setKey` / `removeKey`; each value is described by a sub-schema and merges by its
+own rules, so a dict of `text` merges each entry character-wise.
+
+Key **presence** is last-write-wins by timestamp, which makes the set-vs-remove race
+well-defined: if one person removes a key while another edits its value concurrently, the
+later of the two operations wins: remove-then-edit resurrects the key (edit is newer),
+edit-then-remove drops it.
+
 -}
-dict : Schema vk a -> Schema (DictK vk a) (Dict String a)
-dict =
-    SI.dict
+dict :
+    { s | schema : Schema vk a }
+    ->
+        { schema : Schema (DictK vk a) (Dict String a)
+        , key : String -> Ref r (DictK vk a) (Dict String a) -> Ref r vk a
+        }
+dict val =
+    { schema = SI.dict val.schema
+    , key = \k (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.key k, schema = val.schema }
+    }
 
 
-{-| A movable **tree** of `a`: hierarchical, re-parentable, sibling-ordered data. Reads
-as a `Crdt.Tree.Forest a`.
+{-| A movable tree of `a`: hierarchical, re-parentable, sibling-ordered data (an
+outline, a file tree, threaded comments). Reads as a `Crdt.Tree.Forest a`.
+
+Re-parenting is the hard part — two people could concurrently move A under B and B under A,
+which a naive merge would turn into a detached cycle. The tree uses Kleppmann et al.'s
+[replicated-tree move operation](https://martin.kleppmann.com/2021/10/07/crdt-tree-move-operation.html):
+moves are applied in a deterministic global order and any move that would create a cycle is
+skipped identically on every replica, so all replicas derive the same tree. Sibling order
+is a [fractional index](https://www.figma.com/blog/realtime-editing-of-ordered-sequences/)
+(a position value, not an "after node X" pointer), which keeps concurrent reorders from
+cycling.
+
 -}
-tree : Schema ek a -> Schema (TreeK ek a) (Tree.Forest a)
-tree =
-    SI.tree
+tree :
+    { s | schema : Schema ek a }
+    ->
+        { schema : Schema (TreeK ek a) (Tree.Forest a)
+        , node : Id.OpId -> Ref r (TreeK ek a) (Tree.Forest a) -> Ref r ek a
+        }
+tree nodeBundle =
+    { schema = SI.tree nodeBundle.schema
+    , node = \nodeId (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.node nodeId, schema = nodeBundle.schema }
+    }
 
 
-{-| Collaborative **rich (formatted) text**: a character sequence plus Peritext marks.
-Reads as a list of `Crdt.RichText.Span`s; edit with text edits plus `mark`/`unmark`.
+{-| Collaborative rich (formatted) text: a character sequence (merged character-wise,
+like `text`) plus a set of formatting **marks** such as bold, italic, headings, list
+items layered over character ranges. Reads as a list of `Crdt.RichText.Span`s (runs of
+text sharing the same formatting); edit the text with ordinary text edits and the
+formatting with `mark` / `unmark`.
+
+Marks are [Peritext](https://www.inkandswitch.com/peritext/) ranges: each mark is anchored
+to the character identities at its ends, not to numeric offsets, so a mark stays
+attached to the right span as text is inserted or deleted around it — and a bold applied
+concurrently with an insertion at its boundary merges the way a human would expect.
+
 -}
-richText : Schema RichK (List RichText.Span)
+richText : Leaf RichK (List RichText.Span)
 richText =
-    SI.richText
+    leaf SI.richText
 
 
-{-| Define your **own CRDT type** as an operation-based set: contributions (each written
-under its own op-id via `contribute`) folded into a value at read. Convergence is free
-(merge unions contributions); the semantics is your `fold`, which must be a pure,
-order-independent function of the contribution set.
+{-| Define your own CRDT type when none of the built-ins fit. It's an
+operation-based set: each `contribute` writes one contribution (tagged with its own
+op-id), merge simply **unions** the contributions, and a read `fold`s the whole set into
+your value. Because union is commutative, associative, and idempotent, convergence is free
+— you only supply the `fold`, which must be a pure, order-independent function of the set
+(it sees the contributions in no particular order, possibly with duplicates already
+deduped).
+
+This generalizes the built-in accretive CRDTs: `counter` is `opSet` with `fold = List.sum`;
+a max-register, a grow-only set, or an add-wins tally are all a few lines. It cannot express
+things that need coordinated _removal_ or a custom _sequence_ order — those aren't a plain
+union-of-contributions.
 
     -- a grow-only max register
-    maxRegister : Crdt.Schema (Crdt.OpSetK Int) Int
+    maxRegister : Crdt.Leaf (Crdt.OpSetK Int) Int
     maxRegister =
-        Crdt.opSet { contribution = Crdt.int, fold = List.maximum >> Maybe.withDefault 0 }
+        Crdt.opSet
+            { contribution = Crdt.int
+            , fold = List.maximum >> Maybe.withDefault 0
+            }
 
 -}
-opSet : { contribution : Schema ck c, fold : List c -> a } -> Schema (OpSetK c) a
-opSet =
-    SI.opSet
-
-
-
--- ERRORS ----------------------------------------------------------------------
-
-
-{-| Why an edit couldn't be applied — the error type the editing functions return.
-
-The compile-time checks already rule out the _kind_ mistakes (you can't `increment` text,
-or `move` a non-movable list — those don't compile). What's left are the two runtime ways
-a target can fail to resolve against the document's **current** value, both of which you
-can branch on:
-
-  - `PathNotFound where_` — nothing lives at the spot the ref points to right now. Most
-    often a list index or dictionary key that isn't there (perhaps a peer removed it), or
-    a tree node id that has since been deleted. The `String` names the spot.
-  - `WrongNodeType detail` — something is there, but it isn't the kind of value the edit
-    expects (for instance a block edit aimed at a field that turned out not to be rich
-    text). This points at corrupt or mismatched data rather than a normal race, and the
-    `String` describes what was expected.
-
-In practice most call sites treat either as "the edit didn't apply, keep the document as
-it was" and `Result.withDefault doc` past it. Branch on the variants when you want to tell
-the two apart — e.g. ignore a `PathNotFound` (a benign race) but log a `WrongNodeType` (a
-real bug). Render either with `editErrorToString`.
-
--}
-type EditError
-    = PathNotFound String
-    | WrongNodeType String
-
-
-{-| A human-readable description of an `EditError`, for logging or a message. Branch on
-the variants themselves if you need to react differently to each.
--}
-editErrorToString : EditError -> String
-editErrorToString err =
-    case err of
-        PathNotFound s ->
-            "path not found: " ++ s
-
-        WrongNodeType s ->
-            "wrong node type: " ++ s
-
-
-{-| Why reading a document through its schema failed — returned by `read` and `readAt`.
-Unlike an `EditError` this is not a race: it means the stored data doesn't match the
-schema (a genuinely corrupt or incompatible document). Opaque; render with
-`readErrorToString`.
--}
-type alias ReadError =
-    SI.Error
-
-
-{-| A human-readable description of a `ReadError`.
--}
-readErrorToString : ReadError -> String
-readErrorToString =
-    SI.errorToString
-
-
-fromEditError : DocI.Error -> EditError
-fromEditError err =
-    case err of
-        DocI.PathNotFound s ->
-            PathNotFound s
-
-        DocI.WrongNodeType s ->
-            WrongNodeType s
-
-
-mapEdit : Result DocI.Error a -> Result EditError a
-mapEdit =
-    Result.mapError fromEditError
+opSet : { contribution : { s | schema : Schema ck c }, fold : List c -> a } -> Leaf (OpSetK c) a
+opSet config =
+    leaf (SI.opSet { contribution = config.contribution.schema, fold = config.fold })
 
 
 {-| A typed pointer to one editable spot inside a document — a field, a list element, a
 dictionary value, a variant's payload. You get refs from the `record` and `custom`
-builders (as `board.refs.title`) and pass them to the edit functions (`set`, `increment`,
+builders (as `board.title`) and pass them to the edit functions (`set`, `increment`,
 …) to say _where_ to edit.
 
 The three type parameters are what make edits safe, and you rarely write them by hand:
@@ -663,21 +642,18 @@ The three type parameters are what make edits safe, and you rarely write them by
     — which is what lets the compiler accept `increment` only on a `Counter` ref;
   - `a` is the value the spot **reads as**.
 
-Opaque: build refs with the builders, compose them with `at`/`index`/`key`, and edit
-through them.
+Opaque: build refs with the builders, compose them with `at` (and a container bundle's
+`.index`/`.key`/`.node`), and edit through them.
 
 -}
-type Ref r kind a
-    = Ref
-        { path : Path
-        , schema : Schema kind a
-        }
+type alias Ref r kind a =
+    RefI.Ref r kind a
 
 
 {-| Compose refs: descend from a spot of type `sub` into a spot inside it. Reads as
 navigation in a pipe:
 
-    board.refs.status |> at status.refs.archivedReason
+    board.status |> at status.archivedReason
 
 -}
 at : Ref sub innerKind a -> Ref r outerKind sub -> Ref r innerKind a
@@ -692,7 +668,7 @@ at (Ref inner) (Ref outer) =
 {- A ref to positional argument `i` of a custom type's `variant`, with the argument's
    schema. `set`/`over` through it edit the payload iff that variant is currently active
    (silent no-op otherwise). Internal: the `variant1`/`variant2`/`variant3` builders call
-   this to construct the payload refs they hand back in the `CustomRefs`, so the argument
+   this to construct the payload refs they hand back in the `refs` record, so the argument
    index and schema always match the declaration. Not exposed — users get these refs from
    the builder, never build them by hand.
 -}
@@ -706,42 +682,6 @@ variantPayload variant i schema =
                 |> Path.field (SI.variantArgKey variant)
                 |> Path.field (String.fromInt i)
         , schema = schema
-        }
-
-
-{-| A ref to list element at visible index `i`, given the element schema. Compiles
-only for a list ref (`ListK _ ek _`), and the element schema's kind `ek` must match
-the list's. Because Elm can't recover the element schema from the list ref, you
-pass it — usually the same `Schema` you gave `Crdt.list`.
-
-    Crdt.set
-        (todos
-            |> Crdt.index 0 todoSchema
-            |> Crdt.at todoRefs.done
-        )
-        True
-        doc
-
-The index is a runtime position: editing an out-of-range element is a no-op.
-
--}
-index : Int -> Schema ek e -> Ref r (ListK mv ek e) (List e) -> Ref r ek e
-index i elemSchema (Ref container) =
-    Ref
-        { path = container.path |> Path.index i
-        , schema = elemSchema
-        }
-
-
-{-| A ref to dict value at `k`, given the value schema. Compiles only for a dict
-ref (`DictK vk v`), and the value schema's kind `vk` must match the dict's. Editing
-an absent key is a no-op (use `setKey` to create one).
--}
-key : String -> Schema vk v -> Ref r (DictK vk v) dictType -> Ref r vk v
-key k valSchema (Ref container) =
-    Ref
-        { path = container.path |> Path.key k
-        , schema = valSchema
         }
 
 
@@ -767,417 +707,7 @@ stepInto seg path =
 
 
 
--- EDITS -----------------------------------------------------------------------
-
-
-{-| Set the value at a ref. Total across kinds: a present spot is overwritten; a
-sum-type payload ref edits the payload iff that variant is active, else it is a
-silent no-op. Emits minimal ops; a text spot still merges character-wise.
--}
-set : Ref r kind a -> a -> Doc doc -> Result EditError (Doc doc)
-set (Ref r) value doc =
-    DocI.seedNodeAt r.path (SI.with value r.schema) doc
-        |> mapEdit
-
-
-{-| Modify the value at a ref: read it, apply `f`, write it back. No-op if the spot
-doesn't currently resolve (e.g. an inactive variant payload).
--}
-over : Ref r kind a -> (a -> a) -> Doc doc -> Result EditError (Doc doc)
-over (Ref r) f doc =
-    case DocI.subValue r.schema r.path doc of
-        Ok current ->
-            DocI.seedNodeAt r.path (SI.with (f current) r.schema) doc
-                |> mapEdit
-
-        Err _ ->
-            Ok doc
-
-
-{-| Add `delta` to a counter ref. Only compiles for a `Counter` ref, so
-`increment` on a register or text is a **type error**.
--}
-increment : Ref r Counter Int -> Int -> Doc doc -> Result EditError (Doc doc)
-increment (Ref r) delta doc =
-    DocI.increment (refPath (Ref r)) delta doc
-        |> mapEdit
-
-
-{-| Change which **variant** a custom-type value is, seeding the new variant's payload
-from the value you pass. Only compiles for a `Variants` ref (one built by `custom`).
-
-The distinction to keep straight: `switch` moves between variants; a payload `Ref` (one
-the `custom` builder handed you, reached via `at`) edits _inside_ the variant that's
-currently active. Given the `Status` type from `custom`:
-
-    -- switch the whole status from whatever it is to `Archived "old project"`:
-    doc |> Crdt.switch statusRef (Archived "old project")
-
-    -- vs. edit the reason text *within* an already-Archived status (a no-op if the
-    -- status is currently Planning or Active):
-    doc |> Crdt.set (statusRef |> Crdt.at status.refs.archivedReason) "new reason"
-
-So reach for `switch` when the case changes (`Active` → `Archived`), and a payload ref
-when the case stays the same but its contents change. Which variant is active merges
-last-write-wins.
-
--}
-switch : Ref r (Variants v) v -> v -> Doc doc -> Result EditError (Doc doc)
-switch (Ref r) value doc =
-    DocI.seedNodeAt r.path (SI.with value r.schema) doc
-        |> mapEdit
-
-
-{-| Replace the character content of a **rich-text** ref (a minimal text diff, like
-`set` on plain text). Marks are preserved and follow the surviving characters. Only
-compiles for a `RichK` ref.
--}
-setRich : Ref r RichK (List Span) -> String -> Doc doc -> Result EditError (Doc doc)
-setRich (Ref r) value doc =
-    DocI.setRichText r.path value doc
-        |> mapEdit
-
-
-{-| Read a rich-text ref as **blocks** (type + depth + spans + marker id), rather
-than the flat `List Span` the schema decodes to. Used to resolve a block index to its
-marker `OpId` for the block edits. See [`Crdt.RichText.Block`](Crdt-RichText#Block).
--}
-readBlocks : Ref r RichK (List Span) -> Doc doc -> Result EditError (List RichText.Block)
-readBlocks (Ref r) doc =
-    DocI.readBlocks r.path doc
-        |> mapEdit
-
-
-{-| Apply a formatting mark of kind `type_` (e.g. `"bold"`, `"link"`) with `value`
-over the visible character range `[from, to)` of a rich-text ref. Use
-`RichText.Flag` for boolean marks (bold/italic/…) and `RichText.Value href` for value
-marks (link/color). Only compiles for a `RichK` ref.
--}
-mark : Ref r RichK (List Span) -> Int -> Int -> String -> MarkValue -> Doc doc -> Result EditError (Doc doc)
-mark (Ref r) from to type_ value doc =
-    DocI.mark r.path from to type_ (markPrim value) doc
-        |> mapEdit
-
-
-{-| Clear mark `type_` over the visible range `[from, to)` of a rich-text ref.
--}
-unmark : Ref r RichK (List Span) -> Int -> Int -> String -> Doc doc -> Result EditError (Doc doc)
-unmark (Ref r) from to type_ doc =
-    DocI.clearMark r.path from to type_ doc
-        |> mapEdit
-
-
-{-| Split at a block-relative caret: `charOffset` characters into block `blockIndex`
-(0 = the leading block). Inserts a block boundary there.
--}
-splitBlock : Ref r RichK (List Span) -> Int -> Int -> Doc doc -> Result EditError (Doc doc)
-splitBlock (Ref r) blockIndex charOffset doc =
-    DocI.splitBlock r.path blockIndex charOffset doc
-        |> mapEdit
-
-
-{-| Replace the text of **block `blockIndex`** (a minimal diff scoped to that block's
-characters), leaving marks and other blocks untouched. This is what an editor should
-call per keystroke so typed text lands inside the right block (unlike `setRich`, which
-diffs the whole document and can misplace text across a block boundary).
--}
-setBlockText : Ref r RichK (List Span) -> Int -> String -> Doc doc -> Result EditError (Doc doc)
-setBlockText (Ref r) blockIndex value doc =
-    DocI.setBlockText r.path blockIndex value doc
-        |> mapEdit
-
-
-{-| Merge block `blockIndex` into the previous block (tombstones its marker). No-op on
-block 0.
--}
-mergeBlock : Ref r RichK (List Span) -> Int -> Doc doc -> Result EditError (Doc doc)
-mergeBlock (Ref r) blockIndex doc =
-    DocI.mergeBlock r.path blockIndex doc
-        |> mapEdit
-
-
-{-| Set (`Just t`) or clear (`Nothing`) the app-defined type of block `blockIndex`.
-`type_` is an opaque string the library never interprets.
--}
-setBlockType : Ref r RichK (List Span) -> Int -> Maybe String -> Doc doc -> Result EditError (Doc doc)
-setBlockType (Ref r) blockIndex maybeType doc =
-    DocI.setBlockType r.path blockIndex maybeType doc
-        |> mapEdit
-
-
-{-| Indent (raise depth by one) block `blockIndex`.
--}
-indentBlock : Ref r RichK (List Span) -> Int -> Doc doc -> Result EditError (Doc doc)
-indentBlock (Ref r) blockIndex doc =
-    DocI.indentBlock r.path blockIndex doc
-        |> mapEdit
-
-
-{-| Outdent (lower depth by one, min 0) block `blockIndex`.
--}
-outdentBlock : Ref r RichK (List Span) -> Int -> Doc doc -> Result EditError (Doc doc)
-outdentBlock (Ref r) blockIndex doc =
-    DocI.outdentBlock r.path blockIndex doc
-        |> mapEdit
-
-
-markPrim : MarkValue -> Node.Prim
-markPrim value =
-    case value of
-        RichText.Flag ->
-            Node.PBool True
-
-        RichText.Value s ->
-            Node.PString s
-
-
-{-| Did the spot this `ref` points at — or anything under it, or a container it lives in
-— change in `diff`, and if so who changed it? You ask with the same refs you write
-through; the `Origin` in a `Just` tells you whether the change was `Local` or from a
-particular remote replica. `doc` is the post-merge document.
-
-Use it to _react_ to an incoming change (your `view` already reflects the new state):
-for instance, to flash a highlight on a field a collaborator just touched.
-
-    ( doc1, diff ) =
-        Doc.mergeWithDiff model.doc incoming
-
-    highlightTitle =
-        case Crdt.touched board.refs.title doc1 diff of
-            Just origin ->
-                not (Doc.isLocal origin)
-
-            Nothing ->
-                False
-
--}
-touched : Ref r kind a -> Doc doc -> Diff -> Maybe Origin
-touched (Ref r) doc diff =
-    DocI.diffTouches r.path doc diff
-
-
-{-| Every `Origin` that contributed a change to `diff` — a quick "was there any remote
-edit, and whose?" without threading refs.
--}
-origins : Diff -> List Origin
-origins diff =
-    DocI.diffOrigins diff
-
-
-{-| The underlying path of a ref (used internally).
--}
-refPath : Ref r kind a -> Path
-refPath (Ref r) =
-    r.path
-
-
-
--- LIST OPS --------------------------------------------------------------------
-
-
-{-| Append a value to the end of a list ref, seeded through the element schema.
-Compiles for any list (`ListK _ ek e`).
--}
-append : Ref r (ListK mv ek e) (List e) -> Schema ek e -> e -> Doc doc -> Result EditError (Doc doc)
-append (Ref r) elemSchema value doc =
-    DocI.listAppend r.path (SI.with value elemSchema) doc
-        |> mapEdit
-
-
-{-| Remove the element at visible index `i` from a list ref.
--}
-remove : Ref r (ListK mv ek e) (List e) -> Int -> Doc doc -> Result EditError (Doc doc)
-remove (Ref r) i doc =
-    DocI.listRemove r.path i doc
-        |> mapEdit
-
-
-{-| Move the element at visible index `from` to index `to`. Compiles **only** for a
-`Movable` list (`ListK Movable …`) — calling it on a plain `list` is a type error.
-The moved item keeps its identity (nested edits and cursors follow it).
--}
-move : Ref r (ListK Movable ek e) (List e) -> Int -> Int -> Doc doc -> Result EditError (Doc doc)
-move (Ref r) from to doc =
-    DocI.listMove r.path from to doc
-        |> mapEdit
-
-
-
--- DICT OPS --------------------------------------------------------------------
-
-
-{-| Set (create or overwrite) a dict key to a value, seeded through the value
-schema. Compiles for a dict ref (`DictK vk v`).
--}
-setKey : Ref r (DictK vk v) dictType -> Schema vk v -> String -> v -> Doc doc -> Result EditError (Doc doc)
-setKey (Ref r) valSchema k value doc =
-    DocI.setKey r.path k (SI.with value valSchema) doc
-        |> mapEdit
-
-
-{-| Remove a dict key (LWW tombstone).
--}
-removeKey : Ref r (DictK vk v) dictType -> String -> Doc doc -> Result EditError (Doc doc)
-removeKey (Ref r) k doc =
-    DocI.removeKey r.path k doc
-        |> mapEdit
-
-
-
--- OP-SET (user-defined CRDT) --------------------------------------------------
-
-
-{-| Add a **contribution** to a user-defined op-set CRDT (`opSet`). Only compiles for an
-`OpSetK` ref. Pass the same `contribution` schema you gave `opSet` and a contribution
-value; it is written under a fresh op-id, so concurrent contributions from any replicas
-all survive and the op-set's `fold` sees them all. Returns the contribution's key (its
-op-id string), which you can keep to `retract` exactly that contribution later.
-
-    case Crdt.contribute board.refs.highScore Crdt.int 42 doc of
-        Ok ( key, doc1 ) ->
-            -- keep `key` if you'll want to `retract` this contribution later
-            ...
-
-        Err _ ->
-            ...
-
--}
-contribute : Ref r (OpSetK c) a -> Schema ck c -> c -> Doc doc -> Result EditError ( String, Doc doc )
-contribute (Ref r) contributionSchema value doc =
-    DocI.contribute r.path (SI.with value contributionSchema) doc
-        |> mapEdit
-
-
-{-| Take back **one specific contribution** you previously added to an op-set, so it no
-longer counts toward the folded value.
-
-An op-set is a bag of individual contributions, each written under its own id (see
-`opSet` / `contribute`). `retract` removes one by that id — the `key` string that
-`contribute` handed back — not by its value. So you must **keep the key** from the
-`contribute` you want to be able to undo; retracting isn't "remove a `5` from the set",
-it's "remove _the contribution I made at that moment_". Retracting a key you don't hold
-(or one already retracted) is a harmless no-op.
-
-Under the hood it's a last-write-wins presence flip on that contribution — it converges
-like any edit and can itself be re-added, and it's what turns a grow-only op-set into one
-you can shrink. After retraction the op-set's `fold` runs over the remaining
-contributions only.
-
-    -- a shopping cart as an add-wins set of item ids:
-    cart =
-        Crdt.opSet { contribution = Crdt.string, fold = dedupe }
-
-    -- add an item, remembering the key so it can be removed later:
-    ( appleKey, doc1 ) =
-        Crdt.contribute cartRef Crdt.string "apple" doc
-            |> Result.withDefault ( "", doc )
-
-    -- …the shopper removes it again:
-    doc2 =
-        Crdt.retract cartRef appleKey doc1
-            |> Result.withDefault doc1
-
-If you want removal keyed by value rather than by contribution id, keep your own
-`Dict value key` alongside the document and look the key up when removing.
-
--}
-retract : Ref r (OpSetK c) a -> String -> Doc doc -> Result EditError (Doc doc)
-retract (Ref r) contributionKey doc =
-    DocI.retract r.path contributionKey doc
-        |> mapEdit
-
-
-
--- TREE OPS --------------------------------------------------------------------
--- Node ids come from reading the tree (`Crdt.Tree.itemId`); pass them to these.
-
-
-{-| A payload ref for tree node `nodeId`, given the node schema. Compose into it or
-`set`/`over` its content: `treeRef |> Crdt.node id nodeSchema |> Crdt.at nodeRefs.title`.
-Editing a node not currently present is a no-op.
--}
-node : Id.OpId -> Schema ek a -> Ref r (TreeK ek a) forest -> Ref r ek a
-node nodeId nodeSchema (Ref container) =
-    Ref
-        { path = container.path |> Path.node nodeId
-        , schema = nodeSchema
-        }
-
-
-{-| Add a new node (seeded from `value`) as the last child of `parent` (`Nothing` =
-a new root) in a tree ref.
--}
-addChild : Ref r (TreeK ek a) forest -> Schema ek a -> a -> Maybe Id.OpId -> Doc doc -> Result EditError (Doc doc)
-addChild (Ref r) nodeSchema value parent doc =
-    DocI.treeAddChild r.path parent (SI.with value nodeSchema) doc
-        |> mapEdit
-
-
-{-| Re-parent `child` to be the last child of `parent` (`Nothing` = a root).
-Cycle-forming moves are skipped (the node stays put), so this always converges.
--}
-moveInto : Ref r (TreeK ek a) forest -> Id.OpId -> Maybe Id.OpId -> Doc doc -> Result EditError (Doc doc)
-moveInto (Ref r) child parent doc =
-    DocI.treeMoveInto r.path child parent doc
-        |> mapEdit
-
-
-{-| Move `child` to sit immediately before `sibling` (under the sibling's parent).
--}
-moveBefore : Ref r (TreeK ek a) forest -> Id.OpId -> Id.OpId -> Doc doc -> Result EditError (Doc doc)
-moveBefore (Ref r) child sibling doc =
-    DocI.treeMoveBefore r.path child sibling doc
-        |> mapEdit
-
-
-{-| Move `child` to sit immediately after `sibling` (under the sibling's parent).
--}
-moveAfter : Ref r (TreeK ek a) forest -> Id.OpId -> Id.OpId -> Doc doc -> Result EditError (Doc doc)
-moveAfter (Ref r) child sibling doc =
-    DocI.treeMoveAfter r.path child sibling doc
-        |> mapEdit
-
-
-{-| Remove a node and its subtree from a tree ref.
--}
-removeNode : Ref r (TreeK ek a) forest -> Id.OpId -> Doc doc -> Result EditError (Doc doc)
-removeNode (Ref r) child doc =
-    DocI.treeRemove r.path child doc
-        |> mapEdit
-
-
-
--- CURSORS ---------------------------------------------------------------------
-
-
-{-| Make a stable `Crdt.Cursor` at character `offset` in a text field. Because the cursor
-is anchored to the characters around it (not to the number), it keeps pointing at the
-same spot as the text is edited concurrently — see [`Crdt.Cursor`](Crdt-Cursor). Broadcast
-it on the [`Crdt.Presence`](Crdt-Presence) channel to show collaborators' carets.
--}
-cursorAt : Ref r Settable String -> Int -> Doc doc -> Result EditError Cursor
-cursorAt (Ref r) offset doc =
-    DocI.cursorAt r.path offset doc
-        |> mapEdit
-
-
-{-| Resolve a cursor back to its current character offset in this document, or `Nothing`
-if it no longer points anywhere (its text is gone). The inverse of `cursorAt`.
--}
-cursorOffset : Cursor -> Doc doc -> Maybe Int
-cursorOffset =
-    DocI.cursorOffset
-
-
-
 -- RECORD BUILDER (emits refs) -------------------------------------------------
-
-
-{-| What `build` returns: your record's `schema` (pass it to `Crdt.init`) paired with a
-`refs` record of one typed `Ref` per field (use them to edit).
--}
-type alias RecordRefs a refs =
-    { schema : Schema Nested a, refs : refs }
 
 
 {-| A record schema part-way through `record … |> field … |> field …`. You never name
@@ -1190,32 +720,35 @@ type RecordRefsBuilder r full a refs
         }
 
 
-{-| Start building a record schema. Describe a record type field by field, and get back
-both a schema and a matching set of typed refs to edit through.
+{-| Start building a record schema. Describe a record type field by field, and get back one
+**flat bundle**: a typed `Ref` per field plus a reserved `.schema`.
 
 `record` takes **two** constructors: your record's own constructor (which reassembles the
-decoded value), and a second one for the refs record — usually a type alias's constructor
-whose fields are all `Ref`s. Each `field` you pipe in feeds the field's value to the first
-and its ref to the second, so at the end `build` hands you `{ schema, refs }`.
+decoded value), and a second one for the bundle — a type alias whose fields are the `Ref`s
+in field order, followed by a `schema` field. Each `field` you pipe in feeds the field's
+value to the first and its ref to the second, and `build` supplies the finished schema as
+the bundle's last field.
 
 
     type alias Board =
         { title : String, votes : Int }
 
-    -- one Ref per field, in the same order:
-    type alias BoardRefs =
+    -- one Ref per field, in the same order, then `schema` last:
+    type alias BoardDoc =
         { title : Ref Board Crdt.Settable String
         , votes : Ref Board Crdt.Counter Int
+        , schema : Crdt.Schema Crdt.Nested Board
         }
 
-    board : Crdt.RecordRefs Board BoardRefs
+    board : BoardDoc
     board =
-        Crdt.record Board BoardRefs
+        Crdt.record Board BoardDoc
             |> Crdt.field "title" .title Crdt.text
             |> Crdt.field "votes" .votes Crdt.counter
             |> Crdt.build
 
-    -- now: `board.schema` for `Crdt.init`, `board.refs.title` to edit the title.
+    -- now: `board.schema` for `Crdt.init`,
+    -- `board.title` to edit the title.
 
 Records nest: a field's schema can itself be another record's `.schema`, and you reach
 into it with [`at`](#at).
@@ -1235,17 +768,17 @@ Threads a typed `Ref` for the field into your refs record.
 field :
     String
     -> (full -> f)
-    -> Schema kind f
+    -> { s | schema : Schema kind f }
     -> RecordRefsBuilder r full (f -> b) (Ref r kind f -> rest)
     -> RecordRefsBuilder r full b rest
-field name getter schema (RecordRefsBuilder rb) =
+field name getter bundle (RecordRefsBuilder rb) =
     RecordRefsBuilder
-        { builder = SI.field name getter schema rb.builder
-        , refs = rb.refs (Ref { path = Path.root |> Path.field name, schema = schema })
+        { builder = SI.field name getter bundle.schema rb.builder
+        , refs = rb.refs (Ref { path = Path.root |> Path.field name, schema = bundle.schema })
         }
 
 
-{-| Add a field that also reads from **older names** (`aliases`) when `name` is absent —
+{-| Add a field that also reads from older names (`aliases`) when `name` is absent —
 a schema-evolution rename. Reads prefer `name`, then each alias in order;
 writes and the field's `Ref` always target `name`, so once written the old key becomes an
 inert extra key. Peers on the old and new schema converge on the same document and each
@@ -1260,35 +793,55 @@ aliasedField :
     String
     -> List String
     -> (full -> f)
-    -> Schema kind f
+    -> { s | schema : Schema kind f }
     -> RecordRefsBuilder r full (f -> b) (Ref r kind f -> rest)
     -> RecordRefsBuilder r full b rest
-aliasedField name aliases getter schema (RecordRefsBuilder rb) =
+aliasedField name aliases getter bundle (RecordRefsBuilder rb) =
     RecordRefsBuilder
-        { builder = SI.aliasedField name aliases getter schema rb.builder
-        , refs = rb.refs (Ref { path = Path.root |> Path.field name, schema = schema })
+        { builder = SI.aliasedField name aliases getter bundle.schema rb.builder
+        , refs = rb.refs (Ref { path = Path.root |> Path.field name, schema = bundle.schema })
         }
 
 
-{-| Finish a `record` schema: returns `{ schema, refs }`.
+{-| Finish a `record` schema. Feeds the built schema as the **last** argument to the refs
+assembler, producing one **flat** bundle: your `Ref`s plus a reserved `.schema` field. So
+`build` returns `{ …fieldRefs, schema }` — there is no separate `.refs` wrapper.
 -}
-build : RecordRefsBuilder r a a refs -> RecordRefs a refs
+build : RecordRefsBuilder r a a (Schema Nested a -> unified) -> unified
 build (RecordRefsBuilder rb) =
-    { schema = SI.build rb.builder
-    , refs = rb.refs
+    rb.refs (SI.build rb.builder)
+
+
+{-| Combine two schema bundles into a pair `( a, b )` where each half keeps its own merge
+semantics.
+
+Returns a flat bundle `{ first, second, schema }` — a `Ref` for each component and the
+schema to place in a document.
+
+Prefer a named `record` when the two components have meaningful names.
+
+-}
+tuple :
+    { s1 | schema : Schema k1 a }
+    -> { s2 | schema : Schema k2 b }
+    ->
+        { first : Ref ( a, b ) k1 a
+        , second : Ref ( a, b ) k2 b
+        , schema : Schema Nested ( a, b )
+        }
+tuple firstBundle secondBundle =
+    { first = Ref { path = Path.root |> Path.field "0", schema = firstBundle.schema }
+    , second = Ref { path = Path.root |> Path.field "1", schema = secondBundle.schema }
+    , schema =
+        SI.record Tuple.pair
+            |> SI.field "0" Tuple.first firstBundle.schema
+            |> SI.field "1" Tuple.second secondBundle.schema
+            |> SI.build
     }
 
 
 
 -- CUSTOM (SUM) BUILDER (emits refs) -------------------------------------------
-
-
-{-| What `buildCustom` returns: your custom type's `schema` paired with a `refs` record
-holding one `Ref` per variant **payload** (nullary variants have no payload, so they
-contribute nothing).
--}
-type alias CustomRefs a refs =
-    { schema : Schema (Variants a) a, refs : refs }
 
 
 {-| A custom-type schema part-way through `custom … |> variant… |> variant…`. You never
@@ -1306,39 +859,55 @@ variants, some carrying data). Like `record`, it takes two things: a **matcher**
 says which variant a value is, and a refs constructor for the payload refs.
 
 The matcher is given one handler per variant (in declaration order) plus the value, and
-returns the matching handler — it is just a `case` turned inside out:
+returns the matching handler — it is just a `case` turned inside out. Use
+`variant0`/`variant1`/`variant2`/`variant3` for a variant carrying that many arguments,
+each argument getting its own schema (and its own payload ref):
 
     type Status
-        = Planning
-        | Active
+        = Active
         | Archived String
+        | Snooze String Time.Posix
 
-    -- refs only for variants that carry data — here, Archived's reason:
-    type alias StatusRefs =
-        { archivedReason : Ref Status Crdt.Settable String }
+    -- flat bundle: a payload ref per data-carrying variant arg, then `schema` last
+    type alias StatusDoc =
+        { archivedReason : Ref Status Crdt.Settable String
+        , snoozeReason : Ref Status Crdt.Settable String
+        , snoozeUntil : Ref Status Crdt.Settable Time.Posix
+        , schema : Crdt.Schema (Crdt.Variants Status) Status
+        }
 
-    status : Crdt.CustomRefs Status StatusRefs
+    status : StatusDoc
     status =
         Crdt.custom
-            (\planning active archived value ->
+            (\active archived snooze value ->
                 case value of
-                    Planning ->
-                        planning
-
                     Active ->
                         active
 
                     Archived reason ->
                         archived reason
+
+                    Snooze reason until ->
+                        snooze reason until
             )
-            StatusRefs
-            |> Crdt.variant0 "planning" Planning
+            StatusDoc
             |> Crdt.variant0 "active" Active
             |> Crdt.variant1 "archived" Archived Crdt.text
+            |> Crdt.variant2 "snooze" Snooze Crdt.text time
             |> Crdt.buildCustom
 
-Use `switch` to change which variant a value is, and the payload refs (via `at`) to edit
-inside the active variant. Which variant is active is last-write-wins.
+    time : Crdt.Leaf Crdt.Settable Time.Posix
+    time =
+        Crdt.map Time.millisToPosix
+            Time.posixToMillis
+            Crdt.int
+
+Each `variant*` step contributes exactly its arguments' refs to the `StatusDoc`
+constructor, in order — so `variant2 "snooze" Snooze …` supplies `snoozeReason` then
+`snoozeUntil`. (The `Snooze` payload also shows `map` in action: `time` stores an instant
+as a plain `int` but reads it as a `Time.Posix`.) Use `switch` to change which variant a
+value is, and the payload refs (via `at`) to edit inside the active variant. Which variant
+is active is last-write-wins.
 
 -}
 custom : match -> refsAssembler -> CustomRefsBuilder value match refsAssembler
@@ -1369,13 +938,13 @@ refs assembler; `set`/`over` through it edit iff this variant is active.
 variant1 :
     String
     -> (t1 -> value)
-    -> Schema k1 t1
+    -> { s1 | schema : Schema k1 t1 }
     -> CustomRefsBuilder value ((t1 -> VariantSeed) -> b) (Ref value k1 t1 -> rest)
     -> CustomRefsBuilder value b rest
-variant1 name ctor schema (CustomRefsBuilder cb) =
+variant1 name ctor b1 (CustomRefsBuilder cb) =
     CustomRefsBuilder
-        { builder = SI.variant1 name ctor schema cb.builder
-        , refs = cb.refs (variantPayload name 0 schema)
+        { builder = SI.variant1 name ctor b1.schema cb.builder
+        , refs = cb.refs (variantPayload name 0 b1.schema)
         }
 
 
@@ -1384,14 +953,14 @@ variant1 name ctor schema (CustomRefsBuilder cb) =
 variant2 :
     String
     -> (t1 -> t2 -> value)
-    -> Schema k1 t1
-    -> Schema k2 t2
+    -> { s1 | schema : Schema k1 t1 }
+    -> { s2 | schema : Schema k2 t2 }
     -> CustomRefsBuilder value ((t1 -> t2 -> VariantSeed) -> b) (Ref value k1 t1 -> Ref value k2 t2 -> rest)
     -> CustomRefsBuilder value b rest
-variant2 name ctor s1 s2 (CustomRefsBuilder cb) =
+variant2 name ctor b1 b2 (CustomRefsBuilder cb) =
     CustomRefsBuilder
-        { builder = SI.variant2 name ctor s1 s2 cb.builder
-        , refs = cb.refs (variantPayload name 0 s1) (variantPayload name 1 s2)
+        { builder = SI.variant2 name ctor b1.schema b2.schema cb.builder
+        , refs = cb.refs (variantPayload name 0 b1.schema) (variantPayload name 1 b2.schema)
         }
 
 
@@ -1400,19 +969,19 @@ variant2 name ctor s1 s2 (CustomRefsBuilder cb) =
 variant3 :
     String
     -> (t1 -> t2 -> t3 -> value)
-    -> Schema k1 t1
-    -> Schema k2 t2
-    -> Schema k3 t3
+    -> { s1 | schema : Schema k1 t1 }
+    -> { s2 | schema : Schema k2 t2 }
+    -> { s3 | schema : Schema k3 t3 }
     -> CustomRefsBuilder value ((t1 -> t2 -> t3 -> VariantSeed) -> b) (Ref value k1 t1 -> Ref value k2 t2 -> Ref value k3 t3 -> rest)
     -> CustomRefsBuilder value b rest
-variant3 name ctor s1 s2 s3 (CustomRefsBuilder cb) =
+variant3 name ctor b1 b2 b3 (CustomRefsBuilder cb) =
     CustomRefsBuilder
-        { builder = SI.variant3 name ctor s1 s2 s3 cb.builder
-        , refs = cb.refs (variantPayload name 0 s1) (variantPayload name 1 s2) (variantPayload name 2 s3)
+        { builder = SI.variant3 name ctor b1.schema b2.schema b3.schema cb.builder
+        , refs = cb.refs (variantPayload name 0 b1.schema) (variantPayload name 1 b2.schema) (variantPayload name 2 b3.schema)
         }
 
 
-{-| A **catch-all variant** that **keeps the unknown tag** so you can render it. When a
+{-| A catch-all variant that keeps the unknown tag so you can render it. When a
 custom type's stored `$tag` names a variant this schema doesn't know — one a newer peer
 added — it decodes to `ctor tag`, carrying the raw tag string, instead of failing the
 read.
@@ -1444,7 +1013,7 @@ Give it the constructor of a variant that holds a `String`. Because it keeps the
         |> Crdt.catchAll Unsupported
         |> Crdt.buildCustom
 
-The unknown value is **not corrupted by merely holding it**: sync ships the original
+The unknown value is _not corrupted_ by merely holding it: sync ships the original
 operations, so an old peer that reads, holds, and re-syncs it forwards the untouched
 `$tag` along, and a peer still on the new schema reads the real variant. It is only lost
 if the old peer `switch`es it to a variant it _does_ know — so don't normalize an
@@ -1472,10 +1041,10 @@ catchAll ctor (CustomRefsBuilder cb) =
         }
 
 
-{-| Finish a `custom` schema: returns `{ schema, refs }`.
+{-| Finish a `custom` schema. Like `build`, feeds the built schema as the **last** argument
+to the refs assembler, producing one **flat** bundle: the payload `Ref`s plus a reserved
+`.schema` field.
 -}
-buildCustom : CustomRefsBuilder value (value -> VariantSeed) refs -> CustomRefs value refs
+buildCustom : CustomRefsBuilder value (value -> VariantSeed) (Schema (Variants value) value -> unified) -> unified
 buildCustom (CustomRefsBuilder cb) =
-    { schema = SI.buildCustom cb.builder
-    , refs = cb.refs
-    }
+    cb.refs (SI.buildCustom cb.builder)

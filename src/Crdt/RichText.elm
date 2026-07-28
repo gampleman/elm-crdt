@@ -8,13 +8,13 @@ analogue of a document with bold, links, headings and lists.
 
 You never construct these yourself. You describe a rich-text field with `Crdt.richText`,
 edit it through the `Crdt` module (type into it, and turn formatting on and off with
-`Crdt.mark`/`Crdt.unmark`, or restructure it with `Crdt.splitBlock` and friends), and
+`Crdt.Edit.mark`/`Crdt.Edit.unmark`, or restructure it with `Crdt.Edit.splitBlock` and friends), and
 read it back as the shapes below:
 
   - `Crdt.read` decodes a rich-text field to a flat `List Span` — the text broken into
     runs, each run tagged with the formatting active over it. This is enough to render
     inline formatting (bold, italic, links).
-  - `Crdt.readBlocks` gives you a `List Block` — the same text grouped into the
+  - `Crdt.Edit.readBlocks` gives you a `List Block` — the same text grouped into the
     document's paragraphs, headings and list items, each with its own spans. Use this
     when your editor has block structure.
 
@@ -36,7 +36,7 @@ import Dict exposing (Dict)
 
 {-| One run of text that shares a single set of active formatting marks.
 
-`marks` maps a mark's name (the string you passed to `Crdt.mark`, e.g. `"bold"` or
+`marks` maps a mark's name (the string you passed to `Crdt.Edit.mark`, e.g. `"bold"` or
 `"link"`) to the value it carries over this run. A name being present means that mark
 is _on_ for every character in `text`; a name being absent means it is off.
 
@@ -78,8 +78,8 @@ type alias Span =
   - `Value String` — a mark that carries a string, like a link's `href` or a highlight
     colour.
 
-You choose which kind a mark is when you apply it over a range — `Crdt.mark ref from to
-"bold" RichText.Flag doc` versus `Crdt.mark ref from to "link" (RichText.Value "https://…")
+You choose which kind a mark is when you apply it over a range — `Crdt.Edit.mark ref from to
+"bold" RichText.Flag doc` versus `Crdt.Edit.mark ref from to "link" (RichText.Value "https://…")
 doc`. A mark that is not active over a span is simply absent from its `marks` — there is
 no "off" value to match on.
 
@@ -90,14 +90,14 @@ type MarkValue
 
 
 {-| One block of the document — a paragraph, heading or list item — as produced by
-`Crdt.readBlocks`.
+`Crdt.Edit.readBlocks`.
 
   - `type_` is the app-defined kind of block, the string you set with
-    `Crdt.setBlockType` (for example `"h1"`, `"blockquote"` or `"ul"`). An empty string
+    `Crdt.Edit.setBlockType` (for example `"h1"`, `"blockquote"` or `"ul"`). An empty string
     is the default block (a plain paragraph). The library never interprets this value;
     your editor decides what the vocabulary means and how to render it.
-  - `depth` is the indent level, starting at `0`, changed with `Crdt.indentBlock` and
-    `Crdt.outdentBlock`.
+  - `depth` is the indent level, starting at `0`, changed with `Crdt.Edit.indentBlock` and
+    `Crdt.Edit.outdentBlock`.
   - `spans` is the block's inline content, exactly as `Crdt.read` gives them — so
     the same `viewSpan` renders both.
   - `marker` is an internal identity for the block, used by the block-editing functions

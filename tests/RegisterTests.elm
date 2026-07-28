@@ -8,6 +8,7 @@ merge orders).
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id
 import Expect
 import Json.Decode as JD
@@ -60,7 +61,7 @@ priorityDecoder =
             )
 
 
-prioritySchema : C.Schema C.Settable Priority
+prioritySchema : C.Leaf C.Settable Priority
 prioritySchema =
     C.register Low encodePriority priorityDecoder
 
@@ -69,13 +70,15 @@ type alias Task =
     { priority : Priority }
 
 
-type alias TaskRefs =
-    { priority : Ref Task C.Settable Priority }
+type alias TaskDoc =
+    { priority : Ref Task C.Settable Priority
+    , schema : C.Schema C.Nested Task
+    }
 
 
-task : C.RecordRefs Task TaskRefs
+task : TaskDoc
 task =
-    C.record Task TaskRefs
+    C.record Task TaskDoc
         |> C.field "priority" .priority prioritySchema
         |> C.build
 
@@ -85,14 +88,14 @@ init name =
     C.init (Id.replica name) task.schema
 
 
-ok : Doc Task -> Result C.EditError (Doc Task) -> Doc Task
+ok : Doc Task -> Result Edit.EditError (Doc Task) -> Doc Task
 ok fallback =
     Result.withDefault fallback
 
 
-read : Doc Task -> Result C.ReadError Task
+read : Doc Task -> Result Doc.ReadError Task
 read =
-    C.read
+    Doc.read
 
 
 
@@ -111,7 +114,7 @@ suite =
                     doc =
                         init "a"
                 in
-                C.set task.refs.priority High doc
+                Edit.set task.priority High doc
                     |> ok doc
                     |> read
                     |> Expect.equal (Ok { priority = High })
@@ -122,12 +125,12 @@ suite =
                         init "a"
 
                     edited =
-                        C.set task.refs.priority Medium doc |> ok doc
+                        Edit.set task.priority Medium doc |> ok doc
                 in
                 Doc.encode edited
                     |> (\v -> Doc.decodeInto v (init "reader"))
                     |> Result.mapError (\_ -> "decode failed")
-                    |> Result.andThen (read >> Result.mapError C.readErrorToString)
+                    |> Result.andThen (read >> Result.mapError Doc.readErrorToString)
                     |> Expect.equal (Ok { priority = Medium })
         , test "concurrent edits converge whole-value (LWW), same both merge orders" <|
             \_ ->
@@ -136,10 +139,10 @@ suite =
                         init "a"
 
                     alice =
-                        C.set task.refs.priority High base |> ok base
+                        Edit.set task.priority High base |> ok base
 
                     bob =
-                        C.set task.refs.priority Medium (init "b") |> ok (init "b")
+                        Edit.set task.priority Medium (init "b") |> ok (init "b")
 
                     ab =
                         read (Doc.merge alice bob)

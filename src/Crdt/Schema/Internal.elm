@@ -6,8 +6,8 @@ module Crdt.Schema.Internal exposing
     , list, movableList, dict, tree, richText, opSet
     , record, field, aliasedField, build, RecordBuilder
     , CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
-    , variantArgKey
-    , with, decodeNode, emptyNode, errorToString
+    , variantArgKey, tagKey
+    , with, seedOneFrom, decodeNode, emptyNode, errorToString
     )
 
 {-| The combinator layer: a `Crdt a` describes a CRDT's shape and ties it to a
@@ -32,8 +32,8 @@ op-log edit APIs in `Crdt.Doc.Internal` (surfaced as `Crdt`), decoupled from thi
 @docs list, movableList, dict, tree, richText, opSet
 @docs record, field, aliasedField, build, RecordBuilder
 @docs CustomBuilder, VariantSeed, custom, variant0, variant1, variant2, variant3, catchAll, buildCustom
-@docs variantArgKey
-@docs with, decodeNode, emptyNode, errorToString
+@docs variantArgKey, tagKey
+@docs with, seedOneFrom, decodeNode, emptyNode, errorToString
 
 -}
 
@@ -213,6 +213,38 @@ edit APIs pass to `listAppend` / `setKey`.
 with : a -> Crdt kind a -> Seed
 with value (Crdt c) =
     I.Seed (c.seed value)
+
+
+{-| Seed a **single element** from a _container_ schema (list/movableList/dict/tree),
+recovering the element seeder without needing the element schema separately — so the edit
+APIs that create an element can drop their element-schema argument and take the container
+ref instead.
+
+We can't pull a typed `element -> Seed` out of the opaque container `Crdt` (Elm can't
+destructure the element type out of the container's `kind`), so we go through the
+container's own `seed`: `mkSingleton value` builds the one-element collection value that
+`seed` accepts, we seed it **from the live `Ctx`** (so stamps are minted from the
+document's clock — stamp-sound, no duplicate OpIds under concurrent edits), then `extract`
+pulls the lone element's content node back out. The caller in `Doc.Internal` supplies
+`mkSingleton`/`extract` because it statically knows the container's concrete kind.
+
+-}
+seedOneFrom : (element -> collection) -> (Node -> Maybe Node) -> Crdt containerKind collection -> element -> Seed
+seedOneFrom mkSingleton extract (Crdt c) value =
+    I.Seed
+        (\ctx ->
+            let
+                ( containerNode, ctx1 ) =
+                    c.seed (mkSingleton value) ctx
+            in
+            case extract containerNode of
+                Just elementNode ->
+                    ( elementNode, ctx1 )
+
+                Nothing ->
+                    -- unreachable for a valid container schema; keep total
+                    ( containerNode, ctx1 )
+        )
 
 
 

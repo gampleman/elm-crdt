@@ -8,6 +8,7 @@ schema and the Path edit API; this pins the real thing.
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id
 import Crdt.RichText exposing (MarkValue(..), Span)
 import Crdt.Tree as Tree
@@ -40,11 +41,13 @@ type alias Board =
     }
 
 
-type alias StatusRefs =
-    { archived : Ref Status C.Settable String }
+type alias StatusDoc =
+    { archived : Ref Status C.Settable String
+    , schema : C.Schema (C.Variants Status) Status
+    }
 
 
-statusDoc : C.CustomRefs Status StatusRefs
+statusDoc : StatusDoc
 statusDoc =
     C.custom
         (\planning active archived v ->
@@ -58,32 +61,37 @@ statusDoc =
                 Archived reason ->
                     archived reason
         )
-        StatusRefs
+        StatusDoc
         |> C.variant0 "planning" Planning
         |> C.variant0 "active" Active
         |> C.variant1 "archived" Archived C.text
         |> C.buildCustom
 
 
-type alias TodoRefs =
-    { text : Ref Todo C.Settable String, done : Ref Todo C.Settable Bool }
+type alias TodoDoc =
+    { text : Ref Todo C.Settable String
+    , done : Ref Todo C.Settable Bool
+    , schema : C.Schema C.Nested Todo
+    }
 
 
-todoDoc : C.RecordRefs Todo TodoRefs
+todoDoc : TodoDoc
 todoDoc =
-    C.record Todo TodoRefs
+    C.record Todo TodoDoc
         |> C.field "text" .text C.text
         |> C.field "done" .done C.bool
         |> C.build
 
 
-type alias OutlineRefs =
-    { text : Ref OutlineNode C.Settable String }
+type alias OutlineDoc =
+    { text : Ref OutlineNode C.Settable String
+    , schema : C.Schema C.Nested OutlineNode
+    }
 
 
-outlineDoc : C.RecordRefs OutlineNode OutlineRefs
+outlineDoc : OutlineDoc
 outlineDoc =
-    C.record OutlineNode OutlineRefs
+    C.record OutlineNode OutlineDoc
         |> C.field "text" .text C.text
         |> C.build
 
@@ -95,24 +103,37 @@ type alias BoardRefs =
     , outline : Ref Board (C.TreeK C.Nested OutlineNode) (Tree.Forest OutlineNode)
     , files : Ref Board (C.DictK C.RichK (List Span)) (Dict String (List Span))
     , likes : Ref Board C.Counter Int
+    , schema : C.Schema C.Nested Board
     }
 
 
-boardDoc : C.RecordRefs Board BoardRefs
+todosList =
+    C.movableList todoDoc
+
+
+outlineTree =
+    C.tree outlineDoc
+
+
+filesDict =
+    C.dict C.richText
+
+
+boardDoc : BoardRefs
 boardDoc =
     C.record Board BoardRefs
         |> C.field "title" .title C.text
-        |> C.field "status" .status statusDoc.schema
-        |> C.field "todos" .todos (C.movableList todoDoc.schema)
-        |> C.field "outline" .outline (C.tree outlineDoc.schema)
-        |> C.field "files" .files (C.dict C.richText)
+        |> C.field "status" .status statusDoc
+        |> C.field "todos" .todos todosList
+        |> C.field "outline" .outline outlineTree
+        |> C.field "files" .files filesDict
         |> C.field "likes" .likes C.counter
         |> C.build
 
 
 refs : BoardRefs
 refs =
-    boardDoc.refs
+    boardDoc
 
 
 init : String -> Doc Board
@@ -120,7 +141,7 @@ init name =
     C.init (Id.replica name) boardDoc.schema
 
 
-ok : Doc Board -> Result C.EditError (Doc Board) -> Doc Board
+ok : Doc Board -> Result Edit.EditError (Doc Board) -> Doc Board
 ok fb =
     Result.withDefault fb
 
@@ -144,13 +165,13 @@ suite =
                 let
                     alice =
                         init "alice"
-                            |> (\d -> C.set refs.title "Trip" d |> ok d)
-                            |> (\d -> C.append refs.todos todoDoc.schema (Todo "pack" False) d |> ok d)
+                            |> (\d -> Edit.set refs.title "Trip" d |> ok d)
+                            |> (\d -> Edit.append refs.todos (Todo "pack" False) d |> ok d)
 
                     bob =
                         Doc.decodeInto (Doc.encode alice) (init "bob") |> Result.withDefault (init "bob")
                 in
-                Expect.equal (C.read alice) (C.read bob)
+                Expect.equal (Doc.read alice) (Doc.read bob)
         , test "a title edit delta reaches a peer" <|
             \_ ->
                 let
@@ -158,12 +179,12 @@ suite =
                         Doc.version (init "alice")
 
                     alice =
-                        C.set refs.title "Hello" (init "alice") |> ok (init "alice")
+                        Edit.set refs.title "Hello" (init "alice") |> ok (init "alice")
 
                     bob =
                         deltaSync before alice (init "bob")
                 in
-                C.read bob |> Result.map .title |> Expect.equal (Ok "Hello")
+                Doc.read bob |> Result.map .title |> Expect.equal (Ok "Hello")
         , test "a status variant switch delta reaches a peer" <|
             \_ ->
                 let
@@ -171,12 +192,12 @@ suite =
                         Doc.version (init "alice")
 
                     alice =
-                        C.switch refs.status (Archived "old") (init "alice") |> ok (init "alice")
+                        Edit.switch refs.status (Archived "old") (init "alice") |> ok (init "alice")
 
                     bob =
                         deltaSync before alice (init "bob")
                 in
-                C.read bob |> Result.map .status |> Expect.equal (Ok (Archived "old"))
+                Doc.read bob |> Result.map .status |> Expect.equal (Ok (Archived "old"))
         , test "an appended todo delta reaches a peer" <|
             \_ ->
                 let
@@ -184,12 +205,12 @@ suite =
                         Doc.version (init "alice")
 
                     alice =
-                        C.append refs.todos todoDoc.schema (Todo "buy milk" False) (init "alice") |> ok (init "alice")
+                        Edit.append refs.todos (Todo "buy milk" False) (init "alice") |> ok (init "alice")
 
                     bob =
                         deltaSync before alice (init "bob")
                 in
-                C.read bob |> Result.map (.todos >> List.map .text) |> Expect.equal (Ok [ "buy milk" ])
+                Doc.read bob |> Result.map (.todos >> List.map .text) |> Expect.equal (Ok [ "buy milk" ])
         , test "an added outline node delta reaches a peer" <|
             \_ ->
                 let
@@ -197,13 +218,13 @@ suite =
                         Doc.version (init "alice")
 
                     alice =
-                        C.addChild refs.outline outlineDoc.schema (OutlineNode "root") Nothing (init "alice")
+                        Edit.addChild refs.outline outlineDoc (OutlineNode "root") Nothing (init "alice")
                             |> ok (init "alice")
 
                     bob =
                         deltaSync before alice (init "bob")
                 in
-                C.read bob
+                Doc.read bob
                     |> Result.map (.outline >> List.map (Tree.itemValue >> .text))
                     |> Expect.equal (Ok [ "root" ])
         , test "a file's rich-text edit + mark delta reaches a peer (the demo's editor path)" <|
@@ -213,19 +234,19 @@ suite =
                         Doc.version (init "alice")
 
                     file =
-                        refs.files |> C.key "notes.md" C.richText
+                        refs.files |> filesDict.key "notes.md"
 
                     -- create a file, type text, then bold a range — the demo's intents
                     alice =
                         init "alice"
-                            |> (\d -> C.setKey refs.files C.richText "notes.md" [] d |> ok d)
-                            |> (\d -> C.setRich file "hello" d |> ok d)
-                            |> (\d -> C.mark file 0 3 "bold" Flag d |> ok d)
+                            |> (\d -> Edit.setKey refs.files "notes.md" [] d |> ok d)
+                            |> (\d -> Edit.setRich file "hello" d |> ok d)
+                            |> (\d -> Edit.mark file 0 3 "bold" Flag d |> ok d)
 
                     bob =
                         deltaSync before alice (init "bob")
                 in
-                C.read bob
+                Doc.read bob
                     |> Result.toMaybe
                     |> Maybe.andThen (\b -> Dict.get "notes.md" b.files)
                     |> Maybe.map (List.map (\s -> ( s.text, Dict.keys s.marks )))
@@ -238,11 +259,11 @@ suite =
 
                     alice =
                         init "alice"
-                            |> (\d -> C.increment refs.likes 1 d |> ok d)
-                            |> (\d -> C.increment refs.likes 1 d |> ok d)
+                            |> (\d -> Edit.increment refs.likes 1 d |> ok d)
+                            |> (\d -> Edit.increment refs.likes 1 d |> ok d)
 
                     bob =
                         deltaSync before alice (init "bob")
                 in
-                C.read bob |> Result.map .likes |> Expect.equal (Ok 2)
+                Doc.read bob |> Result.map .likes |> Expect.equal (Ok 2)
         ]

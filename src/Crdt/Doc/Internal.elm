@@ -1,9 +1,9 @@
 module Crdt.Doc.Internal exposing
     ( Doc, Error(..)
     , init, read, merge
-    , Diff, Origin(..), mergeWithDiff, decodeWithDiff, diffSince, diffOrigins, diffTouches
+    , Diff, Origin(..), mergeWithDiff, decodeWithDiff, diffSince, diffBetween, diffOrigins, diffTouches
     , setText, setBool, setInt, setString, increment
-    , listAppend, listRemove, listMove
+    , listAppend, listInsert, listRemove, listMove
     , setKey, removeKey
     , contribute, retract
     , opCount, cacheConsistent
@@ -15,10 +15,10 @@ module Crdt.Doc.Internal exposing
     , Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
     , compact, stableFrontier
     , encode, encodeSince, encodeFrom, decodeInto
-    , seedNodeAt, subValue
+    , seedNodeAt, subValue, subValueAt
     , treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
     , setRichText, setBlockText, mark, clearMark
-    , splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock, readBlocks
+    , splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock, readBlocks, readBlocksAt
     )
 
 {-| **Internal.** The full op-log document implementation: the opaque `Doc` type and
@@ -34,9 +34,9 @@ supported write path — so they live here rather than in the published module.
 
 @docs Doc, Error
 @docs init, read, merge
-@docs Diff, Origin, mergeWithDiff, decodeWithDiff, diffSince, diffOrigins, diffTouches
+@docs Diff, Origin, mergeWithDiff, decodeWithDiff, diffSince, diffBetween, diffOrigins, diffTouches
 @docs setText, setBool, setInt, setString, increment
-@docs listAppend, listRemove, listMove
+@docs listAppend, listInsert, listRemove, listMove
 @docs setKey, removeKey
 @docs contribute, retract
 @docs opCount, cacheConsistent
@@ -48,10 +48,10 @@ supported write path — so they live here rather than in the published module.
 @docs Checkpoint, checkpoint, checkpoints, checkpointMessage, checkpointAuthor, checkpointVersion
 @docs compact, stableFrontier
 @docs encode, encodeSince, encodeFrom, decodeInto
-@docs seedNodeAt, subValue
+@docs seedNodeAt, subValue, subValueAt
 @docs treeAddChild, treeMoveInto, treeMoveBefore, treeMoveAfter, treeRemove
 @docs setRichText, setBlockText, mark, clearMark
-@docs splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock, readBlocks
+@docs splitBlock, mergeBlock, setBlockType, indentBlock, outdentBlock, readBlocks, readBlocksAt
 
 -}
 
@@ -254,7 +254,7 @@ merge local incoming =
 
 
 {-| Merge, and return **what changed** as a `Diff` you can query with your typed refs
-(`Crdt.touched` / `origins`). The document result is identical to `merge`; the diff
+(`touched` / `origins`). The document result is identical to `merge`; the diff
 is derived at no extra cost from the ops this merge actually applied (the incoming ops
 not already present), each tagged with its `Origin` (which replica authored it, relative
 to _this_ document's own replica). Use it to re-read only the changed slices — keeping
@@ -308,7 +308,7 @@ mergeWithDiff (Doc local) (Doc incoming) =
 
 {-| What a merge/ingest changed: an opaque set of touched locations, each tagged with
 the `Origin` that authored the change. Query it with the typed refs you already hold
-(`Crdt.touched ref`, `Crdt.origins`) — it never exposes an untyped path. Built
+(`touched ref`, `origins`) — it never exposes an untyped path. Built
 from the ops a `mergeWithDiff` / `decodeWithDiff` applied; empty if nothing changed
 (e.g. re-merging a peer you already have).
 -}
@@ -457,7 +457,7 @@ diffOrigins (Diff entries) =
 identity-addressed target, then compared to each changed target by prefix (either
 direction: a change under `path`, or to a container `path` lives in, both count). When
 several origins touched it, a `Remote` wins over `Local` (a peer's change is the
-interesting one for "did someone else edit this?"). `Crdt.touched` is the typed front
+interesting one for "did someone else edit this?"). `touched` is the typed front
 door; `Path` never appears in a public signature.
 -}
 diffTouches : Path -> Doc a -> Diff -> Maybe Origin
@@ -566,6 +566,23 @@ same information for the network path without needing a captured version.
 diffSince : Version -> Doc a -> Diff
 diffSince (Version known) (Doc d) =
     diffFromOps (Id.ctxReplica d.ctx) (OpLog.opsAfter known d.store)
+
+
+{-| The diff of everything that changed **between** two versions: the ops present at
+`later` but not at `earlier` (both frontiers), tagged with origin. `earlier` should be an
+ancestor of `later` — e.g. two adjacent `versionAt` steps — so this is the single edit (or
+edits) that carried the document from one to the other. Used by a history scrubber to
+attribute the edit at a given step to its author.
+-}
+diffBetween : Version -> Version -> Doc a -> Diff
+diffBetween (Version earlier) (Version later) (Doc d) =
+    let
+        withinLater =
+            OpLog.ancestorKeys later d.store
+    in
+    OpLog.opsAfter earlier d.store
+        |> List.filter (\theOp -> Set.member (Id.opIdToString theOp.id) withinLater)
+        |> diffFromOps (Id.ctxReplica d.ctx)
 
 
 {-| How many operations the document holds. Useful to reason about transport
@@ -1403,9 +1420,17 @@ visibleElems node =
 
 restoreMap : List TargetStep -> Dict.Dict String Node.Entry -> Dict.Dict String Node.Entry -> Doc a -> Doc a
 restoreMap target mo mc doc =
+    -- Emit the sum-type `$tag` key LAST so its op causally depends on the payload
+    -- ops (each `emit` chains on the current frontier). Otherwise `$tag` — which
+    -- sorts first — flips before its payload is created, and a downward-closed
+    -- prefix (a history scrub, or a peer's deps-respecting op set) can expose the
+    -- new tag with no payload yet, reading as `MissingField "variant argument 0"`.
     (Dict.keys mo ++ Dict.keys mc)
         |> Set.fromList
-        |> Set.foldl (\k d -> restoreMapKey (target ++ [ IntoKey k ]) (Dict.get k mo) (Dict.get k mc) d) doc
+        |> Set.toList
+        |> List.partition (\k -> k == SchemaI.tagKey)
+        |> (\( tagKeys, otherKeys ) -> otherKeys ++ tagKeys)
+        |> List.foldl (\k d -> restoreMapKey (target ++ [ IntoKey k ]) (Dict.get k mo) (Dict.get k mc) d) doc
 
 
 restoreMapKey : List TargetStep -> Maybe Node.Entry -> Maybe Node.Entry -> Doc a -> Doc a
@@ -3281,6 +3306,102 @@ listAppend path seed doc =
             )
 
 
+{-| Insert a new element at **visible index `i`** of a list (`i = 0` prepends; `i >=
+length` is equivalent to `listAppend`). Works on plain `Seq`/`Txt` lists and on `Mov`
+(movable) lists.
+
+Placement is by the two visible neighbors — the element at `i-1` (left) and the one at `i`
+(right). For `Seq`/`Txt` we hand those to `fuguePlacement`, the same rule text insertion
+uses, so a concurrent insert at the same gap converges deterministically and doesn't
+interleave. For `Mov`, cells are structural right-children, so we anchor after the home
+cell of the element at `i-1` (the head when `i = 0`), exactly like `listMove`'s anchor.
+
+-}
+listInsert : Path -> Int -> Seed -> Doc a -> Result Error (Doc a)
+listInsert path i seed doc =
+    resolve path doc
+        |> Result.andThen
+            (\( target, node ) ->
+                case Node.asMov node of
+                    Just ml ->
+                        -- movable list: anchor after the home cell of the element before `i`.
+                        -- Clamp `i` to `[0, length]` so an out-of-range index appends (its
+                        -- predecessor is the last element) rather than falling through to a
+                        -- head insert.
+                        let
+                            { order, homes } =
+                                MoveList.resolveOrder ml
+
+                            clamped =
+                                clamp 0 (List.length order) i
+
+                            after =
+                                if clamped <= 0 then
+                                    Nothing
+
+                                else
+                                    List.drop (clamped - 1) order
+                                        |> List.head
+                                        |> Maybe.andThen (\vid -> Dict.get (Id.opIdToString vid) homes)
+                        in
+                        Ok (emitElemAt target after Rga.Right seed doc)
+
+                    Nothing ->
+                        case seqRga node of
+                            Just rga ->
+                                -- Fugue placement between the neighbors at `i-1` (left) and `i`
+                                -- (right). Clamp `i` to `[0, length]`: at/past the end `right`
+                                -- is absent and `left` is the last element (so it appends); at 0
+                                -- `left` is absent (so it prepends).
+                                let
+                                    ids =
+                                        orderedIds node |> Maybe.withDefault []
+
+                                    clamped =
+                                        clamp 0 (List.length ids) i
+
+                                    left =
+                                        if clamped <= 0 then
+                                            Nothing
+
+                                        else
+                                            List.drop (clamped - 1) ids |> List.head
+
+                                    right =
+                                        List.drop clamped ids |> List.head
+
+                                    ( parent, side ) =
+                                        fuguePlacement rga left right
+                                in
+                                Ok (emitElemAt target parent side seed doc)
+
+                            Nothing ->
+                                Err (WrongNodeType "expected list node for listInsert")
+            )
+
+
+{-| Emit an `InsertElem` at an explicit Fugue `(parent, side)`, running `seed` for the new
+element's content (the seed's stamp owns the fresh element id, keeping the clock
+consistent). The append fast-path is invalidated (`commit` clears `lastAppend`), since this
+is not necessarily a tail insert. Shared by `listInsert`.
+-}
+emitElemAt : List TargetStep -> Maybe OpId -> Rga.Side -> Seed -> Doc a -> Doc a
+emitElemAt target parent side seed (Doc d) =
+    let
+        ( elemId, ctx1 ) =
+            Id.nextId d.ctx
+
+        ( seedNode, ctx2 ) =
+            I.runSeed seed ctx1
+
+        doc1 =
+            Doc { d | ctx = ctx2 }
+    in
+    commit
+        [ op elemId (frontierOf doc1) (InsertElem { container = target, elemId = elemId, parent = parent, side = side, seed = seedNode }) ]
+        doc1
+
+
 {-| Whether a node is an ordered, id-addressed sequence (`Seq`/`Txt`/`Mov`). O(1): a
 constructor test — never materialize the element order just to answer this (that made
 `listAppend` O(n) per append → O(n²) to build a list).
@@ -3930,6 +4051,21 @@ subValue schema path doc =
             )
 
 
+{-| Read the typed value at `path` through a sub-schema **as of a past `Version`** — the
+time-travel counterpart of `subValue`, mirroring `readAt` for a sub-ref. Walks `path`
+against the state checked out at `v`, so a UI previewing history can read a single field's
+past value. The live document is unchanged.
+-}
+subValueAt : Version -> Crdt kind sub -> Path -> Doc a -> Result Error sub
+subValueAt v schema path doc =
+    walk (Path.segments path) (stateAt v doc) []
+        |> Result.andThen
+            (\( _, node ) ->
+                SchemaI.decodeNode schema node
+                    |> Result.mapError (\e -> WrongNodeType (SchemaI.errorToString e))
+            )
+
+
 {-| Read a rich-text field as **blocks** (type + depth + spans), rather than the flat
 `List Span` the `S.richText` schema decodes to. A rich field supports both views;
 block edits (`splitBlock` etc.) address markers by the `marker` id these carry. See
@@ -3937,7 +4073,24 @@ block edits (`splitBlock` etc.) address markers by the `marker` id these carry. 
 -}
 readBlocks : Path -> Doc a -> Result Error (List Block)
 readBlocks path doc =
-    resolve path doc
+    blocksOfNode (state doc) path
+
+
+{-| Read a rich-text ref as blocks **as of a past `Version`** — the time-travel counterpart
+of `readBlocks`. Materializes the state at `v` and walks the path against it, so a UI
+previewing history can feed the editor the blocks it had then. The live document is unchanged.
+-}
+readBlocksAt : Version -> Path -> Doc a -> Result Error (List Block)
+readBlocksAt v path doc =
+    blocksOfNode (stateAt v doc) path
+
+
+{-| Walk `path` against an already-materialized `root` node and read it as rich-text blocks.
+Shared by `readBlocks` (live cache) and `readBlocksAt` (a checked-out past state).
+-}
+blocksOfNode : Node -> Path -> Result Error (List Block)
+blocksOfNode root path =
+    walk (Path.segments path) root []
         |> Result.andThen
             (\( _, node ) ->
                 case Node.asRich node of

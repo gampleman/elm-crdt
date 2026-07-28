@@ -20,6 +20,7 @@ would otherwise mask absence. The convergence test is the property that matters.
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id
 import Expect
 import Test exposing (Test, describe, test)
@@ -61,7 +62,7 @@ priorityToString p =
             "high"
 
 
-prioritySchema : C.Schema C.Settable Priority
+prioritySchema : C.Leaf C.Settable Priority
 prioritySchema =
     C.map priorityFromString priorityToString C.string
 
@@ -78,13 +79,16 @@ type alias TodoV1 =
     { text : String, done : Bool }
 
 
-type alias TodoV1Refs =
-    { text : Ref TodoV1 C.Settable String, done : Ref TodoV1 C.Settable Bool }
+type alias TodoV1Doc =
+    { text : Ref TodoV1 C.Settable String
+    , done : Ref TodoV1 C.Settable Bool
+    , schema : C.Schema C.Nested TodoV1
+    }
 
 
-todoV1 : C.RecordRefs TodoV1 TodoV1Refs
+todoV1 : TodoV1Doc
 todoV1 =
-    C.record TodoV1 TodoV1Refs
+    C.record TodoV1 TodoV1Doc
         |> C.field "text" .text C.text
         -- v1's own name for the flag is "complete"
         |> C.aliasedField "complete" [] .done (C.withDefault False C.bool)
@@ -99,17 +103,18 @@ type alias TodoV2 =
     }
 
 
-type alias TodoV2Refs =
+type alias TodoV2Doc =
     { text : Ref TodoV2 C.Settable String
     , done : Ref TodoV2 C.Settable Bool
     , priority : Ref TodoV2 C.Settable Priority
     , tags : Ref TodoV2 C.Settable (Maybe String)
+    , schema : C.Schema C.Nested TodoV2
     }
 
 
-todoV2 : C.RecordRefs TodoV2 TodoV2Refs
+todoV2 : TodoV2Doc
 todoV2 =
-    C.record TodoV2 TodoV2Refs
+    C.record TodoV2 TodoV2Doc
         |> C.field "text" .text C.text
         |> C.aliasedField "done" [ "complete" ] .done (C.withDefault False C.bool)
         |> C.field "priority" .priority (C.withDefault Medium prioritySchema)
@@ -131,7 +136,7 @@ initV2 name =
     C.init (Id.replica name) todoV2.schema
 
 
-ok : Doc a -> Result C.EditError (Doc a) -> Doc a
+ok : Doc a -> Result Edit.EditError (Doc a) -> Doc a
 ok fb =
     Result.withDefault fb
 
@@ -144,14 +149,14 @@ joinReadV2 : Doc a -> Result String TodoV2
 joinReadV2 from =
     Doc.decodeInto (Doc.encode from) (initV2 "j")
         |> Result.mapError (\_ -> "decode")
-        |> Result.andThen (\d -> C.read d |> Result.mapError C.readErrorToString)
+        |> Result.andThen (\d -> Doc.read d |> Result.mapError Doc.readErrorToString)
 
 
 joinReadV1 : Doc a -> Result String TodoV1
 joinReadV1 from =
     Doc.decodeInto (Doc.encode from) (initV1 "j")
         |> Result.mapError (\_ -> "decode")
-        |> Result.andThen (\d -> C.read d |> Result.mapError C.readErrorToString)
+        |> Result.andThen (\d -> Doc.read d |> Result.mapError Doc.readErrorToString)
 
 
 suite : Test
@@ -162,8 +167,8 @@ suite =
                 let
                     v1doc =
                         initV1 "a"
-                            |> (\d -> C.set todoV1.refs.text "buy milk" d |> ok d)
-                            |> (\d -> C.set todoV1.refs.done True d |> ok d)
+                            |> (\d -> Edit.set todoV1.text "buy milk" d |> ok d)
+                            |> (\d -> Edit.set todoV1.done True d |> ok d)
                 in
                 joinReadV2 v1doc
                     |> Expect.equal
@@ -183,9 +188,9 @@ suite =
                 let
                     v2doc =
                         initV2 "b"
-                            |> (\d -> C.set todoV2.refs.text "ship it" d |> ok d)
-                            |> (\d -> C.set todoV2.refs.done True d |> ok d)
-                            |> (\d -> C.set todoV2.refs.priority High d |> ok d)
+                            |> (\d -> Edit.set todoV2.text "ship it" d |> ok d)
+                            |> (\d -> Edit.set todoV2.done True d |> ok d)
+                            |> (\d -> Edit.set todoV2.priority High d |> ok d)
                 in
                 joinReadV1 v2doc
                     |> Expect.equal (Ok { text = "ship it", done = False })
@@ -197,9 +202,9 @@ suite =
 
                     new =
                         initV2 "b"
-                            |> (\d -> C.set todoV2.refs.priority High d |> ok d)
-                            |> C.read
-                            |> Result.mapError C.readErrorToString
+                            |> (\d -> Edit.set todoV2.priority High d |> ok d)
+                            |> Doc.read
+                            |> Result.mapError Doc.readErrorToString
                             |> Result.map .priority
                 in
                 Expect.all
@@ -215,9 +220,9 @@ suite =
 
                     new =
                         initV2 "b"
-                            |> (\d -> C.set todoV2.refs.tags (Just "urgent") d |> ok d)
-                            |> C.read
-                            |> Result.mapError C.readErrorToString
+                            |> (\d -> Edit.set todoV2.tags (Just "urgent") d |> ok d)
+                            |> Doc.read
+                            |> Result.mapError Doc.readErrorToString
                             |> Result.map .tags
                 in
                 Expect.all
@@ -230,24 +235,24 @@ suite =
                 let
                     doc =
                         initV2 "b"
-                            |> (\d -> C.set todoV2.refs.priority Low d |> ok d)
-                            |> (\d -> C.set todoV2.refs.priority High d |> ok d)
+                            |> (\d -> Edit.set todoV2.priority Low d |> ok d)
+                            |> (\d -> Edit.set todoV2.priority High d |> ok d)
                 in
-                C.read doc |> Result.map .priority |> Expect.equal (Ok High)
+                Doc.read doc |> Result.map .priority |> Expect.equal (Ok High)
         , test "rename: the flag written under EITHER name resolves in v2 (highest stamp)" <|
             \_ ->
                 let
                     fromOldName =
                         initV1 "a"
-                            |> (\d -> C.set todoV1.refs.done True d |> ok d)
+                            |> (\d -> Edit.set todoV1.done True d |> ok d)
                             |> joinReadV2
                             |> Result.map .done
 
                     fromNewName =
                         initV2 "b"
-                            |> (\d -> C.set todoV2.refs.done True d |> ok d)
-                            |> C.read
-                            |> Result.mapError C.readErrorToString
+                            |> (\d -> Edit.set todoV2.done True d |> ok d)
+                            |> Doc.read
+                            |> Result.mapError Doc.readErrorToString
                             |> Result.map .done
                 in
                 Expect.all
@@ -260,15 +265,15 @@ suite =
                 -- THE property that matters. Shared base, concurrent edits, exchange ops.
                 let
                     base =
-                        initV1 "seed" |> (\d -> C.set todoV1.refs.text "start" d |> ok d)
+                        initV1 "seed" |> (\d -> Edit.set todoV1.text "start" d |> ok d)
 
                     v2peer =
                         Doc.decodeInto (Doc.encode base) (initV2 "v2")
                             |> Result.withDefault (initV2 "v2")
-                            |> (\d -> C.set todoV2.refs.priority High d |> ok d)
+                            |> (\d -> Edit.set todoV2.priority High d |> ok d)
 
                     v1peer =
-                        base |> (\d -> C.set todoV1.refs.text "start!" d |> ok d)
+                        base |> (\d -> Edit.set todoV1.text "start!" d |> ok d)
 
                     v2final =
                         Doc.decodeInto (Doc.encode v1peer) v2peer |> Result.withDefault v2peer
@@ -277,10 +282,10 @@ suite =
                         Doc.decodeInto (Doc.encode v2peer) v1peer |> Result.withDefault v1peer
                 in
                 Expect.all
-                    [ \_ -> Expect.equal (C.read v1final |> Result.map .text) (Ok "start!")
-                    , \_ -> Expect.equal (C.read v2final |> Result.map .text) (Ok "start!")
-                    , \_ -> Expect.equal (C.read v2final |> Result.map .priority) (Ok High)
-                    , \_ -> Expect.ok (C.read v2final)
+                    [ \_ -> Expect.equal (Doc.read v1final |> Result.map .text) (Ok "start!")
+                    , \_ -> Expect.equal (Doc.read v2final |> Result.map .text) (Ok "start!")
+                    , \_ -> Expect.equal (Doc.read v2final |> Result.map .priority) (Ok High)
+                    , \_ -> Expect.ok (Doc.read v2final)
                     ]
                     ()
         , test "catchAll: an older peer reads a newer variant's tag as the fallback, not an error" <|
@@ -289,12 +294,12 @@ suite =
                 let
                     newDoc =
                         C.init (Id.replica "new") statusNewDoc.schema
-                            |> (\d -> C.switch statusNewDoc.refs.status Archived d |> ok d)
+                            |> (\d -> Edit.switch statusNewDoc.status Archived d |> ok d)
 
                     oldRead =
                         Doc.decodeInto (Doc.encode newDoc) (C.init (Id.replica "old") statusOldDoc.schema)
                             |> Result.mapError (\_ -> "decode")
-                            |> Result.andThen (\d -> C.read d |> Result.mapError C.readErrorToString)
+                            |> Result.andThen (\d -> Doc.read d |> Result.mapError Doc.readErrorToString)
                             |> Result.map .status
                 in
                 oldRead |> Expect.equal (Ok (UnknownStatus "archived"))
@@ -305,12 +310,12 @@ suite =
                 let
                     newDoc =
                         C.init (Id.replica "new") statusNewDoc.schema
-                            |> (\d -> C.switch statusNewDoc.refs.status Archived d |> ok d)
+                            |> (\d -> Edit.switch statusNewDoc.status Archived d |> ok d)
 
                     oldRead =
                         Doc.decodeInto (Doc.encode newDoc) (C.init (Id.replica "old") statusPlainDoc.schema)
                             |> Result.mapError (\_ -> "decode")
-                            |> Result.andThen (\d -> C.read d |> Result.mapError C.readErrorToString)
+                            |> Result.andThen (\d -> Doc.read d |> Result.mapError Doc.readErrorToString)
                             |> Result.map .status
                 in
                 oldRead |> Expect.equal (Ok OPActive)
@@ -327,11 +332,7 @@ type StatusNew
     | Archived
 
 
-type alias StatusNewRefs =
-    {}
-
-
-statusNew : C.CustomRefs StatusNew StatusNewRefs
+statusNew : { schema : C.Schema (C.Variants StatusNew) StatusNew }
 statusNew =
     C.custom
         (\active done archived v ->
@@ -345,7 +346,7 @@ statusNew =
                 Archived ->
                     archived
         )
-        StatusNewRefs
+        (\schema -> { schema = schema })
         |> C.variant0 "active" NActive
         |> C.variant0 "done" NDone
         |> C.variant0 "archived" Archived
@@ -358,11 +359,7 @@ type StatusOld
     | UnknownStatus String
 
 
-type alias StatusOldRefs =
-    {}
-
-
-statusOld : C.CustomRefs StatusOld StatusOldRefs
+statusOld : { schema : C.Schema (C.Variants StatusOld) StatusOld }
 statusOld =
     C.custom
         (\active done unknown v ->
@@ -376,7 +373,7 @@ statusOld =
                 UnknownStatus tag ->
                     unknown tag
         )
-        StatusOldRefs
+        (\schema -> { schema = schema })
         |> C.variant0 "active" OActive
         |> C.variant0 "done" ODone
         |> C.catchAll UnknownStatus
@@ -387,10 +384,10 @@ type alias StatusDocNew =
     { status : StatusNew }
 
 
-statusNewDoc : C.RecordRefs StatusDocNew { status : Ref StatusDocNew (C.Variants StatusNew) StatusNew }
+statusNewDoc : { status : Ref StatusDocNew (C.Variants StatusNew) StatusNew, schema : C.Schema C.Nested StatusDocNew }
 statusNewDoc =
-    C.record StatusDocNew (\s -> { status = s })
-        |> C.field "status" .status statusNew.schema
+    C.record StatusDocNew (\s schema -> { status = s, schema = schema })
+        |> C.field "status" .status statusNew
         |> C.build
 
 
@@ -398,10 +395,10 @@ type alias StatusDocOld =
     { status : StatusOld }
 
 
-statusOldDoc : C.RecordRefs StatusDocOld { status : Ref StatusDocOld (C.Variants StatusOld) StatusOld }
+statusOldDoc : { status : Ref StatusDocOld (C.Variants StatusOld) StatusOld, schema : C.Schema C.Nested StatusDocOld }
 statusOldDoc =
-    C.record StatusDocOld (\s -> { status = s })
-        |> C.field "status" .status statusOld.schema
+    C.record StatusDocOld (\s schema -> { status = s, schema = schema })
+        |> C.field "status" .status statusOld
         |> C.build
 
 
@@ -414,7 +411,7 @@ type StatusPlain
     | OPDone
 
 
-statusPlain : C.CustomRefs StatusPlain {}
+statusPlain : { schema : C.Schema (C.Variants StatusPlain) StatusPlain }
 statusPlain =
     C.custom
         (\active done v ->
@@ -425,7 +422,7 @@ statusPlain =
                 OPDone ->
                     done
         )
-        {}
+        (\schema -> { schema = schema })
         |> C.variant0 "active" OPActive
         |> C.variant0 "done" OPDone
         |> C.buildCustom
@@ -435,8 +432,8 @@ type alias StatusDocPlain =
     { status : StatusPlain }
 
 
-statusPlainDoc : C.RecordRefs StatusDocPlain { status : Ref StatusDocPlain (C.Variants StatusPlain) StatusPlain }
+statusPlainDoc : { status : Ref StatusDocPlain (C.Variants StatusPlain) StatusPlain, schema : C.Schema C.Nested StatusDocPlain }
 statusPlainDoc =
-    C.record StatusDocPlain (\s -> { status = s })
-        |> C.field "status" .status (C.withDefault OPActive statusPlain.schema)
+    C.record StatusDocPlain (\s schema -> { status = s, schema = schema })
+        |> C.field "status" .status (C.withDefault OPActive statusPlain)
         |> C.build

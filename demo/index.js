@@ -79,6 +79,12 @@ document.addEventListener("richtext-input", (event) => {
   app.ports.richTextInput.send(event.detail);
 });
 
+// The editor's caret (a document-wide char offset) bubbles up on every selection/doc
+// change; forward it so Elm can mint a stable cursor and broadcast it as presence.
+document.addEventListener("richtext-caret", (event) => {
+  app.ports.richTextCaret.send(event.detail);
+});
+
 // Note: no mount observer is needed — the Elm view sets `docBlocks` as a property on
 // the <crdt-richtext> element on every render (including the first, when the editor
 // tab mounts), so a freshly-mounted editor is always handed the current blocks.

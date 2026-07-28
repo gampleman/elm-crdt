@@ -22,7 +22,8 @@
 // resulting ProseMirror transaction is not echoed back up as user input.
 
 import { Editor } from "@tiptap/core";
-import { TextSelection } from "@tiptap/pm/state";
+import { TextSelection, Plugin, PluginKey } from "@tiptap/pm/state";
+import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import Document from "@tiptap/extension-document";
 import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
@@ -83,7 +84,87 @@ const Block = Paragraph.extend({
   },
 });
 
-const BlockDocument = Document.extend({ content: "block+" });
+const BlockDocument = Document.extend({
+  content: "block+",
+  addProseMirrorPlugins() {
+    return [remoteCaretsPlugin()];
+  },
+});
+
+// --- remote carets ----------------------------------------------------------
+//
+// Elm resolves every peer's `Crdt.Cursor` to a document-wide character offset and
+// pushes the list down as the `remoteCarets` property: [{ offset, color, name }].
+// We render each as a widget decoration — a thin colored bar with a name label —
+// at the PM position that offset maps to. Decorations are presentation only: they
+// never enter the document or emit input, so they can't perturb the CRDT.
+const remoteCaretKey = new PluginKey("remoteCarets");
+
+function remoteCaretsPlugin() {
+  return new Plugin({
+    key: remoteCaretKey,
+    state: {
+      init: () => [],
+      // carets are carried in transaction meta (set by `setRemoteCarets`); otherwise
+      // keep the current list across doc/selection changes.
+      apply(tr, current) {
+        const next = tr.getMeta(remoteCaretKey);
+        return next === undefined ? current : next;
+      },
+    },
+    props: {
+      decorations(state) {
+        const carets = remoteCaretKey.getState(state) || [];
+        const decos = carets
+          .map((c) => {
+            const pos = docCharOffsetToPos(state.doc, c.offset);
+            if (pos == null) return null;
+            return Decoration.widget(pos, () => renderCaret(c), {
+              side: 1,
+              key: "caret-" + c.name,
+            });
+          })
+          .filter(Boolean);
+        return DecorationSet.create(state.doc, decos);
+      },
+    },
+  });
+}
+
+// Build the DOM for one remote caret: a colored bar with a small name flag.
+function renderCaret(c) {
+  const wrap = document.createElement("span");
+  wrap.className = "remote-caret-rt";
+  wrap.style.borderColor = c.color;
+  const flag = document.createElement("span");
+  flag.className = "remote-caret-rt-flag";
+  flag.style.background = c.color;
+  flag.textContent = c.name;
+  wrap.appendChild(flag);
+  return wrap;
+}
+
+// A document-wide character offset (block boundaries not counted) → an absolute PM
+// position, clamped to the end. Inverse of `_docCharOffset`. Returns null if the doc
+// is empty of blocks.
+function docCharOffsetToPos(doc, offset) {
+  if (doc.childCount === 0) return null;
+  let remaining = Math.max(0, offset);
+  let pos = 1; // inside the first block's content
+  for (let i = 0; i < doc.childCount; i++) {
+    const block = doc.child(i);
+    const len = block.content.size;
+    if (remaining <= len) return pos + remaining;
+    remaining -= len;
+    // step over this block's content + its close/open boundary to the next block
+    pos += block.nodeSize;
+  }
+  // past the end: clamp to the last block's end
+  const last = doc.child(doc.childCount - 1);
+  let end = 1;
+  for (let i = 0; i < doc.childCount - 1; i++) end += doc.child(i).nodeSize;
+  return end + last.content.size;
+}
 
 class CrdtRichText extends HTMLElement {
   constructor() {
@@ -106,6 +187,9 @@ class CrdtRichText extends HTMLElement {
     // replaces the whole PM doc and would otherwise drop the caret to the end. Null =
     // no explicit target, so a re-render just preserves the current caret position.
     this._desiredCaret = null;
+    // Remote peers' carets pushed by Elm ([{ offset, color, name }]); rendered as
+    // decorations. Held here so a freshly-connected editor can seed the plugin.
+    this._remoteCarets = [];
   }
 
   connectedCallback() {
@@ -128,13 +212,24 @@ class CrdtRichText extends HTMLElement {
       ],
       content: blocksToDoc(this._pendingBlocks || [{ type: "", depth: 0, spans: [] }]),
       onTransaction: ({ editor, transaction }) => {
-        if (transaction.getMeta(FROM_ELM)) return; // don't echo Elm-driven changes
+        if (transaction.getMeta(FROM_ELM)) {
+          // an Elm-driven doc change can shift where our caret sits — re-report it so
+          // peers see the corrected offset — but don't echo the change back as input.
+          if (transaction.docChanged) this._emitCaret(editor);
+          return;
+        }
         this._emitTransaction(editor, transaction);
+        // report our caret whenever the selection or doc changed (typing, clicking,
+        // arrow keys), so peers can draw it. Cheap: just a char offset.
+        if (transaction.docChanged || transaction.selectionSet) this._emitCaret(editor);
       },
     });
 
     // seed the diff baseline with the initial content (before any user edit)
     this._baseline = currentEditorBlocks(this.editor);
+
+    // seed any remote carets that arrived before the editor mounted
+    if (this._remoteCarets.length) this.remoteCarets = this._remoteCarets;
 
     // block/format keyboard behavior (Enter split, Backspace merge, Tab indent) is
     // installed via a plain DOM keydown handler so we control the exact intents.
@@ -159,6 +254,36 @@ class CrdtRichText extends HTMLElement {
 
   get docBlocks() {
     return this._pendingBlocks;
+  }
+
+  // Remote peers' carets: [{ offset, color, name }], pushed by Elm every render.
+  // We stash them into the decoration plugin via a meta-only transaction (no doc or
+  // selection change), so they redraw without touching the document.
+  set remoteCarets(carets) {
+    this._remoteCarets = carets || [];
+    if (this.editor) {
+      const { state, view } = this.editor;
+      view.dispatch(
+        state.tr.setMeta(remoteCaretKey, this._remoteCarets).setMeta("addToHistory", false)
+      );
+    }
+  }
+
+  get remoteCarets() {
+    return this._remoteCarets || [];
+  }
+
+  // Report our own caret to Elm as a document-wide character offset, so it can mint a
+  // stable `Crdt.Cursor` and broadcast it. Emitted on selection/doc changes.
+  _emitCaret(editor) {
+    const head = editor.state.selection.$head;
+    this.dispatchEvent(
+      new CustomEvent("richtext-caret", {
+        detail: { offset: this._docCharOffset(head.pos) },
+        bubbles: true,
+        composed: true,
+      })
+    );
   }
 
   // Reconcile the PM doc to `blocks` without echoing back to Elm. Skip when the

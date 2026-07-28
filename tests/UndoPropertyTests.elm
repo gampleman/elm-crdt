@@ -18,6 +18,7 @@ are resolved against the live tree at apply time (out-of-range picks are no-ops)
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id exposing (OpId)
 import Crdt.Tree as Tree
 import Expect
@@ -33,13 +34,15 @@ type alias NodeItem =
     { label : String }
 
 
-type alias NodeRefs =
-    { label : Ref NodeItem C.Settable String }
+type alias NodeDoc =
+    { label : Ref NodeItem C.Settable String
+    , schema : C.Schema C.Nested NodeItem
+    }
 
 
-nodeDoc : C.RecordRefs NodeItem NodeRefs
+nodeDoc : NodeDoc
 nodeDoc =
-    C.record NodeItem NodeRefs
+    C.record NodeItem NodeDoc
         |> C.field "label" .label C.text
         |> C.build
 
@@ -55,21 +58,30 @@ type alias DocRefs =
     { title : Ref Sample C.Settable String
     , tags : Ref Sample (C.ListK C.Movable C.Settable String) (List String)
     , outline : Ref Sample (C.TreeK C.Nested NodeItem) (Tree.Forest NodeItem)
+    , schema : C.Schema C.Nested Sample
     }
 
 
-docDoc : C.RecordRefs Sample DocRefs
+tagsList =
+    C.movableList C.text
+
+
+outlineTree =
+    C.tree nodeDoc
+
+
+docDoc : DocRefs
 docDoc =
     C.record Sample DocRefs
         |> C.field "title" .title C.text
-        |> C.field "tags" .tags (C.movableList C.text)
-        |> C.field "outline" .outline (C.tree nodeDoc.schema)
+        |> C.field "tags" .tags tagsList
+        |> C.field "outline" .outline outlineTree
         |> C.build
 
 
 refs : DocRefs
 refs =
-    docDoc.refs
+    docDoc
 
 
 init : Doc Sample
@@ -98,7 +110,7 @@ allNodeIds : Doc Sample -> List OpId
 allNodeIds doc =
     let
         forest =
-            C.read doc |> Result.map .outline |> Result.withDefault []
+            Doc.read doc |> Result.map .outline |> Result.withDefault []
 
         go items =
             items |> List.concatMap (\i -> Tree.itemId i :: go (Tree.itemChildren i))
@@ -108,7 +120,7 @@ allNodeIds doc =
 
 rootIds : Doc Sample -> List OpId
 rootIds doc =
-    C.read doc
+    Doc.read doc
         |> Result.map (.outline >> List.map Tree.itemId)
         |> Result.withDefault []
 
@@ -130,21 +142,21 @@ applyEdit edit doc =
         edited =
             case edit of
                 SetTitle s ->
-                    C.set refs.title s doc |> ok
+                    Edit.set refs.title s doc |> ok
 
                 AddTag s ->
-                    C.append refs.tags C.text s doc |> ok
+                    Edit.append refs.tags s doc |> ok
 
                 RemoveTag i ->
-                    C.remove refs.tags i doc |> ok
+                    Edit.remove refs.tags i doc |> ok
 
                 AddRoot s ->
-                    C.addChild refs.outline nodeDoc.schema (NodeItem s) Nothing doc |> ok
+                    Edit.addChild refs.outline nodeDoc (NodeItem s) Nothing doc |> ok
 
                 AddChildOfFirst s ->
                     case List.head (rootIds doc) of
                         Just p ->
-                            C.addChild refs.outline nodeDoc.schema (NodeItem s) (Just p) doc |> ok
+                            Edit.addChild refs.outline nodeDoc (NodeItem s) (Just p) doc |> ok
 
                         Nothing ->
                             doc
@@ -154,7 +166,7 @@ applyEdit edit doc =
                     -- redo class that lost inner text needs this to be fuzzed)
                     case List.head (allNodeIds doc) of
                         Just n ->
-                            C.set (refs.outline |> C.node n nodeDoc.schema |> C.at nodeDoc.refs.label) s doc |> ok
+                            Edit.set (refs.outline |> outlineTree.node n |> C.at nodeDoc.label) s doc |> ok
 
                         Nothing ->
                             doc
@@ -166,7 +178,7 @@ applyEdit edit doc =
                                 doc
 
                             else
-                                C.moveInto refs.outline first (Just last) doc |> ok
+                                Edit.moveInto refs.outline first (Just last) doc |> ok
 
                         _ ->
                             doc
@@ -174,7 +186,7 @@ applyEdit edit doc =
                 DeleteFirstRoot ->
                     case List.head (rootIds doc) of
                         Just r ->
-                            C.removeNode refs.outline r doc |> ok
+                            Edit.removeNode refs.outline r doc |> ok
 
                         Nothing ->
                             doc
@@ -186,7 +198,7 @@ applyEdit edit doc =
 -}
 render : Doc Sample -> String
 render doc =
-    case C.read doc of
+    case Doc.read doc of
         Ok d ->
             d.title ++ " | " ++ String.join "," d.tags ++ " | " ++ shape d.outline
 

@@ -7,6 +7,7 @@ refs), read back as a `Crdt.Tree.Forest`, and synced through the op-log wire.
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id exposing (OpId)
 import Crdt.Tree as Tree
 import Expect
@@ -19,13 +20,15 @@ type alias Item =
     { label : String }
 
 
-type alias ItemRefs =
-    { label : Ref Item C.Settable String }
+type alias ItemDoc =
+    { label : Ref Item C.Settable String
+    , schema : C.Schema C.Nested Item
+    }
 
 
-itemDoc : C.RecordRefs Item ItemRefs
+itemDoc : ItemDoc
 itemDoc =
-    C.record Item ItemRefs
+    C.record Item ItemDoc
         |> C.field "label" .label C.text
         |> C.build
 
@@ -35,19 +38,29 @@ type alias Sample =
 
 
 type alias DocRefs =
-    { outline : Ref Sample (C.TreeK C.Nested Item) (Tree.Forest Item) }
+    { outline : Ref Sample (C.TreeK C.Nested Item) (Tree.Forest Item)
+    , schema : C.Schema C.Nested Sample
+    }
 
 
-boardDoc : C.RecordRefs Sample DocRefs
+outlineTree :
+    { schema : C.Schema (C.TreeK C.Nested Item) (Tree.Forest Item)
+    , node : OpId -> Ref Sample (C.TreeK C.Nested Item) (Tree.Forest Item) -> Ref Sample C.Nested Item
+    }
+outlineTree =
+    C.tree itemDoc
+
+
+boardDoc : DocRefs
 boardDoc =
     C.record Sample DocRefs
-        |> C.field "outline" .outline (C.tree itemDoc.schema)
+        |> C.field "outline" .outline outlineTree
         |> C.build
 
 
 refs : DocRefs
 refs =
-    boardDoc.refs
+    boardDoc
 
 
 init : String -> Doc Sample
@@ -55,14 +68,14 @@ init name =
     C.init (Id.replica name) boardDoc.schema
 
 
-ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
+ok : Doc Sample -> Result Edit.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
 
 read : Doc Sample -> Tree.Forest Item
 read doc =
-    C.read doc |> Result.map .outline |> Result.withDefault []
+    Doc.read doc |> Result.map .outline |> Result.withDefault []
 
 
 {-| Flat bracketed render of a forest, e.g. `A[A1] B`, for single-`Expect.equal`
@@ -96,7 +109,7 @@ addRoot : String -> Doc Sample -> ( Maybe OpId, Doc Sample )
 addRoot label doc =
     let
         doc1 =
-            C.addChild refs.outline itemDoc.schema (Item label) Nothing doc |> ok doc
+            Edit.addChild refs.outline itemDoc (Item label) Nothing doc |> ok doc
     in
     ( findId label doc1, doc1 )
 
@@ -105,14 +118,14 @@ addUnder : String -> OpId -> Doc Sample -> ( Maybe OpId, Doc Sample )
 addUnder label parent doc =
     let
         doc1 =
-            C.addChild refs.outline itemDoc.schema (Item label) (Just parent) doc |> ok doc
+            Edit.addChild refs.outline itemDoc (Item label) (Just parent) doc |> ok doc
     in
     ( findId label doc1, doc1 )
 
 
 {-| Run one outline edit bracketed as a single undo step (as the demo does).
 -}
-tracked : (Doc Sample -> Result C.EditError (Doc Sample)) -> Doc Sample -> Doc Sample
+tracked : (Doc Sample -> Result Edit.EditError (Doc Sample)) -> Doc Sample -> Doc Sample
 tracked edit doc =
     Doc.recordEdit (Doc.version doc) (edit doc |> ok doc)
 
@@ -174,7 +187,7 @@ suite =
                     d3 =
                         case ( mA, mB ) of
                             ( Just aId, Just bId ) ->
-                                C.moveInto refs.outline bId (Just aId) d2 |> ok d2
+                                Edit.moveInto refs.outline bId (Just aId) d2 |> ok d2
 
                             _ ->
                                 d2
@@ -190,7 +203,7 @@ suite =
                     Just aId ->
                         let
                             d2 =
-                                C.set (refs.outline |> C.node aId itemDoc.schema |> C.at itemDoc.refs.label) "A!" d1
+                                Edit.set (outlineTree.node aId refs.outline |> C.at itemDoc.label) "A!" d1
                                     |> ok d1
                         in
                         shape (read d2) |> Expect.equal "A!"
@@ -214,7 +227,7 @@ suite =
                     d3 =
                         case mA of
                             Just aId ->
-                                C.removeNode refs.outline aId d2 |> ok d2
+                                Edit.removeNode refs.outline aId d2 |> ok d2
 
                             Nothing ->
                                 d2
@@ -236,7 +249,7 @@ suite =
                     d4 =
                         case ( findId "C" d3, findId "A" d3 ) of
                             ( Just cId, Just aId ) ->
-                                C.moveBefore refs.outline cId aId d3 |> ok d3
+                                Edit.moveBefore refs.outline cId aId d3 |> ok d3
 
                             _ ->
                                 d3
@@ -282,10 +295,10 @@ suite =
 
                                 -- alice moves A under B; bob moves B under A
                                 alice =
-                                    C.moveInto refs.outline aId (Just bId) start |> ok start
+                                    Edit.moveInto refs.outline aId (Just bId) start |> ok start
 
                                 bob =
-                                    C.moveInto refs.outline bId (Just aId) bobStart |> ok bobStart
+                                    Edit.moveInto refs.outline bId (Just aId) bobStart |> ok bobStart
 
                                 ab =
                                     Doc.decodeInto (Doc.encode bob) alice |> Result.withDefault alice
@@ -326,7 +339,7 @@ suite =
                         deleted =
                             case mA of
                                 Just aId ->
-                                    tracked (C.removeNode refs.outline aId) d3
+                                    tracked (Edit.removeNode refs.outline aId) d3
 
                                 Nothing ->
                                     d3
@@ -343,7 +356,7 @@ suite =
                 \_ ->
                     let
                         added =
-                            tracked (C.addChild refs.outline itemDoc.schema (Item "X") Nothing) (init "alice")
+                            tracked (Edit.addChild refs.outline itemDoc (Item "X") Nothing) (init "alice")
                     in
                     Expect.all
                         [ \_ -> Expect.equal "X" (shape (read added))
@@ -362,7 +375,7 @@ suite =
                         moved =
                             case ( mA, mB ) of
                                 ( Just aId, Just bId ) ->
-                                    tracked (C.moveInto refs.outline bId (Just aId)) d2
+                                    tracked (Edit.moveInto refs.outline bId (Just aId)) d2
 
                                 _ ->
                                     d2
@@ -381,7 +394,7 @@ suite =
                         deleted =
                             case mA of
                                 Just aId ->
-                                    tracked (C.removeNode refs.outline aId) d1
+                                    tracked (Edit.removeNode refs.outline aId) d1
 
                                 Nothing ->
                                     d1
@@ -396,13 +409,13 @@ suite =
                     -- redo must rebuild the node AND its text, in order.
                     let
                         d1 =
-                            tracked (C.addChild refs.outline itemDoc.schema (Item "A") Nothing) (init "alice")
+                            tracked (Edit.addChild refs.outline itemDoc (Item "A") Nothing) (init "alice")
 
                         edited =
                             case findId "A" d1 of
                                 Just aId ->
                                     tracked
-                                        (C.set (refs.outline |> C.node aId itemDoc.schema |> C.at itemDoc.refs.label) "A!")
+                                        (Edit.set (outlineTree.node aId refs.outline |> C.at itemDoc.label) "A!")
                                         d1
 
                                 Nothing ->

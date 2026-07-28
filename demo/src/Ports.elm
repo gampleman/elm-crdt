@@ -3,6 +3,7 @@ port module Ports exposing
     , incoming
     , outgoing
     , renderRichText
+    , richTextCaret
     , richTextInput
     )
 
@@ -49,3 +50,11 @@ editor's current single paragraph. Elm diffs it against the CRDT and emits the
 minimal ops, so concurrent edits still merge.
 -}
 port richTextInput : (JD.Value -> msg) -> Sub msg
+
+
+{-| The editor's caret moved: `{ offset }`, a document-wide character offset into the
+open file's rich text. Elm mints a stable `Crdt.Cursor` from it (via
+`Crdt.Cursor.cursorAtRich`) and broadcasts it on the presence channel, so peers can draw
+this cursor in their own editor.
+-}
+port richTextCaret : (JD.Value -> msg) -> Sub msg

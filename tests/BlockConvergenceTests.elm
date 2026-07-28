@@ -19,6 +19,7 @@ as the demo uses it.
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc.Internal as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id
 import Crdt.Path as Path exposing (Path)
 import Crdt.RichText exposing (Block, Span)
@@ -35,20 +36,22 @@ type alias Sample =
     { body : List Span }
 
 
-type alias DocRefs =
-    { body : Ref Sample C.RichK (List Span) }
+type alias DocDoc =
+    { body : Ref Sample C.RichK (List Span)
+    , schema : C.Schema C.Nested Sample
+    }
 
 
-docDoc : C.RecordRefs Sample DocRefs
+docDoc : DocDoc
 docDoc =
-    C.record Sample DocRefs
+    C.record Sample DocDoc
         |> C.field "body" .body C.richText
         |> C.build
 
 
-refs : DocRefs
+refs : DocDoc
 refs =
-    docDoc.refs
+    docDoc
 
 
 bodyPath : Path
@@ -61,7 +64,7 @@ init name =
     Doc.init (Id.replica name) docDoc.schema
 
 
-ok : Doc Sample -> Result C.EditError (Doc Sample) -> Doc Sample
+ok : Doc Sample -> Result Edit.EditError (Doc Sample) -> Doc Sample
 ok fb =
     Result.withDefault fb
 
@@ -144,13 +147,13 @@ applyEdit edit doc =
                     else
                         modBy (blockLen bi + 1) (abs off)
             in
-            C.splitBlock refs.body bi charOffset doc |> ok doc
+            Edit.splitBlock refs.body bi charOffset doc |> ok doc
 
         MergeAt i ->
-            C.mergeBlock refs.body (clampIndex i) doc |> ok doc
+            Edit.mergeBlock refs.body (clampIndex i) doc |> ok doc
 
         SetType i t ->
-            C.setBlockType refs.body
+            Edit.setBlockType refs.body
                 (clampIndex i)
                 (if t == "" then
                     Nothing
@@ -162,13 +165,13 @@ applyEdit edit doc =
                 |> ok doc
 
         Indent i ->
-            C.indentBlock refs.body (clampIndex i) doc |> ok doc
+            Edit.indentBlock refs.body (clampIndex i) doc |> ok doc
 
         Outdent i ->
-            C.outdentBlock refs.body (clampIndex i) doc |> ok doc
+            Edit.outdentBlock refs.body (clampIndex i) doc |> ok doc
 
         SetBlockText i s ->
-            C.setBlockText refs.body (clampIndex i) s doc |> ok doc
+            Edit.setBlockText refs.body (clampIndex i) s doc |> ok doc
 
 
 runFrom : Doc Sample -> List Edit -> Doc Sample
@@ -181,10 +184,10 @@ their concurrent edits build on a common base.
 -}
 sharedBase : Doc Sample
 sharedBase =
-    C.setRich refs.body "alphabravocharlie" (init "seed")
+    Edit.setRich refs.body "alphabravocharlie" (init "seed")
         |> ok (init "seed")
-        |> (\d -> C.splitBlock refs.body 0 5 d |> ok d)
-        |> (\d -> C.splitBlock refs.body 1 5 d |> ok d)
+        |> (\d -> Edit.splitBlock refs.body 0 5 d |> ok d)
+        |> (\d -> Edit.splitBlock refs.body 1 5 d |> ok d)
 
 
 

@@ -1,7 +1,9 @@
 module Crdt.Doc exposing
     ( Doc
+    , read, readAt, ReadError, readErrorToString
     , merge, encode, decodeInto, encodeSince, encodeFrom
-    , Diff, Origin, isLocal, originReplica, mergeWithDiff, decodeWithDiff, diffSince
+    , Diff, Origin, isLocal, originReplica, mergeWithDiff, decodeWithDiff, diffSince, diffBetween
+    , touched, origins
     , Version, version, historyLength, versionAt, restoreTo
     , encodeVersion, decodeVersion
     , fork, forkAt, Divergence, divergence
@@ -26,7 +28,7 @@ module is everything else you do with a document once you have one:
     (`encode` / `decodeInto`, or the smaller `encodeSince` delta), and merging what
     arrives — the library guarantees convergence, the network is entirely yours;
 
-2.  **react** to what a merge changed (`mergeWithDiff` + `Crdt.touched`);
+2.  **react** to what a merge changed (`mergeWithDiff` + `Doc.touched`);
 
 3.  travel through **history** (`version` / `restoreTo`), **undo/redo**, name
     **checkpoints**, and **compact** old history away.
@@ -39,10 +41,19 @@ module is everything else you do with a document once you have one:
 
 # The document
 
-You create a document (`Crdt.init`) and read it (`Crdt.read`) through the `Crdt` module,
-where the schema lives. This module is everything else you do with one once you have it.
+You create a document with `Crdt.init` (in the `Crdt` module, where the schema lives), then
+everything you do with it once you have one is here — starting with reading its value.
 
 @docs Doc
+
+
+# Reading the value
+
+`read` decodes the document through its schema to the typed value your app renders; `readAt`
+does the same for a past `Version` (time-travel). Both `Err` only on a genuinely corrupt or
+schema-incompatible document — a `ReadError`, not a merge conflict.
+
+@docs read, readAt, ReadError, readErrorToString
 
 
 # Syncing with other replicas
@@ -61,10 +72,12 @@ just re-render the new state (your `view` already reflects that for free). Knowi
 a merge touched and **who** did it lets you, for example, flash a highlight on a field a
 collaborator just edited, show a "Bob is editing" marker, scroll a remote change into
 view, or fire a notification. `mergeWithDiff` / `decodeWithDiff` hand back a `Diff`
-alongside the new document; ask it questions with your typed refs — `Crdt.touched ref
-diff` tells you whether (and by whom) a given spot changed.
+alongside the new document; query it with the same typed refs you edit through — `touched`
+tells you whether (and by whom) a given spot changed, and `origins` lists every replica
+that contributed.
 
-@docs Diff, Origin, isLocal, originReplica, mergeWithDiff, decodeWithDiff, diffSince
+@docs Diff, Origin, isLocal, originReplica, mergeWithDiff, decodeWithDiff, diffSince, diffBetween
+@docs touched, origins
 
 
 # History and time travel
@@ -188,14 +201,48 @@ base; see [`encodeFrom`](#encodeFrom).)
 
 import Crdt.Doc.Internal as I
 import Crdt.Id
+import Crdt.Ref.Internal exposing (Ref(..))
+import Crdt.Schema.Internal as SI
 import Json.Encode as JE
 
 
 {-| A collaborative document holding a value of type `a` (the type your schema decodes
-to). Opaque: create it with `init`, read it with `read`, edit it through `Crdt`.
+to). Opaque: create it with `Crdt.init`, read it with `read`, edit it through `Crdt.Edit`.
 -}
 type alias Doc a =
     I.Doc a
+
+
+{-| Read the document's current value through its schema. `Err` only if the stored data
+can't be interpreted by the schema (a genuinely corrupt document); render the error with
+`readErrorToString`.
+-}
+read : Doc a -> Result ReadError a
+read =
+    I.read
+
+
+{-| Read the value as it stood at a past `Version` — true time-travel, without disturbing
+the live document. Great for previews and history views.
+-}
+readAt : Version -> Doc a -> Result ReadError a
+readAt =
+    I.readAt
+
+
+{-| Why reading a document through its schema failed — returned by `read` and `readAt`.
+Unlike an edit error this is not a race: it means the stored data doesn't match the schema
+(a genuinely corrupt or incompatible document). Opaque; render with `readErrorToString`.
+-}
+type alias ReadError =
+    SI.Error
+
+
+{-| A human-readable description of a `ReadError`.
+-}
+readErrorToString : ReadError -> String
+readErrorToString =
+    SI.errorToString
 
 
 {-| Merge another replica's document into this one. Commutative, associative and
@@ -268,7 +315,7 @@ encodeFrom =
 
 
 {-| What a merge changed, as an opaque value you query with your typed refs
-(`Crdt.touched` / `Crdt.origins`). Produced by `mergeWithDiff` /
+(`Doc.touched` / `Doc.origins`). Produced by `mergeWithDiff` /
 `decodeWithDiff`.
 -}
 type alias Diff =
@@ -304,7 +351,7 @@ originReplica origin =
 
 {-| Like `merge`, but also return a `Diff` of what changed — so you can react to and
 attribute a collaborator's changes (highlight them, notify, scroll into view). See
-`Crdt.touched`.
+`Doc.touched`.
 -}
 mergeWithDiff : Doc a -> Doc a -> ( Doc a, Diff )
 mergeWithDiff =
@@ -326,6 +373,49 @@ however the change arrived.
 diffSince : Version -> Doc a -> Diff
 diffSince =
     I.diffSince
+
+
+{-| The `Diff` of what changed **between** two versions — the ops at `later` that weren't
+yet at `earlier`. Pass two adjacent scrubber steps (`versionAt (n-1)` and `versionAt n`) to
+get the single edit that produced step `n`, then `touched` it with a ref to find where it
+landed and `originReplica` to attribute it. `earlier` should be an ancestor of `later`.
+-}
+diffBetween : Version -> Version -> Doc a -> Diff
+diffBetween =
+    I.diffBetween
+
+
+{-| Did the spot a `ref` points at — or anything under it, or a container it lives in —
+change in `diff`, and if so who? You ask with the same typed refs you edit through (from
+your schema's `.refs`); the `Origin` in a `Just` says whether the change was `Local` or
+from a particular remote replica. `doc` is the post-merge document.
+
+Use it to _react_ to an incoming change (your `view` already reflects the new state) — e.g.
+to flash a highlight on a field a collaborator just touched:
+
+    ( doc1, diff ) =
+        Doc.mergeWithDiff model.doc incoming
+
+    highlightTitle =
+        case Doc.touched board.refs.title doc1 diff of
+            Just origin ->
+                not (Doc.isLocal origin)
+
+            Nothing ->
+                False
+
+-}
+touched : Ref r kind a -> Doc doc -> Diff -> Maybe Origin
+touched (Ref r) doc diff =
+    I.diffTouches r.path doc diff
+
+
+{-| Every `Origin` that contributed a change to `diff` — a quick "was there any remote
+edit, and whose?" without threading refs.
+-}
+origins : Diff -> List Origin
+origins =
+    I.diffOrigins
 
 
 {-| A point in the document's shared history — the state at some moment. Two replicas
