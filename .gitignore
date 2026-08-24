@@ -1,6 +1,6 @@
 elm-stuff/
 node_modules/
-docs.json
+# docs.json
 
 # demo build artifacts
 demo/elm.js
