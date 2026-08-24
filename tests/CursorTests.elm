@@ -1,6 +1,6 @@
 module CursorTests exposing (suite)
 
-{-| Stable cursors (see `docs/03-stable-cursors.md`). A cursor anchors to element
+{-| Stable cursors (see `design-docs/03-stable-cursors.md`). A cursor anchors to element
 identity, so its resolved offset tracks the _content_ it pointed at as other
 replicas concurrently insert, delete, and reorder — and two converged replicas
 resolve the same cursor to the same offset.

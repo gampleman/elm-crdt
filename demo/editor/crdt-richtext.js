@@ -9,7 +9,7 @@
 //     them into CRDT ops (setRich / mark / split / merge / setType / indent /
 //     outdent), which converge, then flow back down.
 //
-// Block model (see docs/11): the CRDT is a flat list of blocks, each { type, depth,
+// Block model (see design-docs/11): the CRDT is a flat list of blocks, each { type, depth,
 // spans }. We render each block as a SINGLE top-level ProseMirror node (paragraph /
 // heading / blockquote, or a paragraph visually styled as a list item), with depth
 // applied as CSS indentation via a `data-depth` attribute — deliberately NOT PM's

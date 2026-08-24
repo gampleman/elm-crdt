@@ -3,7 +3,7 @@ module BlockTests exposing (suite)
 {-| Block structure end-to-end through the public API: a `C.richText` field edited
 via `Crdt.Ref` block edits (`splitBlock`/`mergeBlock`/`setBlockType`/`indentBlock`/
 `outdentBlock`) and read back as `RichText.Block`s via `Doc.readBlocks`, synced
-through the op-log wire. Pins the properties from `docs/11`: split/merge preserve
+through the op-log wire. Pins the properties from `design-docs/11`: split/merge preserve
 char identity, type-change converges by LWW, marks span a split, concurrent split +
 edit converge, indent/outdent (incl. concurrency), and wire + undo round-trips.
 -}

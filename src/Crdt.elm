@@ -1,5 +1,5 @@
 module Crdt exposing
-    ( Schema
+    ( Crdt, Schema
     , int, float, string, bool, counter, register
     , text, richText
     , list, movableList, dict, tree
@@ -11,7 +11,7 @@ module Crdt exposing
     , optional, withDefault
     , aliasedField, catchAll
     , init
-    , Ref, Leaf
+    , Ref
     , at
     , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
     , VariantSeed
@@ -45,6 +45,7 @@ and a field name, written once in the schema, can never be mistyped.
 
     import Crdt
     import Crdt.Edit as Edit
+    import Crdt.Id
 
     type alias Board =
         { title : String, votes : Int }
@@ -64,15 +65,18 @@ and a field name, written once in the schema, can never be mistyped.
             |> Crdt.build
 
     -- `board.schema` creates the document
-    -- `board.title` / `board.votes` are your edit handles:
+    -- `board.title` / `board.votes` are your edit handles (each edit returns a
+    -- `Result`, since a ref can fail to resolve against the current value):
     doc =
         Crdt.init (Crdt.Id.replica "alice") board.schema
 
     doc1 =
         Edit.set board.title "Trip plan" doc
+            |> Result.withDefault doc
 
     doc2 =
         Edit.increment board.votes 1 doc1
+            |> Result.withDefault doc1
 
     -- Edit.increment board.title  =>  a compile error
 
@@ -95,7 +99,11 @@ The same applies for `string` vs `text` - both are represented as a simple strin
 `string` is a LWW register, vs `text` merges edits. `string` is useful for things like
 IDs or URLs, where having both just breaks, `text` is much better for human readable text.
 
-@docs Schema
+Every builder below hands back a **bundle** — a `Crdt`. It always carries the `.schema`
+itself, plus whatever handles that kind of data offers: a container's element composer, or
+(for a record / custom type) one `Ref` per field. That's the one type you'll see throughout:
+
+@docs Crdt, Schema
 
 
 ## Simple values
@@ -189,9 +197,9 @@ its schema already captured. You compose deeper with `at`, then pass the ref to 
 `Crdt.Edit` function. A ref carries a phantom `kind` marker, so the compiler rejects a
 nonsensical edit (`increment` on text, `move` on a plain list) before it runs.
 
-    refs.todos |> todoList.index 0 |> Crdt.at todo.done
+    board.todos |> todoList.index 0 |> Crdt.at todo.done
 
-@docs Ref, Leaf
+@docs Ref
 
 @docs at
 
@@ -312,11 +320,13 @@ type alias RichK =
     SI.RichK
 
 
-{-| Kind marker: a user-defined **op-set** CRDT over contribution type `c` (see
-[`opSet`](#opSet)); edited only via `contribute`/`retract`.
+{-| Kind marker: a user-defined **op-set** CRDT whose contributions have kind `ck` and type
+`c` (see [`opSet`](#opSet)); edited only via `contribute`/`retract`. Carrying the
+contribution's kind is what makes `contribute` reject a differently-merging schema of the
+same type (a `counter` where an `int` register was declared).
 -}
-type alias OpSetK c =
-    SI.OpSetK c
+type alias OpSetK ck c =
+    SI.OpSetK ck c
 
 
 {-| The opaque "make a fresh variant payload" value the choice-type builders
@@ -327,43 +337,55 @@ type alias VariantSeed =
     SI.VariantSeed
 
 
-{-| A **leaf bundle** — a schema with nothing to compose into. Every primitive
-(`int`, `text`, `counter`, …) is one. It carries just `.schema`, so it drops into a record
-`field`, a container, or `Crdt.init` the same way any bundle does.
+{-| Everything a builder hands back: a **bundle**. It always carries `.schema` (the piece of
+collaborative data itself), plus whatever extra handles that kind of data offers —
+collected in the `setters` row:
+
+  - a **primitive** has no extras: `Crdt Settable Int {}` — just `.schema`.
+  - a **container** adds a composer that points at an element with the element schema
+    already captured: a list's `{ index : … }`, a dict's `{ key : … }`, a tree's
+    `{ node : … }`.
+  - a **record** or **custom type** you build adds one `Ref` per field or payload, so its
+    bundle is your own flat alias (`{ title = …, votes = …, schema = … }`).
+
+Because the type is an extensible record, anything that just needs a schema accepts _any_
+bundle: `field`, the containers, `optional`/`withDefault`/`map` all take `Crdt kind a s`
+and ignore the extras. That's why you never pass a schema separately.
+
 -}
-type alias Leaf kind a =
-    { schema : Schema kind a }
+type alias Crdt kind a setters =
+    { setters | schema : Schema kind a }
 
 
-leaf : Schema kind a -> Leaf kind a
+leaf : Schema kind a -> Crdt kind a {}
 leaf s =
     { schema = s }
 
 
 {-| An integer LWW register.
 -}
-int : Leaf Settable Int
+int : Crdt Settable Int {}
 int =
     leaf SI.int
 
 
 {-| A float LWW register.
 -}
-float : Leaf Settable Float
+float : Crdt Settable Float {}
 float =
     leaf SI.float
 
 
 {-| A string LWW register. For collaborative editing use `text`.
 -}
-string : Leaf Settable String
+string : Crdt Settable String {}
 string =
     leaf SI.string
 
 
 {-| A boolean LWW register.
 -}
-bool : Leaf Settable Bool
+bool : Crdt Settable Bool {}
 bool =
     leaf SI.bool
 
@@ -383,7 +405,7 @@ the same spot concurrently, each run stays a contiguous block after merging. You
 element permits that interleaving.)
 
 -}
-text : Leaf Settable String
+text : Crdt Settable String {}
 text =
     leaf SI.text
 
@@ -400,7 +422,7 @@ silently lost.
 Implemented as a [PN-counter](https://www.cs.utexas.edu/~rossbach/cs380p/papers/Counters.html#pn-counter---increment-and-decrement-counter).
 
 -}
-counter : Leaf Counter Int
+counter : Crdt Counter Int {}
 counter =
     leaf SI.counter
 
@@ -416,7 +438,7 @@ and a decoder:
         = Low
         | High
 
-    priority : Schema Settable Priority
+    priority : Crdt.Crdt Crdt.Settable Priority {}
     priority =
         Crdt.register Low encodePriority priorityDecoder
 
@@ -429,7 +451,7 @@ Start from the top of the document, and make a record there, with all values reg
 Then you can keep doing this conversion until your whole app can do granular merges.
 
 -}
-register : a -> (a -> JE.Value) -> JD.Decoder a -> Leaf Settable a
+register : a -> (a -> JE.Value) -> JD.Decoder a -> Crdt Settable a {}
 register default encode decoder =
     leaf (SI.register default encode decoder)
 
@@ -441,7 +463,7 @@ field is absent (a document written before the field existed) instead of failing
     |> Crdt.field "priority" .priority (Crdt.optional prioritySchema)
 
 -}
-optional : { s | schema : Schema kind a } -> Leaf kind (Maybe a)
+optional : Crdt kind a s -> Crdt kind (Maybe a) {}
 optional bundle =
     leaf (SI.optional bundle.schema)
 
@@ -459,7 +481,7 @@ Note that re-saving a collapsed value with `switch` loses the original tag, wher
 holding and syncing it preserves it.) Genuinely malformed data still errors.
 
 -}
-withDefault : a -> { s | schema : Schema kind a } -> Leaf kind a
+withDefault : a -> Crdt kind a s -> Crdt kind a {}
 withDefault default bundle =
     leaf (SI.withDefault default bundle.schema)
 
@@ -471,7 +493,7 @@ as the type your app actually uses while it merges as a primitive underneath.
 
     -- store an instant as milliseconds (a plain LWW `int`),
     -- read it as a `Time.Posix`:
-    time : Crdt.Schema Crdt.Settable Time.Posix
+    time : Crdt.Crdt Crdt.Settable Time.Posix {}
     time =
         Crdt.map Time.millisToPosix
             Time.posixToMillis
@@ -486,12 +508,12 @@ to `String` while the stored bytes stay put by mapping between the old represent
 the new domain type.
 
 -}
-map : (a -> b) -> (b -> a) -> { s | schema : Schema kind a } -> Leaf kind b
+map : (a -> b) -> (b -> a) -> Crdt kind a s -> Crdt kind b {}
 map to from bundle =
     leaf (SI.map to from bundle.schema)
 
 
-{-| An ordered, growable list of `a` (each element is itself described by a sub-schemas). Elements keep a stable identity,
+{-| An ordered, growable list of `a` (each element is itself described by a sub-schema). Elements keep a stable identity,
 so a nested edit or a cursor into one survives other people's concurrent insertions and
 deletions elsewhere in the list.
 
@@ -502,11 +524,8 @@ reordered either, that's what `movableList` is for.
 
 -}
 list :
-    { s | schema : Schema ek a }
-    ->
-        { schema : Schema (ListK Fixed ek a) (List a)
-        , index : Int -> Ref r (ListK mv ek a) (List a) -> Ref r ek a
-        }
+    Crdt ek a s
+    -> Crdt (ListK Fixed ek a) (List a) { index : Int -> Ref r (ListK mv ek a) (List a) -> Ref r ek a }
 list elem =
     { schema = SI.list elem.schema
     , index = \i (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.index i, schema = elem.schema }
@@ -527,11 +546,8 @@ position.
 
 -}
 movableList :
-    { s | schema : Schema ek a }
-    ->
-        { schema : Schema (ListK Movable ek a) (List a)
-        , index : Int -> Ref r (ListK mv ek a) (List a) -> Ref r ek a
-        }
+    Crdt ek a s
+    -> Crdt (ListK Movable ek a) (List a) { index : Int -> Ref r (ListK mv ek a) (List a) -> Ref r ek a }
 movableList elem =
     { schema = SI.movableList elem.schema
     , index = \i (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.index i, schema = elem.schema }
@@ -543,17 +559,20 @@ keys with `setKey` / `removeKey`; each value is described by a sub-schema and me
 own rules, so a dict of `text` merges each entry character-wise.
 
 Key **presence** is last-write-wins by timestamp, which makes the set-vs-remove race
-well-defined: if one person removes a key while another edits its value concurrently, the
-later of the two operations wins: remove-then-edit resurrects the key (edit is newer),
-edit-then-remove drops it.
+well-defined: concurrent `setKey` and `removeKey` on the same key resolve by stamp, so the
+later of the two wins. Editing _inside_ a value is not a presence write, so it does not
+resurrect a key a peer removed concurrently — the removal stands, though the value it held
+is kept, so `setKey`ing the key again brings back whatever that value has since merged to
+(with the new value written over it, by the same rules as any other write).
+
+`removeKey` on a key this replica has never seen does nothing: there is no value to
+tombstone, and a delete races only against writes it has actually observed, so a concurrent
+`setKey` of an unseen key wins.
 
 -}
 dict :
-    { s | schema : Schema vk a }
-    ->
-        { schema : Schema (DictK vk a) (Dict String a)
-        , key : String -> Ref r (DictK vk a) (Dict String a) -> Ref r vk a
-        }
+    Crdt vk a s
+    -> Crdt (DictK vk a) (Dict String a) { key : String -> Ref r (DictK vk a) (Dict String a) -> Ref r vk a }
 dict val =
     { schema = SI.dict val.schema
     , key = \k (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.key k, schema = val.schema }
@@ -574,11 +593,8 @@ cycling.
 
 -}
 tree :
-    { s | schema : Schema ek a }
-    ->
-        { schema : Schema (TreeK ek a) (Tree.Forest a)
-        , node : Id.OpId -> Ref r (TreeK ek a) (Tree.Forest a) -> Ref r ek a
-        }
+    Crdt ek a s
+    -> Crdt (TreeK ek a) (Tree.Forest a) { node : Id.OpId -> Ref r (TreeK ek a) (Tree.Forest a) -> Ref r ek a }
 tree nodeBundle =
     { schema = SI.tree nodeBundle.schema
     , node = \nodeId (RefI.Ref c) -> RefI.Ref { path = c.path |> Path.node nodeId, schema = nodeBundle.schema }
@@ -597,7 +613,7 @@ attached to the right span as text is inserted or deleted around it — and a bo
 concurrently with an insertion at its boundary merges the way a human would expect.
 
 -}
-richText : Leaf RichK (List RichText.Span)
+richText : Crdt RichK (List RichText.Span) {}
 richText =
     leaf SI.richText
 
@@ -616,7 +632,7 @@ things that need coordinated _removal_ or a custom _sequence_ order — those ar
 union-of-contributions.
 
     -- a grow-only max register
-    maxRegister : Crdt.Leaf (Crdt.OpSetK Int) Int
+    maxRegister : Crdt.Crdt (Crdt.OpSetK Crdt.Settable Int) Int {}
     maxRegister =
         Crdt.opSet
             { contribution = Crdt.int
@@ -624,7 +640,7 @@ union-of-contributions.
             }
 
 -}
-opSet : { contribution : { s | schema : Schema ck c }, fold : List c -> a } -> Leaf (OpSetK c) a
+opSet : { contribution : Crdt ck c s, fold : List c -> a } -> Crdt (OpSetK ck c) a {}
 opSet config =
     leaf (SI.opSet { contribution = config.contribution.schema, fold = config.fold })
 
@@ -668,9 +684,9 @@ at (Ref inner) (Ref outer) =
 {- A ref to positional argument `i` of a custom type's `variant`, with the argument's
    schema. `set`/`over` through it edit the payload iff that variant is currently active
    (silent no-op otherwise). Internal: the `variant1`/`variant2`/`variant3` builders call
-   this to construct the payload refs they hand back in the `refs` record, so the argument
-   index and schema always match the declaration. Not exposed — users get these refs from
-   the builder, never build them by hand.
+   this to construct the payload refs they thread into the bundle, so the argument index
+   and schema always match the declaration. Not exposed — users get these refs from the
+   builder, never build them by hand.
 -}
 
 
@@ -735,8 +751,8 @@ the bundle's last field.
 
     -- one Ref per field, in the same order, then `schema` last:
     type alias BoardDoc =
-        { title : Ref Board Crdt.Settable String
-        , votes : Ref Board Crdt.Counter Int
+        { title : Crdt.Ref Board Crdt.Settable String
+        , votes : Crdt.Ref Board Crdt.Counter Int
         , schema : Crdt.Schema Crdt.Nested Board
         }
 
@@ -768,7 +784,7 @@ Threads a typed `Ref` for the field into your refs record.
 field :
     String
     -> (full -> f)
-    -> { s | schema : Schema kind f }
+    -> Crdt kind f s
     -> RecordRefsBuilder r full (f -> b) (Ref r kind f -> rest)
     -> RecordRefsBuilder r full b rest
 field name getter bundle (RecordRefsBuilder rb) =
@@ -793,7 +809,7 @@ aliasedField :
     String
     -> List String
     -> (full -> f)
-    -> { s | schema : Schema kind f }
+    -> Crdt kind f s
     -> RecordRefsBuilder r full (f -> b) (Ref r kind f -> rest)
     -> RecordRefsBuilder r full b rest
 aliasedField name aliases getter bundle (RecordRefsBuilder rb) =
@@ -822,8 +838,8 @@ Prefer a named `record` when the two components have meaningful names.
 
 -}
 tuple :
-    { s1 | schema : Schema k1 a }
-    -> { s2 | schema : Schema k2 b }
+    Crdt k1 a s1
+    -> Crdt k2 b s2
     ->
         { first : Ref ( a, b ) k1 a
         , second : Ref ( a, b ) k2 b
@@ -870,9 +886,9 @@ each argument getting its own schema (and its own payload ref):
 
     -- flat bundle: a payload ref per data-carrying variant arg, then `schema` last
     type alias StatusDoc =
-        { archivedReason : Ref Status Crdt.Settable String
-        , snoozeReason : Ref Status Crdt.Settable String
-        , snoozeUntil : Ref Status Crdt.Settable Time.Posix
+        { archivedReason : Crdt.Ref Status Crdt.Settable String
+        , snoozeReason : Crdt.Ref Status Crdt.Settable String
+        , snoozeUntil : Crdt.Ref Status Crdt.Settable Time.Posix
         , schema : Crdt.Schema (Crdt.Variants Status) Status
         }
 
@@ -896,7 +912,7 @@ each argument getting its own schema (and its own payload ref):
             |> Crdt.variant2 "snooze" Snooze Crdt.text time
             |> Crdt.buildCustom
 
-    time : Crdt.Leaf Crdt.Settable Time.Posix
+    time : Crdt.Crdt Crdt.Settable Time.Posix {}
     time =
         Crdt.map Time.millisToPosix
             Time.posixToMillis
@@ -938,7 +954,7 @@ refs assembler; `set`/`over` through it edit iff this variant is active.
 variant1 :
     String
     -> (t1 -> value)
-    -> { s1 | schema : Schema k1 t1 }
+    -> Crdt k1 t1 s1
     -> CustomRefsBuilder value ((t1 -> VariantSeed) -> b) (Ref value k1 t1 -> rest)
     -> CustomRefsBuilder value b rest
 variant1 name ctor b1 (CustomRefsBuilder cb) =
@@ -953,8 +969,8 @@ variant1 name ctor b1 (CustomRefsBuilder cb) =
 variant2 :
     String
     -> (t1 -> t2 -> value)
-    -> { s1 | schema : Schema k1 t1 }
-    -> { s2 | schema : Schema k2 t2 }
+    -> Crdt k1 t1 s1
+    -> Crdt k2 t2 s2
     -> CustomRefsBuilder value ((t1 -> t2 -> VariantSeed) -> b) (Ref value k1 t1 -> Ref value k2 t2 -> rest)
     -> CustomRefsBuilder value b rest
 variant2 name ctor b1 b2 (CustomRefsBuilder cb) =
@@ -969,9 +985,9 @@ variant2 name ctor b1 b2 (CustomRefsBuilder cb) =
 variant3 :
     String
     -> (t1 -> t2 -> t3 -> value)
-    -> { s1 | schema : Schema k1 t1 }
-    -> { s2 | schema : Schema k2 t2 }
-    -> { s3 | schema : Schema k3 t3 }
+    -> Crdt k1 t1 s1
+    -> Crdt k2 t2 s2
+    -> Crdt k3 t3 s3
     -> CustomRefsBuilder value ((t1 -> t2 -> t3 -> VariantSeed) -> b) (Ref value k1 t1 -> Ref value k2 t2 -> Ref value k3 t3 -> rest)
     -> CustomRefsBuilder value b rest
 variant3 name ctor b1 b2 b3 (CustomRefsBuilder cb) =

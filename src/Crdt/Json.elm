@@ -1,5 +1,7 @@
 module Crdt.Json exposing
-    ( encodeMarkAnchor
+    ( blockTokenDecoder
+    , encodeBlockToken
+    , encodeMarkAnchor
     , encodeNode
     , encodeOpId
     , encodePrim
@@ -12,14 +14,21 @@ module Crdt.Json exposing
     )
 
 {-| Lossless JSON serialization of the `Node` tree, including every `OpId`,
-presence cell and tombstone. This is what the demo ships over the WebSocket;
-nothing about ordering or causality may be dropped, or convergence breaks.
+presence cell and tombstone. It serializes the `Node` values that travel inside the
+op wire format (`Crdt.OpJson`) — insert/presence/tree seeds — plus the compacted
+`base` node a snapshot payload carries (see `Crdt.Doc.Internal`). Nothing about
+ordering or causality may be dropped, or convergence breaks.
 
 The wire shape tags each node with a `t` field:
 
   - register: `{ "t": "reg", "v": <prim>, "s": <opid> }`
-  - map: `{ "t": "map", "e": { key: {v, present, s}, ... } }`
-  - seq / txt: `{ "t": "seq"|"txt", "el": [ {id, origin, content, deleted}, ... ] }`
+  - map: `{ "t": "map", "e": { key: {v, p, s}, ... } }` — `p` = present, `s` = stamp
+  - seq / txt: `{ "t": "seq"|"txt", "el": [ {id, p, s, c, d}, ... ] }` — per element
+    `p` = parent anchor, `s` = side, `c` = content, `d` = deleted (see `Crdt.Rga`)
+  - counter: `{ "t": "cnt", "c": { opid: {s, d}, ... } }`
+  - movable list: `{ "t": "mov", "cells": [...], "vals": {...}, "del": [...] }`
+  - tree: `{ "t": "tree", "moves": {...}, "vals": {...}, "del": [...] }`
+  - rich text: `{ "t": "rich", "el": [...], "marks": {...} }`
 
 `OpId`s serialize as `[counter, replica]`; primitives carry a type tag so ints
 and floats survive the roundtrip distinctly.
@@ -29,7 +38,7 @@ and floats survive the roundtrip distinctly.
 import Crdt.Frac as Frac
 import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.MoveList as MoveList
-import Crdt.Node as Node exposing (Element, Entry, Node, Prim(..))
+import Crdt.Node as Node exposing (Entry, Node, Prim(..))
 import Crdt.Rga as Rga
 import Crdt.Tree.Internal as Tree
 import Json.Decode as JD exposing (Decoder)
@@ -60,13 +69,13 @@ encodeNode node =
         Node.Seq rga ->
             JE.object
                 [ ( "t", JE.string "seq" )
-                , ( "el", JE.list encodeElement (Rga.elements rga) )
+                , ( "el", JE.list (encodeElement encodeNode) (Rga.elements rga) )
                 ]
 
         Node.Txt rga ->
             JE.object
                 [ ( "t", JE.string "txt" )
-                , ( "el", JE.list encodeElement (Rga.elements rga) )
+                , ( "el", JE.list (encodeElement JE.string) (Rga.elements rga) )
                 ]
 
         Node.Cnt contributions ->
@@ -94,7 +103,7 @@ encodeNode node =
         Node.Rich r ->
             JE.object
                 [ ( "t", JE.string "rich" )
-                , ( "el", JE.list encodeElement (Rga.elements r.text) )
+                , ( "el", JE.list (encodeElement encodeRichElem) (Rga.elements r.text) )
                 , ( "marks", JE.dict identity encodeMarkOp r.marks )
                 ]
 
@@ -158,11 +167,14 @@ encodeMove m =
 
 
 {-| A position cell of a movable list: its id, anchor, and the valueId it carries.
+
+`side` and `deleted` are **not serialized** — a cell is always a live right-child, so
+both are constants (see the `cellRga` note on `Crdt.MoveList.MoveList`) and `cellsDecoder`
+reconstructs them through the same `Rga.putRight` that wrote them.
+
 -}
 encodeCell : Rga.Element OpId -> JE.Value
 encodeCell cell =
-    -- A MoveList cell is always a right-child (structural ordering), so its `side`
-    -- is not serialized; the decoder reconstructs it as `Right`.
     JE.object
         [ ( "id", encodeOpId cell.id )
         , ( "o"
@@ -194,8 +206,14 @@ encodeEntry e =
         ]
 
 
-encodeElement : Element -> JE.Value
-encodeElement el =
+{-| An RGA element, with its **content encoded by the caller**. Each sequence container
+holds a different content type (`design-docs/16-typed-sequence-content.md`): a `Seq` element
+is a whole `Node`, a `Txt` element one character, a `Rich` element a `RichElem`. Only the
+ordering fields — id, Fugue anchor, side, tombstone — are shared, and they are what this
+writes.
+-}
+encodeElement : (c -> JE.Value) -> Rga.Element c -> JE.Value
+encodeElement encodeContent el =
     JE.object
         [ ( "id", encodeOpId el.id )
         , ( "p"
@@ -207,9 +225,95 @@ encodeElement el =
                     JE.null
           )
         , ( "s", encodeSide el.side )
-        , ( "c", encodeNode el.content )
+        , ( "c", encodeContent el.content )
         , ( "d", JE.bool el.deleted )
         ]
+
+
+{-| A rich-text element's content. A character is `{"c":"a"}`; the two structural tokens are
+`{"tk":"m"}` (block marker) and `{"tk":"n"}` (nest/indent token). Tagged rather than
+positional so the three are distinguishable without knowing the vocabulary — these used to
+be a whole register node carrying a magic `PInt`.
+-}
+encodeRichElem : Node.RichElem -> JE.Value
+encodeRichElem elem =
+    case elem of
+        Node.TextChar ch ->
+            JE.object [ ( "c", JE.string ch ) ]
+
+        Node.Token token ->
+            JE.object [ ( "tk", encodeBlockToken token ) ]
+
+
+{-| A block token's wire tag: `"m"` for a boundary marker, `"n"` for one nest/indent unit.
+Shared by the node codec (an element's content) and `Crdt.OpJson` (the `tok` action that
+inserts one).
+-}
+encodeBlockToken : Node.BlockToken -> JE.Value
+encodeBlockToken =
+    blockTokenTag >> JE.string
+
+
+blockTokenTag : Node.BlockToken -> String
+blockTokenTag token =
+    case token of
+        Node.Marker ->
+            "m"
+
+        Node.Nest ->
+            "n"
+
+
+blockTokenDecoder : Decoder Node.BlockToken
+blockTokenDecoder =
+    JD.string
+        |> JD.andThen
+            (\tag ->
+                case tag of
+                    "m" ->
+                        JD.succeed Node.Marker
+
+                    "n" ->
+                        JD.succeed Node.Nest
+
+                    other ->
+                        JD.fail ("unknown block token: " ++ other)
+            )
+
+
+richElemDecoder : Decoder Node.RichElem
+richElemDecoder =
+    JD.oneOf
+        [ JD.field "c" charDecoder |> JD.map Node.TextChar
+        , JD.field "tk" blockTokenDecoder |> JD.map Node.Token
+        ]
+
+
+{-| A text element's content: exactly **one** `Char`.
+
+The invariant is enforced here, at the edge, rather than on every read. One element per
+character is what every writer produces and what the index-based paths assume —
+`Doc.Internal.applyCharDiff` keeps its id array aligned one-to-one with the text, so a
+two-character element would silently shift every cursor and diff position after it. Measured
+in `Char`s (code points), not `String.length` (UTF-16 units), so an astral character such as
+an emoji is one, matching how the writers split.
+
+-}
+charDecoder : Decoder String
+charDecoder =
+    JD.string
+        |> JD.andThen
+            (\s ->
+                case String.toList s of
+                    [ _ ] ->
+                        JD.succeed s
+
+                    chars ->
+                        JD.fail
+                            ("a text element must hold exactly one character, not "
+                                ++ String.fromInt (List.length chars)
+                            )
+            )
 
 
 encodeSide : Rga.Side -> JE.Value
@@ -286,11 +390,11 @@ nodeDecoder =
                             |> JD.map Node.mapFromEntries
 
                     "seq" ->
-                        JD.field "el" (JD.list elementDecoder)
+                        JD.field "el" (JD.list (elementDecoder (JD.lazy (\_ -> nodeDecoder))))
                             |> JD.map (Rga.fromElements >> Node.seq)
 
                     "txt" ->
-                        JD.field "el" (JD.list elementDecoder)
+                        JD.field "el" (JD.list (elementDecoder charDecoder))
                             |> JD.map (Rga.fromElements >> Node.txt)
 
                     "cnt" ->
@@ -300,9 +404,9 @@ nodeDecoder =
                     "mov" ->
                         JD.map3
                             (\cs vs del ->
-                                Node.mov (MoveList.fromParts (Rga.fromElements cs) vs (Set.fromList del))
+                                Node.mov (MoveList.fromParts cs vs (Set.fromList del))
                             )
-                            (JD.field "cells" (JD.list cellDecoder))
+                            (JD.field "cells" cellsDecoder)
                             (JD.field "vals" (JD.dict (JD.lazy (\_ -> nodeDecoder))))
                             (JD.field "del" (JD.list JD.string))
 
@@ -318,7 +422,7 @@ nodeDecoder =
                     "rich" ->
                         JD.map2
                             (\els marks -> Node.rich { text = Rga.fromElements els, marks = marks })
-                            (JD.field "el" (JD.list elementDecoder))
+                            (JD.field "el" (JD.list (elementDecoder richElemDecoder)))
                             (JD.field "marks" (JD.dict markOpDecoder))
 
                     other ->
@@ -326,13 +430,19 @@ nodeDecoder =
             )
 
 
-cellDecoder : Decoder (Rga.Element OpId)
-cellDecoder =
-    -- cells are always right-children (structural), so reconstruct `side = Right`.
-    JD.map3 (\id parent valueId -> Rga.element id parent Rga.Right valueId False)
+{-| The whole cell RGA of a movable list, rebuilt through `Rga.putRight` — the same
+constructor `Crdt.MoveList` writes cells with, which is what lets the wire omit `side`
+and `deleted`. Decoding the RGA as a unit (rather than a `List Element` handed to
+`Rga.fromElements`) is what keeps that constructor the only way a cell is ever made.
+-}
+cellsDecoder : Decoder (Rga.Rga OpId)
+cellsDecoder =
+    JD.map3 (\id parent valueId -> Rga.putRight id parent valueId)
         (JD.field "id" opIdDecoder)
         (JD.field "o" (JD.nullable opIdDecoder))
         (JD.field "v" opIdDecoder)
+        |> JD.list
+        |> JD.map (List.foldl (<|) Rga.empty)
 
 
 moveDecoder : Decoder Tree.Move
@@ -393,13 +503,13 @@ incrementDecoder =
         (JD.field "d" JD.int)
 
 
-elementDecoder : Decoder Element
-elementDecoder =
+elementDecoder : Decoder c -> Decoder (Rga.Element c)
+elementDecoder contentDecoder =
     JD.map5 Rga.element
         (JD.field "id" opIdDecoder)
         (JD.field "p" (JD.nullable opIdDecoder))
         (JD.field "s" sideDecoder)
-        (JD.field "c" (JD.lazy (\_ -> nodeDecoder)))
+        (JD.field "c" contentDecoder)
         (JD.field "d" JD.bool)
 
 

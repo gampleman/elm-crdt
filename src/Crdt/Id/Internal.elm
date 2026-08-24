@@ -1,6 +1,6 @@
 module Crdt.Id.Internal exposing
     ( ReplicaId, replica, toString
-    , OpId, opId, opIdCounter, opIdReplica, compareOpId, opIdToString
+    , OpId, opId, opIdCounter, opIdReplica, compareOpId, opIdToString, unwrittenStamp
     , Ctx, ctx, nextId, observe, ctxReplica, ctxCounter, withReplica
     )
 
@@ -19,7 +19,7 @@ to break ties in last-write-wins registers.
 
 # Operation ids
 
-@docs OpId, opId, opIdCounter, opIdReplica, compareOpId, opIdToString
+@docs OpId, opId, opIdCounter, opIdReplica, compareOpId, opIdToString, unwrittenStamp
 
 
 # Clocks
@@ -93,6 +93,22 @@ compareOpId (OpId c1 r1) (OpId c2 r2) =
 
         other ->
             other
+
+
+{-| The stamp of a cell **no replica has written**: counter `0` under the empty replica
+id. `nextId` hands out counters from `1` up, so every real write outranks this under
+`compareOpId` no matter which replica made it — which is what makes it usable as a
+_canonical_ stamp, identical on every replica, in a value that a later op must overwrite
+(see `Crdt.Node.vacate`).
+
+It is deliberately not unique: several cells of one skeleton share it. That is safe
+precisely because a stamp is only ever _compared_ (LWW), never used as identity — unlike a
+sequence element's id, which is why a skeleton carries no elements.
+
+-}
+unwrittenStamp : OpId
+unwrittenStamp =
+    OpId 0 (ReplicaId "")
 
 
 {-| A stable string form, used as a `Dict` key for collections (so structural

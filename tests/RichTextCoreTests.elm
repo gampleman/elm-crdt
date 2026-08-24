@@ -46,7 +46,7 @@ richFrom str marks =
                                 else
                                     Just (rid i)
                         in
-                        Rga.put (Rga.element id parent Rga.Right (Node.reg (PString (String.fromChar ch)) id) False) rga
+                        Rga.put (Rga.element id parent Rga.Right (Node.TextChar (String.fromChar ch)) False) rga
                     )
                     Rga.empty
     in

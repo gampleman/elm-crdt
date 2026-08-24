@@ -1,9 +1,9 @@
 module Crdt.Rga exposing
     ( Rga, Element, Side(..)
-    , empty, element, fromElements, elements, put
-    , insertAfter, delete, merge
-    , toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId, compactTombstones
-    , visibleIds, liveCountThrough
+    , empty, element, fromElements, elements, put, putRight
+    , insertAfter, delete
+    , toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId, compactTombstones, reStamp
+    , visibleIds, liveCountThroughWith
     , get, updateElement
     , maxCounter
     )
@@ -22,7 +22,7 @@ right-children after, and concurrent siblings on the same side are ordered by id
 (descending). The payoff over plain RGA (a single left anchor) is that two
 _concurrent runs_ inserted at the same spot stay **contiguous blocks** instead of
 interleaving character-by-character — each run is a right-spine subtree, so the
-whole subtree renders before the other. See `docs/09-fugue.md`.
+whole subtree renders before the other. See `design-docs/09-fugue.md`.
 
 (`origin = Just L` in old RGA is exactly `parent = L, side = Right`; the new
 expressible case is `side = Left`, "immediately before parent", which is what keeps
@@ -30,18 +30,26 @@ runs from interleaving. Roots always have `side = Right`.)
 
 The crucial invariant is unchanged: the visible order is a **pure function of the
 element set** (ids + parent + side), computed in `toElementsInOrder`, never mutated
-incrementally — that is what makes ordering independent of merge order. Tombstones
-are retained forever (in v1) so state-based merge stays idempotent — dropping a
-tombstone would resurrect deleted elements on a later merge.
+incrementally — that is what makes ordering independent of merge order.
+
+**Tombstones.** A deleted element keeps its `deleted` flag rather than leaving the store,
+because ordering is derived from the whole element set: a live element may anchor its
+`parent` to a dead one, and an op still in flight may anchor after it. So a tombstone is
+load-bearing for as long as any op could reference it. They are _not_ retained forever,
+though — `compactTombstones` physically drops them, rebuilding the survivors as a
+right-spine (same visible order, same ids, so cursors still resolve). That is only sound
+**below a stable cut** every replica has already incorporated, which is why the only caller
+is `Crdt.Doc.compact`, and only once the whole op log has folded into the base. See
+`design-docs/04-gc.md`.
 
 The store is keyed by a string form of the `OpId` so that Elm structural
 equality (`==`) is a sound convergence oracle.
 
 @docs Rga, Element, Side
-@docs empty, element, fromElements, elements, put
-@docs insertAfter, delete, merge
-@docs toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId, compactTombstones
-@docs visibleIds, liveCountThrough
+@docs empty, element, fromElements, elements, put, putRight
+@docs insertAfter, delete
+@docs toList, toElementsInOrder, idAtVisibleIndex, lastVisibleId, compactTombstones, reStamp
+@docs visibleIds, liveCountThroughWith
 @docs get, updateElement
 @docs maxCounter
 
@@ -92,7 +100,9 @@ empty =
     Rga Dict.empty
 
 
-{-| Build from a list of elements (later duplicates win by merge rule).
+{-| Build from a list of elements (on a repeated id the later element overwrites the
+earlier one, except that `deleted` is retained once set — see `insertElement`; this is a
+plain insert, not a set-union join).
 -}
 fromElements : List (Element c) -> Rga c
 fromElements =
@@ -106,19 +116,67 @@ elements (Rga d) =
     Dict.values d
 
 
+{-| Write an element into the store, **preserving an existing tombstone**: the record is
+replaced wholesale, except that `deleted` is the OR of the old and new flags.
+
+Deletion is monotone in every other part of the design (tombstones only ever accumulate;
+`Crdt.MoveList` and `Crdt.Tree` keep grow-only tombstone sets), and it has to be monotone
+here too, because an id is not a promise that it is written once:
+
+  - an insert op can be **re-applied** — deliberately, when a pending op is retried after
+    its anchor arrives, or incidentally on any re-delivery — and if the element was deleted
+    in between, a plain `Dict.insert` would resurrect it;
+  - a **hostile or corrupt** op can claim an `elemId` that an existing tombstone already
+    holds. It cannot resurrect the victim's content (the element is rebuilt from the op's
+    own seed, so what appears is the forger's), but without the OR it could un-delete the
+    position and clobber a tombstone other elements anchor to.
+
+So `deleted` never goes from `True` back to `False` through this door, which is what makes
+`put` idempotent as a function of the op _set_ rather than of arrival order.
+
+-}
 insertElement : Element c -> Dict String (Element c) -> Dict String (Element c)
 insertElement el d =
-    Dict.insert (Id.opIdToString el.id) el d
+    Dict.insert (Id.opIdToString el.id)
+        (case Dict.get (Id.opIdToString el.id) d of
+            Just old ->
+                { el | deleted = el.deleted || old.deleted }
+
+            Nothing ->
+                el
+        )
+        d
 
 
 {-| Insert a single element directly (O(log n)), without rebuilding the array.
 Used by the op-log fold so applying an insert op is not O(n). Order is still
-derived in `toList`, so where the element ends up is governed by its id/origin,
-not by insertion time.
+derived in `toElementsInOrder`, so where the element ends up is governed by its
+id and its `parent`/`side` anchor, not by insertion time.
+
+Re-putting an id that is already tombstoned leaves it tombstoned (see `insertElement`),
+which is what makes re-delivering or retrying an insert op a no-op.
+
 -}
 put : Element c -> Rga c -> Rga c
 put el (Rga d) =
     Rga (insertElement el d)
+
+
+{-| Insert a live right-child of `parent` (`Nothing` = a root at the head) — the only
+two `Element` shapes a caller that never deletes and never anchors to the `Left` can
+produce. Use this instead of `element`+`put` when `side = Right` and `deleted = False`
+are **invariants of your structure** rather than choices: naming them once here means
+they cannot be got wrong at a call site, and a reader can see from the type that there
+is no other case to handle.
+
+`Crdt.MoveList`'s position cells are the motivating caller — see the `cellRga` note on
+`Crdt.MoveList.MoveList` for why cells are always live right-children, and what the
+wire format does with that.
+
+-}
+putRight : OpId -> Maybe OpId -> c -> Rga c -> Rga c
+putRight id parent content rga =
+    put (element id parent Right content False) rga
 
 
 
@@ -130,9 +188,10 @@ using a freshly minted id. Returns the updated array and advanced context.
 
 "After `origin`" is expressed as a **right-child of `origin`** (`side = Right`); at
 the head it is a root (`parent = Nothing, side = Right`). This is the classic-RGA
-anchoring rule, used by the `Crdt.Text` char layer and `Node.reStamp`. The op-log
-text layer (`Crdt.Doc.Internal.applyTextDiff`) chooses `parent`/`side` itself to get
-Fugue's non-interleaving runs.
+anchoring rule, used where a whole sequence is built locally in one go: the
+`Crdt.Text` char layer, the schema's list/text seeding, and `Node.reStamp`. The
+op-log text layer (`Crdt.Doc.Internal.applyTextDiff`) chooses `parent`/`side`
+itself to get Fugue's non-interleaving runs.
 
 -}
 insertAfter : Id.Ctx -> Maybe OpId -> c -> Rga c -> ( Rga c, Id.Ctx )
@@ -149,94 +208,6 @@ insertAfter ctx origin content (Rga d) =
 delete : OpId -> Rga c -> Rga c
 delete id (Rga d) =
     Rga (Dict.update (Id.opIdToString id) (Maybe.map (\el -> { el | deleted = True })) d)
-
-
-
--- MERGE ----------------------------------------------------------------------
-
-
-{-| Merge two arrays: union of elements by id; on a shared id, a deletion on
-either side wins (tombstone OR) and the element **contents are merged
-recursively** with `mergeContent` (so nested containers inside a list element —
-e.g. a record sitting in a list — converge). The operation is commutative,
-associative and idempotent as long as `mergeContent` is.
-
-In normal use an id is minted exactly once, so the two copies of a shared id are
-identical. But decoded (possibly corrupt or adversarial) input could disagree on
-an element's `parent`/`side`; to keep `merge` commutative on _any_ input we resolve
-a conflicting anchor deterministically (see `mergeAnchor`) rather than keeping
-whichever side happened to be the left argument.
-
--}
-merge : (c -> c -> c) -> Rga c -> Rga c -> Rga c
-merge mergeContent (Rga a) (Rga b) =
-    Rga
-        (Dict.merge
-            Dict.insert
-            (\k ea eb -> Dict.insert k (mergeElement mergeContent ea eb))
-            Dict.insert
-            a
-            b
-            Dict.empty
-        )
-
-
-mergeElement : (c -> c -> c) -> Element c -> Element c -> Element c
-mergeElement mergeContent a b =
-    let
-        ( parent, side ) =
-            mergeAnchor ( a.parent, a.side ) ( b.parent, b.side )
-    in
-    { id = a.id
-    , parent = parent
-    , side = side
-    , deleted = a.deleted || b.deleted
-    , content = mergeContent a.content b.content
-    }
-
-
-{-| Deterministically combine two (possibly conflicting) `(parent, side)` anchors so
-merge is order-independent. In normal use an id is minted exactly once, so both
-copies of a shared id carry an identical anchor and this passes through unchanged;
-the resolver only matters for decoded (possibly corrupt/adversarial) input that
-disagrees. Fixed rule: prefer the larger parent `OpId` (treating `Nothing` = head as
-smallest); on an equal parent, prefer `Right` over `Left`.
--}
-mergeAnchor : ( Maybe OpId, Side ) -> ( Maybe OpId, Side ) -> ( Maybe OpId, Side )
-mergeAnchor ( pa, sa ) ( pb, sb ) =
-    case ( pa, pb ) of
-        ( Just x, Just y ) ->
-            case Id.compareOpId x y of
-                LT ->
-                    ( pb, sb )
-
-                GT ->
-                    ( pa, sa )
-
-                EQ ->
-                    ( pa, mergeSide sa sb )
-
-        ( Just _, Nothing ) ->
-            ( pa, sa )
-
-        ( Nothing, Just _ ) ->
-            ( pb, sb )
-
-        ( Nothing, Nothing ) ->
-            ( Nothing, mergeSide sa sb )
-
-
-mergeSide : Side -> Side -> Side
-mergeSide a b =
-    case ( a, b ) of
-        ( Right, _ ) ->
-            Right
-
-        ( _, Right ) ->
-            Right
-
-        _ ->
-            Left
 
 
 
@@ -263,8 +234,8 @@ through `compactContent`, so nested sequences inside a live element compact too.
 This is **not** merge-safe on its own: an incoming op that anchors after a dropped
 tombstone would dangle (Fugue treats a missing parent as a head root, so it would jump to
 the front). Only sound below a **stable** cut every replica has already incorporated — the
-same envelope as `compact`/`gc` discarding ops (see `docs/04-gc.md`). The caller owns that;
-this function just performs the rewrite.
+same envelope as `Crdt.Doc.compact` discarding ops (see `design-docs/04-gc.md`). The caller
+owns that; this function just performs the rewrite.
 
 -}
 compactTombstones : (c -> c) -> Rga c -> Rga c
@@ -288,6 +259,57 @@ compactTombstones compactContent rga =
                 |> Tuple.second
     in
     fromElements chained
+
+
+{-| Rebuild the sequence as a **copy with entirely fresh element ids**, in the same
+visible order, re-stamping each element's content with `reStampContent`. Tombstones are
+dropped: a copy has no history for an in-flight op to anchor into, which is the whole
+point (`compactTombstones` keeps ids and so must stay below a stable cut; this mints new
+ones and so is unconditional).
+
+Also returns the `oldId → newId` map, because a copy is useless without it — mark anchors,
+cursors and reverse-ops all name the originals and have to be re-pointed (see
+`Crdt.Node.reStampWithMap`).
+
+Takes the content re-stamper as an argument for the same reason `compactTombstones` and
+`maxCounter` do: this module is content-polymorphic and must not know about `Crdt.Node`.
+
+-}
+reStamp :
+    (Id.Ctx -> c -> ( c, Id.Ctx, Dict String OpId ))
+    -> Id.Ctx
+    -> Rga c
+    -> ( Rga c, Id.Ctx, Dict String OpId )
+reStamp reStampContent ctx rga =
+    toElementsInOrder rga
+        |> List.filter (not << .deleted)
+        |> List.foldl
+            (\old ( acc, c, ( prev, remap ) ) ->
+                let
+                    ( content, c1, contentRemap ) =
+                        reStampContent c old.content
+
+                    ( acc1, c2 ) =
+                        insertAfter c1 prev content acc
+
+                    newId =
+                        lastVisibleId acc1
+
+                    entry =
+                        case newId of
+                            Just nid ->
+                                Dict.insert (Id.opIdToString old.id) nid remap
+
+                            Nothing ->
+                                remap
+                in
+                -- union order is immaterial: an old id is unique across the whole
+                -- document, so this element's key cannot also appear in its own content's
+                -- table and the two are disjoint
+                ( acc1, c2, ( newId, Dict.union contentRemap entry ) )
+            )
+            ( empty, ctx, ( Nothing, Dict.empty ) )
+        |> (\( acc, c, ( _, remap ) ) -> ( acc, c, remap ))
 
 
 {-| One item of the explicit traversal stack: either **expand** an element's
@@ -316,7 +338,7 @@ the newest left insert sits nearest the parent, just before it).
 Because each typed run chains as a right-spine (char₂ is a right-child of char₁),
 an inserted run is one contiguous subtree, so a _concurrent_ run at the same anchor
 renders entirely before or after it — never interleaved. That is the whole point of
-Fugue over RGA. See `docs/09-fugue.md`.
+Fugue over RGA. See `design-docs/09-fugue.md`.
 
 -}
 toElementsInOrder : Rga c -> List (Element c)
@@ -444,32 +466,20 @@ headKey =
 -- VISIBLE-INDEX HELPERS (for the Edit layer) ---------------------------------
 
 
-{-| The id of the element at a given _visible_ index (tombstones skipped).
--}
-idAtVisibleIndex : Int -> Rga c -> Maybe OpId
-idAtVisibleIndex i rga =
-    toElementsInOrder rga
-        |> List.filter (not << .deleted)
-        |> List.drop i
-        |> List.head
-        |> Maybe.map .id
-
-
-{-| The id of the last visible element, for appends.
--}
-lastVisibleId : Rga c -> Maybe OpId
-lastVisibleId rga =
-    toElementsInOrder rga
-        |> List.filter (not << .deleted)
-        |> List.reverse
-        |> List.head
-        |> Maybe.map .id
-
-
 {-| The ids of all visible (non-tombstoned) elements, in order. Computes the
 ordering **once** — callers that need several visible indices (e.g. a text-diff
 delete range) should use this instead of repeated `idAtVisibleIndex`, which
 re-orders the whole array each call (turning an edit O(D·N)).
+
+Deliberately a `List` rather than an `Array`. The one thing an `Array` would buy is
+`Array.get` in place of `List.drop i >> List.head` — and `toElementsInOrder`, which
+every caller here goes through, produces a `List`, so the conversion would cost a pass
+on the whole sequence to save a partial one. It would also split this from the
+identically-shaped `Doc.Internal.cursorIds` (which filters to characters and so cannot
+come from here), and every consumer downstream — membership, predecessor search, the
+typed read models — wants a list anyway. Index lookup is not the hot path: the paths
+that _are_ hot (`applyTextDiff`) exist precisely to walk this once.
+
 -}
 visibleIds : Rga c -> List OpId
 visibleIds rga =
@@ -478,54 +488,66 @@ visibleIds rga =
         |> List.map .id
 
 
-{-| The count of **live** (non-tombstoned) elements at or before `anchor` in RGA
-order. This is the basis for stable cursors: a caret anchored _after_ element
-`anchor` sits at this visible offset, and it stays correct as other replicas
-insert/delete elsewhere.
+{-| The id of the element at a given _visible_ index (tombstones skipped).
+-}
+idAtVisibleIndex : Int -> Rga c -> Maybe OpId
+idAtVisibleIndex i rga =
+    visibleIds rga |> List.drop i |> List.head
+
+
+{-| The id of the last visible element, for appends.
+-}
+lastVisibleId : Rga c -> Maybe OpId
+lastVisibleId rga =
+    visibleIds rga |> List.reverse |> List.head
+
+
+{-| The count of live (non-tombstoned) elements that the predicate accepts, at or before
+`anchor` in sequence order. This is the basis for stable cursors: a caret anchored _after_
+element `anchor` sits at this visible offset, and it stays correct as other replicas
+insert/delete elsewhere. For a plain sequence pass `(always True)`; rich text passes a
+char-only predicate, because its sequence interleaves characters with block markers and
+nest tokens while the offsets an editor speaks in count **characters only** (counting
+every element instead drifts the caret by one per preceding marker).
 
 Robust across deletion of the anchor itself: ordering uses `toElementsInOrder`,
 which retains tombstones, so a deleted anchor still has an order position and we
 count the live elements up to it — the caret lands at the nearest surviving spot.
 If `anchor` isn't present at all (e.g. its op hasn't arrived yet), returns the
-count of all live elements (caret at the end), which converges once it arrives.
+count of all counted elements (caret at the end), which converges once it arrives.
 
 -}
-liveCountThrough : OpId -> Rga c -> Int
-liveCountThrough anchor rga =
+liveCountThroughWith : (Element c -> Bool) -> OpId -> Rga c -> Int
+liveCountThroughWith keep anchor rga =
     let
         anchorKey =
             Id.opIdToString anchor
 
-        step el ( count, stop ) =
-            if stop then
-                ( count, stop )
-
-            else if Id.opIdToString el.id == anchorKey then
-                -- include the anchor itself if it's live, then stop
-                ( count
-                    + (if el.deleted then
-                        0
-
-                       else
-                        1
-                      )
-                , True
-                )
+        counts el =
+            if el.deleted || not (keep el) then
+                0
 
             else
-                ( count
-                    + (if el.deleted then
-                        0
+                1
 
-                       else
-                        1
-                      )
-                , False
-                )
+        -- A real early exit rather than a `List.foldl` carrying a `stop` flag, which
+        -- walked every element past the anchor to reach a decision it had already made.
+        -- It bounds the counting at the anchor, not the whole ordering: `toElementsInOrder`
+        -- above is still O(N) and remains the cost that matters here.
+        countTo els count =
+            case els of
+                [] ->
+                    count
+
+                el :: rest ->
+                    if Id.opIdToString el.id == anchorKey then
+                        -- include the anchor itself if it's live (and counted), then stop
+                        count + counts el
+
+                    else
+                        countTo rest (count + counts el)
     in
-    toElementsInOrder rga
-        |> List.foldl step ( 0, False )
-        |> Tuple.first
+    countTo (toElementsInOrder rga) 0
 
 
 {-| Look up an element by id.
@@ -535,8 +557,8 @@ get id (Rga d) =
     Dict.get (Id.opIdToString id) d
 
 
-{-| Update the element at a visible index by transforming its content. No-op if
-the index is out of range.
+{-| Update the element with the given id by transforming its content. No-op if no
+element carries that id (tombstoned elements are updated like any other).
 -}
 updateElement : OpId -> (c -> c) -> Rga c -> Rga c
 updateElement id f (Rga d) =

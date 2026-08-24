@@ -2,8 +2,7 @@ module Crdt.Tree.Internal exposing
     ( Tree
     , empty, fromParts, moves, payloads, deletedIds
     , move, moveOnly, updateValue, mapPayloads, delete
-    , merge
-    , roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter
+    , roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter, reStamp
     , Move
     , Forest, Item, toForest, itemId, itemValue, itemChildren
     )
@@ -20,30 +19,30 @@ Two hard problems, two orthogonal mechanisms:
     **skipping any move that would make a node its own ancestor**. Every replica
     holds the same move-set, sorts it identically, and makes identical skip
     decisions → identical trees. This is Kleppmann et al. 2020's move algorithm; it
-    fits because `Crdt.OpLog` already re-folds from base on merge, so we never need
-    their incremental undo/redo — we just re-fold. A skipped move leaves its node at
-    its previous parent (nothing vanishes).
+    fits because the tree is derived at **read** time — `resolve` re-folds the whole
+    move-set on every read — so a move that arrives late (out of `moveOp` order) is
+    incorporated without their incremental undo/redo. A skipped move leaves its node
+    at its previous parent (nothing vanishes).
   - **Sibling order** uses a **fractional index** (`Crdt.Frac`), a position _value_
     (not a "after sibling X" reference — that would let concurrent reorders cycle
     the way `Crdt.MoveList` avoids). Concurrent inserts at the same gap pick the
     same key and tiebreak by child `OpId`.
 
-Storage is a plain semilattice (dict-union of moves, recursive dict-merge of
-payloads, set-union of tombstones), so convergence of the representation is free;
+Storage is grow-only in every component (moves, payloads and tombstones only ever
+accumulate, in any order), so convergence of the representation under op replay is free;
 the tree is a pure function of it. `c` is the node payload (a `Node` in practice).
 
 @docs Tree
 @docs empty, fromParts, moves, payloads, deletedIds
 @docs move, moveOnly, updateValue, mapPayloads, delete
-@docs merge
-@docs roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter
+@docs roots, childrenOf, get, parentOf, siblingPos, lastChildPos, maxCounter, reStamp
 @docs Move
 @docs Forest, Item, toForest, itemId, itemValue, itemChildren
 
 -}
 
 import Crdt.Frac as Frac exposing (Frac)
-import Crdt.Id as Id exposing (OpId)
+import Crdt.Id.Internal as Id exposing (OpId)
 import Dict exposing (Dict)
 import Set exposing (Set)
 
@@ -51,8 +50,9 @@ import Set exposing (Set)
 {-| A movable tree of payloads `c`.
 
   - `moveSet` — append-only, keyed by `moveOp` string; a node's creation is its
-    first move. Union-merged.
-  - `payload` — nodeId → content, stable across moves. Recursively merged.
+    first move. Grow-only.
+  - `payload` — nodeId → content, stable across moves; edited in place by ops that
+    target the node.
   - `tombstones` — deleted nodeIds (grow-only, delete-wins). A deleted node's
     subtree is dropped at read.
 
@@ -115,10 +115,11 @@ deletedIds (Tree t) =
 -- EDITS ----------------------------------------------------------------------
 
 
-{-| Record a move of `child` under `parent` at position `pos`, minted as `moveOp`.
-Creating a node is its first `move` (with its content set via `updateValue`, which
-the op layer seeds alongside). Appending a move never removes an older one — the
-older moves become inert history (skipped at read), like RGA tombstones.
+{-| Record a move of `child` under `parent` at position `pos`, minted as `moveOp`,
+setting the node's payload to `content`. Creating a node is its first `move` (which is
+what seeds that payload); use `moveOnly` to re-parent/reorder a node that already has
+one. Appending a move never removes an older one — the older moves become inert
+history (skipped at read), like RGA tombstones.
 -}
 move : OpId -> OpId -> Maybe OpId -> Frac -> c -> Tree c -> Tree c
 move moveOp child parent pos content (Tree t) =
@@ -169,36 +170,12 @@ delete child (Tree t) =
 
 
 
--- MERGE ----------------------------------------------------------------------
-
-
-{-| Merge two trees: union the move sets (a shared `moveOp` is an identical move),
-recursively merge shared payloads, union the tombstones. Each component is a
-semilattice, so the whole is commutative/associative/idempotent and the derived
-tree is a deterministic function of the result.
--}
-merge : (c -> c -> c) -> Tree c -> Tree c -> Tree c
-merge mergeContent (Tree a) (Tree b) =
-    Tree
-        { moveSet = Dict.union a.moveSet b.moveSet
-        , payload =
-            Dict.merge
-                Dict.insert
-                (\k x y -> Dict.insert k (mergeContent x y))
-                Dict.insert
-                a.payload
-                b.payload
-                Dict.empty
-        , tombstones = Set.union a.tombstones b.tombstones
-        }
-
-
-
 -- READ -----------------------------------------------------------------------
 
 
-{-| The resolved parent/position of each live node, after folding all moves in
-`moveOp` order and skipping cycle-forming ones. Key = child nodeId string.
+{-| The resolved parent/position of every node named by a move, after folding all
+moves in `moveOp` order and skipping cycle-forming ones. Liveness is _not_ applied
+here — tombstoned nodes still appear; readers filter them. Key = child nodeId string.
 -}
 type alias Resolved =
     Dict String { child : OpId, parent : Maybe OpId, pos : Frac }
@@ -258,8 +235,9 @@ wouldCycle child newParent resolved =
     climb newParent Set.empty
 
 
-{-| Whether a node is live (has a resolved position and isn't tombstoned). A node
-under a tombstoned ancestor is dropped by the recursive read, not here.
+{-| Whether a node itself is un-tombstoned. Callers pair this with the other
+admission tests (a resolved position, a present payload). A node under a
+tombstoned _ancestor_ is dropped by the read, not here.
 -}
 isLive : Tree c -> String -> Bool
 isLive (Tree t) key =
@@ -423,6 +401,63 @@ maxCounter contentMax (Tree t) =
     max moveMax payloadMax
 
 
+{-| Rebuild the tree as a **copy with entirely fresh node ids and move ids**, preserving
+structure and sibling order, re-stamping each node's payload with `reStampPayload`.
+Returns the `oldId → newId` map alongside, so anchors into the original can be re-pointed
+(see `Crdt.Node.reStampWithMap`).
+
+The walk is **pre-order — each node before its children — and that is load-bearing**: a
+child's move names its parent, so the parent's re-minted id has to exist before the child
+is recorded, or the copy's move-set would point at nothing and the subtree would be
+unreachable. Each node keeps its source sibling position, or the midpoint if it had none.
+
+Only live, readable nodes are copied, and tombstones are not carried over: a fresh id has
+no history for an in-flight op to reference.
+
+Takes the payload re-stamper as an argument for the same reason `maxCounter` and
+`mapPayloads` do — this module is content-polymorphic and must not know about `Crdt.Node`.
+
+-}
+reStamp :
+    (Id.Ctx -> c -> ( c, Id.Ctx, Dict String OpId ))
+    -> Id.Ctx
+    -> Tree c
+    -> ( Tree c, Id.Ctx, Dict String OpId )
+reStamp reStampPayload ctx tree =
+    let
+        step : Maybe OpId -> OpId -> ( Tree c, Id.Ctx, Dict String OpId ) -> ( Tree c, Id.Ctx, Dict String OpId )
+        step newParent oldId ( acc, c, remap ) =
+            case get oldId tree of
+                Nothing ->
+                    ( acc, c, remap )
+
+                Just payload ->
+                    let
+                        ( content, c1, payloadRemap ) =
+                            reStampPayload c payload
+
+                        ( newId, c2 ) =
+                            Id.nextId c1
+
+                        ( moveId, c3 ) =
+                            Id.nextId c2
+
+                        pos =
+                            siblingPos oldId tree
+                                |> Maybe.withDefault (Frac.between Nothing Nothing)
+                    in
+                    -- disjoint tables (an old id is unique document-wide), so union order
+                    -- here is immaterial
+                    List.foldl (step (Just newId))
+                        ( move moveId newId newParent pos content acc
+                        , c3
+                        , Dict.union payloadRemap (Dict.insert (Id.opIdToString oldId) newId remap)
+                        )
+                        (childrenOf oldId tree)
+    in
+    List.foldl (step Nothing) ( empty, ctx, Dict.empty ) (roots tree)
+
+
 
 -- READ SHAPE -----------------------------------------------------------------
 
@@ -483,8 +518,8 @@ toForest f ((Tree t) as tree) =
             resolve tree
 
         -- parentKey -> that parent's children, already in sibling order. Only nodes
-        -- that are live and have a payload are bucketed (the same admission test the
-        -- old `childIdsOf` applied); `""` is the key for roots (parent = Nothing).
+        -- that are live and have a payload are bucketed (the same admission test
+        -- `childIdsOf` applies); `""` is the key for roots (parent = Nothing).
         rootKey =
             ""
 

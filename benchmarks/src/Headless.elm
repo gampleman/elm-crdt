@@ -1,12 +1,12 @@
 port module Headless exposing (main)
 
 {-| Headless **memory/size/latency** harness, driven from Node (`run-mem.js`,
-`run-merge.js`, `run-wire.js`, `run-bench.js`).
+`run-merge.js`, `run-wire.js`, `run-bench.js`, `run-delta.js`, `run-scrub.js`).
 
 For each requested workload it builds a document at scale `n` and reports structural
 proxies for its footprint — the number of ops in the log, and the encoded byte size
 (overall, and split by container). These proxies are deterministic (unlike a
-GC-dependent heap reading) and attribute cost to a *structure*, so we can see which
+GC-dependent heap reading) and attribute cost to a _structure_, so we can see which
 one dominates. The runners additionally bracket the calls with timing /
 `process.memoryUsage()`.
 
@@ -22,6 +22,9 @@ Workloads:
   - `"list"` — a movable list of `n` small records.
   - `"churn"` — a movable list of `n`, then `n` pseudo-random `move`s (the
     arbitrary-position edit path; a single move is O(n), a batch is O(n²)).
+  - `"deletes"` — a list of `n`, then every other element deleted, so half the log is
+    `DeleteElem`. The delete-heavy shape, for pricing anything the fold does per delete
+    (pair it with `mode:"scrub"`).
   - `"dict"` — a dict of `n` short text entries.
   - `"tree"` — an outline tree of `n` nodes.
 
@@ -29,6 +32,7 @@ Workloads:
 
 import Crdt as C exposing (Ref)
 import Crdt.Doc as Doc exposing (Doc)
+import Crdt.Edit as Edit
 import Crdt.Id as Id
 import Crdt.RichText exposing (Span)
 import Crdt.Tree as Tree
@@ -58,52 +62,85 @@ type alias ONode =
     { text : String }
 
 
-type alias BoardRefs =
+{-| The board's flat bundle: one `Ref` per field plus the reserved `.schema` (same shape
+the demo uses).
+-}
+type alias BoardDoc =
     { title : Ref Board C.Settable String
     , todos : Ref Board (C.ListK C.Movable C.Nested Todo) (List Todo)
     , files : Ref Board (C.DictK C.RichK (List Span)) (Dict String (List Span))
     , outline : Ref Board (C.TreeK C.Nested ONode) (Tree.Forest ONode)
     , likes : Ref Board C.Counter Int
     , tags : Ref Board (C.ListK C.Fixed C.Settable String) (List String)
+    , schema : C.Schema C.Nested Board
     }
 
 
-boardDoc : C.RecordRefs Board BoardRefs
+boardDoc : BoardDoc
 boardDoc =
-    C.record Board BoardRefs
+    C.record Board BoardDoc
         |> C.field "title" .title C.text
-        |> C.field "todos" .todos (C.movableList todoDoc.schema)
-        |> C.field "files" .files (C.dict C.richText)
-        |> C.field "outline" .outline (C.tree onodeDoc.schema)
+        |> C.field "todos" .todos todosList
+        |> C.field "files" .files filesDict
+        |> C.field "outline" .outline outlineTree
         |> C.field "likes" .likes C.counter
-        |> C.field "tags" .tags (C.list C.text)
+        |> C.field "tags" .tags tagsList
         |> C.build
 
 
-refs : BoardRefs
+refs : BoardDoc
 refs =
-    boardDoc.refs
+    boardDoc
 
 
-type alias TodoRefs =
-    { text : Ref Todo C.Settable String, done : Ref Todo C.Settable Bool }
+{-| The container bundles. Each carries its element/value schema, so the edit and ref
+call sites below don't repeat it: `todosList.index i`, `filesDict.key k`,
+`outlineTree.node id`.
+-}
+todosList : C.Crdt (C.ListK C.Movable C.Nested Todo) (List Todo) { index : Int -> Ref r (C.ListK mv C.Nested Todo) (List Todo) -> Ref r C.Nested Todo }
+todosList =
+    C.movableList todoDoc
 
 
-todoDoc : C.RecordRefs Todo TodoRefs
+filesDict : C.Crdt (C.DictK C.RichK (List Span)) (Dict String (List Span)) { key : String -> Ref r (C.DictK C.RichK (List Span)) (Dict String (List Span)) -> Ref r C.RichK (List Span) }
+filesDict =
+    C.dict C.richText
+
+
+outlineTree : C.Crdt (C.TreeK C.Nested ONode) (Tree.Forest ONode) { node : Id.OpId -> Ref r (C.TreeK C.Nested ONode) (Tree.Forest ONode) -> Ref r C.Nested ONode }
+outlineTree =
+    C.tree onodeDoc
+
+
+tagsList : C.Crdt (C.ListK C.Fixed C.Settable String) (List String) { index : Int -> Ref r (C.ListK mv C.Settable String) (List String) -> Ref r C.Settable String }
+tagsList =
+    C.list C.text
+
+
+type alias TodoDoc =
+    { text : Ref Todo C.Settable String
+    , done : Ref Todo C.Settable Bool
+    , schema : C.Schema C.Nested Todo
+    }
+
+
+todoDoc : TodoDoc
 todoDoc =
-    C.record Todo TodoRefs
+    C.record Todo TodoDoc
         |> C.field "text" .text C.text
         |> C.field "done" .done C.bool
         |> C.build
 
 
-type alias ONodeRefs =
-    { text : Ref ONode C.Settable String }
+type alias ONodeDoc =
+    { text : Ref ONode C.Settable String
+    , schema : C.Schema C.Nested ONode
+    }
 
 
-onodeDoc : C.RecordRefs ONode ONodeRefs
+onodeDoc : ONodeDoc
 onodeDoc =
-    C.record ONode ONodeRefs
+    C.record ONode ONodeDoc
         |> C.field "text" .text C.text
         |> C.build
 
@@ -113,7 +150,7 @@ init =
     C.init (Id.replica "bench") boardDoc.schema
 
 
-ok : Doc Board -> Result C.EditError (Doc Board) -> Doc Board
+ok : Doc Board -> Result Edit.EditError (Doc Board) -> Doc Board
 ok fb =
     Result.withDefault fb
 
@@ -129,12 +166,12 @@ typeFile : String -> String -> Doc Board -> Doc Board
 typeFile name s doc =
     let
         d1 =
-            C.setKey refs.files C.richText name [] doc |> ok doc
+            Edit.setKey refs.files name [] doc |> ok doc
 
         fileRef =
-            refs.files |> C.key name C.richText
+            refs.files |> filesDict.key name
     in
-    C.setRich fileRef s d1 |> ok d1
+    Edit.setRich fileRef s d1 |> ok d1
 
 
 {-| A short pseudo-random-ish word from an index, so text isn't degenerate.
@@ -178,14 +215,14 @@ buildTyping n =
             String.length full
     in
     List.range 1 chars
-        |> List.foldl (\i doc -> C.set refs.title (String.left i full) doc |> ok doc) init
+        |> List.foldl (\i doc -> Edit.set refs.title (String.left i full) doc |> ok doc) init
 
 
 buildList : Int -> Doc Board
 buildList n =
     List.range 1 n
         |> List.foldl
-            (\i doc -> C.append refs.todos todoDoc.schema (Todo (word i) False) doc |> ok doc)
+            (\i doc -> Edit.append refs.todos (Todo (word i) False) doc |> ok doc)
             init
 
 
@@ -221,17 +258,40 @@ buildChurn n =
                     to =
                         modBy n s2
                 in
-                ( C.move refs.todos from to doc |> ok doc, s2 )
+                ( Edit.move refs.todos from to doc |> ok doc, s2 )
             )
             ( list0, 1 )
         |> Tuple.first
+
+
+{-| Delete-heavy: build a list of `n` records, then delete **every other one** — so half
+the ops in the log are `DeleteElem`, each addressing an element by id.
+
+This is the workload that costs something under the pending-ops gate
+(`design-docs/15-pending-ops.md`): a delete is one of the three gated actions, so every
+one of them pays a target walk plus an `Rga.get` for its subject on each fold. Registers,
+text and inserts skip the check syntactically, so `list`/`text`/`dict` can't see it —
+only this workload and `scrub` (which re-folds the whole log) can.
+
+-}
+buildDeletes : Int -> Doc Board
+buildDeletes n =
+    let
+        list0 =
+            buildList n
+    in
+    -- delete from the back, so each index is still valid as the list shrinks
+    List.range 1 (n // 2)
+        |> List.foldl
+            (\i doc -> Edit.remove refs.todos (n - (2 * i)) doc |> ok doc)
+            list0
 
 
 buildFlat : Int -> Doc Board
 buildFlat n =
     List.range 1 n
         |> List.foldl
-            (\i doc -> C.append refs.tags C.text (word i) doc |> ok doc)
+            (\i doc -> Edit.append refs.tags (word i) doc |> ok doc)
             init
 
 
@@ -264,7 +324,7 @@ buildDict : Int -> Doc Board
 buildDict n =
     List.range 1 n
         |> List.foldl
-            (\i doc -> C.setKey refs.files C.richText ("k" ++ String.fromInt i) [] doc |> ok doc)
+            (\i doc -> Edit.setKey refs.files ("k" ++ String.fromInt i) [] doc |> ok doc)
             init
 
 
@@ -272,7 +332,7 @@ buildTree : Int -> Doc Board
 buildTree n =
     List.range 1 n
         |> List.foldl
-            (\i doc -> C.addChild refs.outline onodeDoc.schema (ONode (word i)) Nothing doc |> ok doc)
+            (\i doc -> Edit.addChild refs.outline onodeDoc (ONode (word i)) Nothing doc |> ok doc)
             init
 
 
@@ -283,11 +343,11 @@ buildDemo : Int -> Doc Board
 buildDemo n =
     let
         withTitle d =
-            C.set refs.title "Benchmark board" d |> ok d
+            Edit.set refs.title "Benchmark board" d |> ok d
 
         withTodos d =
             List.range 1 n
-                |> List.foldl (\i acc -> C.append refs.todos todoDoc.schema (Todo (sentence i 4) False) acc |> ok acc) d
+                |> List.foldl (\i acc -> Edit.append refs.todos (Todo (sentence i 4) False) acc |> ok acc) d
 
         withFiles d =
             List.range 1 (max 1 (n // 10))
@@ -295,11 +355,11 @@ buildDemo n =
 
         withTree d =
             List.range 1 n
-                |> List.foldl (\i acc -> C.addChild refs.outline onodeDoc.schema (ONode (word i)) Nothing acc |> ok acc) d
+                |> List.foldl (\i acc -> Edit.addChild refs.outline onodeDoc (ONode (word i)) Nothing acc |> ok acc) d
 
         withLikes d =
             List.range 1 (max 1 (n // 5))
-                |> List.foldl (\_ acc -> C.increment refs.likes 1 acc |> ok acc) d
+                |> List.foldl (\_ acc -> Edit.increment refs.likes 1 acc |> ok acc) d
     in
     init |> withTitle |> withTodos |> withFiles |> withTree |> withLikes
 
@@ -319,6 +379,9 @@ build workload n =
         "churn" ->
             buildChurn n
 
+        "deletes" ->
+            buildDeletes n
+
         "flat" ->
             buildFlat n
 
@@ -332,7 +395,7 @@ build workload n =
             buildDemo n
 
 
-{-| One more *typical* edit on top of a doc — the realistic steady-state action whose
+{-| One more _typical_ edit on top of a doc — the realistic steady-state action whose
 delta (`encodeSince`) is the small payload where gzip's cold dictionary hurts most.
 Returns the doc after the edit; the caller diffs it against the pre-edit version.
 -}
@@ -343,32 +406,32 @@ oneMoreEdit workload doc =
             -- type a few more characters into the existing file
             let
                 fileRef =
-                    refs.files |> C.key "doc.md" C.richText
+                    refs.files |> filesDict.key "doc.md"
 
                 current =
-                    C.read doc |> Result.toMaybe |> Maybe.andThen (\b -> Dict.get "doc.md" b.files) |> Maybe.map plain |> Maybe.withDefault ""
+                    Doc.read doc |> Result.toMaybe |> Maybe.andThen (\b -> Dict.get "doc.md" b.files) |> Maybe.map plain |> Maybe.withDefault ""
             in
-            C.setRich fileRef (current ++ " more") doc |> ok doc
+            Edit.setRich fileRef (current ++ " more") doc |> ok doc
 
         "typing" ->
             -- one more keystroke: append a single char to the title (1-char run op)
             let
                 current =
-                    C.read doc |> Result.toMaybe |> Maybe.map .title |> Maybe.withDefault ""
+                    Doc.read doc |> Result.toMaybe |> Maybe.map .title |> Maybe.withDefault ""
             in
-            C.set refs.title (current ++ "x") doc |> ok doc
+            Edit.set refs.title (current ++ "x") doc |> ok doc
 
         "list" ->
-            C.append refs.todos todoDoc.schema (Todo "one more" False) doc |> ok doc
+            Edit.append refs.todos (Todo "one more" False) doc |> ok doc
 
         "dict" ->
-            C.setKey refs.files C.richText "newkey" [] doc |> ok doc
+            Edit.setKey refs.files "newkey" [] doc |> ok doc
 
         "tree" ->
-            C.addChild refs.outline onodeDoc.schema (ONode "one more") Nothing doc |> ok doc
+            Edit.addChild refs.outline onodeDoc (ONode "one more") Nothing doc |> ok doc
 
         _ ->
-            C.append refs.todos todoDoc.schema (Todo "one more" False) doc |> ok doc
+            Edit.append refs.todos (Todo "one more" False) doc |> ok doc
 
 
 {-| Plain text of a rich-text span list, for `oneMoreEdit` on "text".
@@ -390,8 +453,9 @@ encodedBytes doc =
     Doc.encode doc |> JE.encode 0 |> String.length
 
 
-{-| A command. `mode` selects the harness: "" = build/retain (mem), "merge", "wire",
-"build" (latency of constructing the doc), "read" (latency of `iters` reads).
+{-| A command. `mode` selects the harness: "" = build/retain (mem), "merge", "delta",
+"wire", "build" (latency of constructing the doc), "read" (latency of `iters` cached reads),
+"fresh" (the same reads re-folded from base), "scrub" (`readAt` mid-history).
 -}
 type alias Command =
     { workload : String, n : Int, retain : Bool, reset : Bool, roundtrip : Bool, mode : String, iters : Int }
@@ -401,10 +465,18 @@ type alias Model =
     { retained : List (Doc Board) }
 
 
-{-| The wire payloads for a workload at size `n`: the full-document encoding, and the
-delta (`encodeSince`) of exactly one more typical edit on top.
+{-| The wire payloads for a workload at size `n`: the full-document encoding, the delta
+(`encodeSince`) of exactly one more typical edit on top, and a **snapshot** of the compacted
+document.
+
+The snapshot is the only payload that carries the `Node` **state** encoding rather than the
+op encoding, so it is the only one that moves when a container's element representation
+changes (`design-docs/16-typed-sequence-content.md`). It is also a real path, not a
+curiosity: it is what a peer behind our compaction boundary is sent to catch up
+(`Crdt.Doc.encodeFrom` / the snapshot branch of `decodeInto`).
+
 -}
-wirePayloads : String -> Int -> ( String, String )
+wirePayloads : String -> Int -> { full : String, delta : String, snapshot : String }
 wirePayloads workload n =
     let
         doc =
@@ -415,17 +487,14 @@ wirePayloads workload n =
 
         edited =
             oneMoreEdit workload doc
-
-        full =
-            Doc.encode doc |> JE.encode 0
-
-        delta =
-            Doc.encodeSince before edited |> JE.encode 0
     in
-    ( full, delta )
+    { full = Doc.encode doc |> JE.encode 0
+    , delta = Doc.encodeSince before edited |> JE.encode 0
+    , snapshot = Doc.encodeFrom (Doc.version doc) doc |> JE.encode 0
+    }
 
 
-{-| A doc as it would arrive over the wire: encode then decode into a *fresh* replica.
+{-| A doc as it would arrive over the wire: encode then decode into a _fresh_ replica.
 -}
 received : Doc Board -> Doc Board
 received doc =
@@ -446,7 +515,7 @@ mergeSetup workload n =
         peer =
             Doc.decodeInto (Doc.encode local) (C.init (Id.replica "peer") boardDoc.schema)
                 |> Result.withDefault local
-                |> (\d -> C.set refs.title "peer edit" d |> ok d)
+                |> (\d -> Edit.set refs.title "peer edit" d |> ok d)
     in
     ( local, peer )
 
@@ -499,6 +568,68 @@ deltaBench workload n iters =
     List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
 
 
+{-| History-scrub latency: `iters` `readAt` reads at a **mid-history** version of a size-`n`
+doc, returning a forced checksum.
+
+Unlike `readBench` (served from the maintained cache) this is the one path that **re-folds
+the op log from the base** on every call — `checkout` the frontier's ancestors, then
+materialize. It is therefore where any per-op cost added to the fold shows up, and the
+reason it has its own mode: pair it with the `deletes` workload to price the pending-ops
+gate (`design-docs/15-pending-ops.md`).
+
+Scrubbing to the middle rather than the end also means half the log is _excluded_, which
+is what a scrubber drag actually does.
+
+-}
+scrubBench : String -> Int -> Int -> Int
+scrubBench workload n iters =
+    let
+        doc =
+            build workload n
+
+        at =
+            Doc.versionAt (Doc.historyLength doc // 2) doc
+
+        once acc =
+            case Doc.readAt at doc of
+                Ok b ->
+                    acc + List.length b.todos + Dict.size b.files + List.length b.outline
+
+                Err _ ->
+                    acc
+    in
+    List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
+
+
+{-| The un-cached counterpart to `readBench`: `iters` reads of the **head** version via
+`readAt`, which re-folds the entire op log from the base instead of reading the maintained
+cache. Same content as `readBench`, so the two are directly comparable — that ratio is the
+Phase-2 go/no-go gate `run.js` prints (cached must stay ~flat in `n` while fresh grows).
+
+`scrubBench` measures the same machinery at a mid-history version, where half the log is
+excluded; this one folds all of it.
+
+-}
+freshReadBench : String -> Int -> Int -> Int
+freshReadBench workload n iters =
+    let
+        doc =
+            build workload n
+
+        head =
+            Doc.version doc
+
+        once acc =
+            case Doc.readAt head doc of
+                Ok b ->
+                    acc + List.length b.todos + Dict.size b.files + List.length b.outline
+
+                Err _ ->
+                    acc
+    in
+    List.range 1 iters |> List.foldl (\_ acc -> once acc) 0
+
+
 {-| Read-latency: `iters` reads of a size-`n` doc, returning a forced checksum. JS times
 the batch and subtracts the build cost (reported separately by "build" mode).
 -}
@@ -509,7 +640,7 @@ readBench workload n iters =
             build workload n
 
         once acc =
-            case C.read doc of
+            case Doc.read doc of
                 Ok b ->
                     acc + List.length b.todos + Dict.size b.files + List.length b.outline
 
@@ -553,6 +684,38 @@ main =
                             , ( "n", JE.int cmd.n )
                             , ( "iters", JE.int iters )
                             , ( "checksum", JE.int (deltaBench cmd.workload cmd.n iters) )
+                            ]
+                        )
+                    )
+
+                else if cmd.mode == "fresh" then
+                    let
+                        iters =
+                            max 1 cmd.iters
+                    in
+                    ( model
+                    , done
+                        (JE.object
+                            [ ( "workload", JE.string cmd.workload )
+                            , ( "n", JE.int cmd.n )
+                            , ( "iters", JE.int iters )
+                            , ( "checksum", JE.int (freshReadBench cmd.workload cmd.n iters) )
+                            ]
+                        )
+                    )
+
+                else if cmd.mode == "scrub" then
+                    let
+                        iters =
+                            max 1 cmd.iters
+                    in
+                    ( model
+                    , done
+                        (JE.object
+                            [ ( "workload", JE.string cmd.workload )
+                            , ( "n", JE.int cmd.n )
+                            , ( "iters", JE.int iters )
+                            , ( "checksum", JE.int (scrubBench cmd.workload cmd.n iters) )
                             ]
                         )
                     )
@@ -605,7 +768,7 @@ main =
 
                 else if cmd.mode == "wire" then
                     let
-                        ( full, delta ) =
+                        payloads =
                             wirePayloads cmd.workload cmd.n
                     in
                     ( model
@@ -613,8 +776,9 @@ main =
                         (JE.object
                             [ ( "workload", JE.string cmd.workload )
                             , ( "n", JE.int cmd.n )
-                            , ( "full", JE.string full )
-                            , ( "delta", JE.string delta )
+                            , ( "full", JE.string payloads.full )
+                            , ( "delta", JE.string payloads.delta )
+                            , ( "snapshot", JE.string payloads.snapshot )
                             ]
                         )
                     )

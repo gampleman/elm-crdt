@@ -2,7 +2,7 @@ module RefTests exposing (suite)
 
 {-| Type-safe writes via `Crdt.Ref`. These tests exercise the _runtime_ behavior;
 the _compile-time_ guarantees (e.g. `increment` only on a counter ref) are asserted
-by the fact that this module compiles at all, plus the notes in `docs/07-optics.md`.
+by the fact that this module compiles at all, plus the notes in `design-docs/07-optics.md`.
 
 Covered: field refs from the builder, `set`/`over`/`increment`, composition with
 `at` into a nested record, `switch` on a sum type, and editing a variant's payload

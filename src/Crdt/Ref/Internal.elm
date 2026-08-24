@@ -1,9 +1,10 @@
 module Crdt.Ref.Internal exposing (Ref(..))
 
-{-| **Internal.** The `Ref` type, extracted to its own module so both the `Crdt` module
-(where refs are built and used to edit) and `Crdt.Doc` (where `touched`/`origins` query a
-`Diff` with a ref) can reference it without a circular import. `Crdt` re-exposes it as the
-public `Crdt.Ref` type alias; users never import this module.
+{-| **Internal.** The `Ref` type, extracted to its own module so every layer that speaks
+refs can reference it without a circular import: `Crdt` (where refs are built),
+`Crdt.Edit` (where they are edited through), `Crdt.Doc` (where `touched`/`origins` query a
+`Diff` with a ref) and `Crdt.Cursor`. `Crdt` re-exposes it as the public `Crdt.Ref` type
+alias; users never import this module.
 
 A `Ref` pairs a `Path` into the document with the sub-schema at that spot. It depends only
 on lower layers (`Crdt.Path`, `Crdt.Schema.Internal`), so it sits below both `Crdt` and

@@ -1,12 +1,18 @@
 module ExtensibilityTests exposing (suite)
 
 {-| User-defined CRDT types via `Crdt.opSet` + `Edit.contribute`/`retract`
-(see docs/14). An op-set is a grow-only/removable set of op-id-keyed contributions folded
+(see design-docs/14). An op-set is a grow-only/removable set of op-id-keyed contributions folded
 into a value at read; convergence is free (merge unions the contributions), the semantics
 is the user's `fold`. These tests build three user types — a max-register, a multi-value
 register, and an add-wins set — entirely in test code (no library change), and assert the
 property that makes it a real CRDT: **concurrent contributions from two replicas converge
 to the same value in both merge orders**, plus that the fold and removal read correctly.
+
+`OpSetK` carries the contribution's **kind** as well as its type, so `contribute` only
+accepts a bundle that merges the way the op-set declared. That guarantee is compile-time —
+this module compiling at all is the assertion; see the comment above `docDoc` for the
+counter-example that no longer compiles.
+
 -}
 
 import Crdt as C exposing (Ref)
@@ -30,27 +36,40 @@ type alias Sample =
 
 
 type alias DocRefs =
-    { high : Ref Sample (C.OpSetK Int) Int
-    , seen : Ref Sample (C.OpSetK Int) (List Int)
-    , tags : Ref Sample (C.OpSetK String) (List String)
+    { high : Ref Sample (C.OpSetK C.Settable Int) Int
+    , seen : Ref Sample (C.OpSetK C.Settable Int) (List Int)
+    , tags : Ref Sample (C.OpSetK C.Settable String) (List String)
     , schema : C.Schema C.Nested Sample
     }
 
 
-maxRegister : C.Leaf (C.OpSetK Int) Int
+maxRegister : C.Crdt (C.OpSetK C.Settable Int) Int {}
 maxRegister =
     C.opSet { contribution = C.int, fold = List.maximum >> Maybe.withDefault 0 }
 
 
-mvRegister : C.Leaf (C.OpSetK Int) (List Int)
+mvRegister : C.Crdt (C.OpSetK C.Settable Int) (List Int) {}
 mvRegister =
     -- keep every distinct concurrently-contributed value, sorted for a stable read
     C.opSet { contribution = C.int, fold = \xs -> Set.toList (Set.fromList xs) }
 
 
-stringSet : C.Leaf (C.OpSetK String) (List String)
+stringSet : C.Crdt (C.OpSetK C.Settable String) (List String) {}
 stringSet =
     C.opSet { contribution = C.string, fold = \xs -> Set.toList (Set.fromList xs) }
+
+
+
+-- COMPILE-TIME GUARANTEE (no runtime assertion possible): `OpSetK` carries the
+-- contribution's KIND as well as its type, so `contribute` only accepts a bundle that
+-- merges the way the op-set declared. Every `Edit.contribute … C.int …` below type-checks
+-- against `maxRegister`/`mvRegister` (declared with `C.int`, a Settable register), whereas
+--
+--     Edit.contribute docDoc.high C.counter 5 doc
+--
+-- does NOT compile — even though `C.counter` also has contribution type `Int`. Before the
+-- kind param existed that mistake compiled and seeded a counter node where a register was
+-- expected. This module compiling is the assertion.
 
 
 docDoc : DocRefs
@@ -99,7 +118,7 @@ mergeIn from to =
 
 suite : Test
 suite =
-    describe "extensibility: user-defined op-set CRDTs (docs/14)"
+    describe "extensibility: user-defined op-set CRDTs (design-docs/14)"
         [ test "fresh op-set reads its fold of the empty set" <|
             \_ ->
                 read (init "a")

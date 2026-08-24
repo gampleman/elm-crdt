@@ -118,23 +118,15 @@ toSpans r =
 
 -- BLOCK STRUCTURE ------------------------------------------------------------
 --
--- The char sequence carries two extra *distinguished* element kinds besides text:
+-- The sequence carries two *structural* element kinds besides text (see
+-- `design-docs/11`):
 --   • a MARKER = a block boundary (its `block` mark gives the following block's type,
 --     the live nest tokens right after it give the block's depth);
 --   • a NEST TOKEN = one unit of indent depth for the block it follows a marker in.
--- Both are encoded as non-string prims (marker = PInt 0, token = PInt 1) so they can
--- never collide with a text char (`Reg (PString _)`) and are already skipped by
--- `charOf`/`toSpans` (which match only `PString`). See `docs/11`.
-
-
-markerTag : Int
-markerTag =
-    0
-
-
-nestTokenTag : Int
-nestTokenTag =
-    1
+-- These are constructors of `Node.RichElem`, so the compiler enforces that an element is
+-- exactly one of the three and every walk over the sequence has to say what it does with
+-- each. They used to be non-string prims smuggled inside a register (marker = PInt 0,
+-- token = PInt 1), distinguishable only by convention.
 
 
 {-| Is a mark op the **leading-block type mark** — the `block`-type mark that carries
@@ -186,37 +178,36 @@ leadingTypeMark marks =
         |> Maybe.withDefault ""
 
 
-{-| The content `Node` for a block-boundary marker element (used when seeding /
-emitting a split). Distinguished from a text char by being a non-string prim.
+{-| The content of a block-boundary marker element (used when seeding / emitting a split).
 -}
-markerNode : Node.Node
+markerNode : Node.RichElem
 markerNode =
-    Node.reg (PInt markerTag) (Id.opId 0 (Id.replica ""))
+    Node.Token Node.Marker
 
 
-{-| The content `Node` for one nest-token (indent-unit) element.
+{-| The content of one nest-token (indent-unit) element.
 -}
-nestTokenNode : Node.Node
+nestTokenNode : Node.RichElem
 nestTokenNode =
-    Node.reg (PInt nestTokenTag) (Id.opId 0 (Id.replica ""))
+    Node.Token Node.Nest
 
 
 {-| Is this element content a block marker?
 -}
-isMarker : Node.Node -> Bool
-isMarker node =
-    Node.asPrim node == Just (PInt markerTag)
+isMarker : Node.RichElem -> Bool
+isMarker elem =
+    elem == Node.Token Node.Marker
 
 
 {-| Is this element content a nest token?
 -}
-isNestToken : Node.Node -> Bool
-isNestToken node =
-    Node.asPrim node == Just (PInt nestTokenTag)
+isNestToken : Node.RichElem -> Bool
+isNestToken elem =
+    elem == Node.Token Node.Nest
 
 
 {-| Flatten a rich-text node into its **blocks**, each with its app-defined type,
-indent depth, and inline spans (see `docs/11`). The document always has at least the
+indent depth, and inline spans (see `design-docs/11`). The document always has at least the
 implicit leading block (characters before the first marker), so an empty/marker-free
 node reads as one default block.
 
@@ -415,7 +406,7 @@ valueInRange r type_ start end =
 
 
 {-| Does mark op `m`'s range cover the character at order-index `i`? The endpoints
-are half-open boundaries between characters (or ±∞ for start/end of text), so a
+are boundaries _between_ characters (or ±∞ for start/end of text), so a
 character sits strictly between them: `start < i < end`. A missing anchor `ref` (the
 referenced character hasn't arrived yet) means the mark covers nothing until it
 resolves.
@@ -459,13 +450,15 @@ boundaryPos indexOf anchor =
                     )
 
 
-charOf : Node.Node -> Maybe String
-charOf node =
-    case Node.asPrim node of
-        Just (PString s) ->
-            Just s
+{-| The character an element holds, or `Nothing` for a structural token.
+-}
+charOf : Node.RichElem -> Maybe String
+charOf elem =
+    case elem of
+        Node.TextChar ch ->
+            Just ch
 
-        _ ->
+        Node.Token _ ->
             Nothing
 
 
@@ -507,7 +500,7 @@ fromSpans ctx spans =
                                                 lastId r
 
                                             r1 =
-                                                Rga.put (Rga.element id parent Rga.Right (Node.reg (PString (String.fromChar ch)) id) False) r
+                                                Rga.put (Rga.element id parent Rga.Right (Node.TextChar (String.fromChar ch)) False) r
                                         in
                                         ( r1, cc1, id :: acc )
                                     )
@@ -568,7 +561,7 @@ primOf mv =
             PString s
 
 
-lastId : Rga.Rga Node.Node -> Maybe OpId
+lastId : Rga.Rga c -> Maybe OpId
 lastId rga =
     Rga.toElementsInOrder rga |> List.reverse |> List.head |> Maybe.map .id
 

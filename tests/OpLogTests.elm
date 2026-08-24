@@ -1,6 +1,6 @@
 module OpLogTests exposing (suite)
 
-{-| Phase 1 op-log tests (see `docs/02-oplog.md`): real DAG + frontiers, causal
+{-| Phase 1 op-log tests (see `design-docs/02-oplog.md`): real DAG + frontiers, causal
 materialize, op-union merge, and checkout.
 
 The central properties:
@@ -10,12 +10,12 @@ The central properties:
   - **materialize is independent of the causal linearization** chosen — folding
     any valid permutation of the ops yields the same `Node`;
   - **checkout** to a frontier reproduces the state as of that point;
-  - **SetPresence** expresses dict set/remove on the log.
+  - **SetKeyPresence** expresses dict set/remove on the log.
 
 -}
 
 import Crdt.Id.Internal as Id exposing (OpId)
-import Crdt.Node as Node exposing (Node, Prim(..))
+import Crdt.Node exposing (Node, Prim(..))
 import Crdt.OpLog as OpLog exposing (Action(..), Op, OpStore, TargetStep(..))
 import Crdt.Rga as Rga
 import Crdt.Schema.Internal as S exposing (Crdt)
@@ -110,15 +110,10 @@ why a _causal_ order (not just any order) is needed to materialize correctly.
 sampleOps : List Op
 sampleOps =
     [ { id = alice 1, deps = [], action = InsertElem { container = items, elemId = alice 1, parent = Nothing, side = Rga.Right, seed = emptyItem } }
-    , { id = alice 2, deps = [ alice 1 ], action = InsertElem { container = [ IntoKey "items", IntoElem (alice 1), IntoKey "label" ], elemId = alice 2, parent = Nothing, side = Rga.Right, seed = charNode 'A' (alice 2) } }
+    , { id = alice 2, deps = [ alice 1 ], action = InsertText { container = [ IntoKey "items", IntoElem (alice 1), IntoKey "label" ], start = alice 2, text = "A", parent = Nothing, side = Rga.Right } }
     , { id = alice 3, deps = [ alice 1 ], action = InsertElem { container = items, elemId = alice 3, parent = Just (alice 1), side = Rga.Right, seed = emptyItem } }
     , { id = alice 4, deps = [ alice 1 ], action = DeleteElem { container = items, elem = alice 1 } }
     ]
-
-
-charNode : Char -> OpId -> Node
-charNode c stamp =
-    Node.reg (PString (String.fromChar c)) stamp
 
 
 
@@ -233,7 +228,7 @@ suite =
                         |> Result.map (.items >> List.map .label)
                         |> Expect.equal (Ok [ "A" ])
             ]
-        , describe "SetPresence (dict on the log)"
+        , describe "SetKeyPresence (dict on the log)"
             [ test "setting a key present (seeded as text) then typing into it reads back" <|
                 \_ ->
                     let
@@ -241,8 +236,8 @@ suite =
                             S.emptyNode S.text (Id.ctx (Id.replica "base")) |> Tuple.first
 
                         ops =
-                            [ { id = alice 1, deps = [], action = SetPresence { target = [ IntoKey "notes", IntoKey "k" ], present = True, seed = emptyNote } }
-                            , { id = alice 2, deps = [ alice 1 ], action = InsertElem { container = [ IntoKey "notes", IntoKey "k" ], elemId = alice 2, parent = Nothing, side = Rga.Right, seed = charNode 'v' (alice 2) } }
+                            [ { id = alice 1, deps = [], action = SetKeyPresence { target = [ IntoKey "notes", IntoKey "k" ], present = True, seed = emptyNote } }
+                            , { id = alice 2, deps = [ alice 1 ], action = InsertText { container = [ IntoKey "notes", IntoKey "k" ], start = alice 2, text = "v", parent = Nothing, side = Rga.Right } }
                             ]
                     in
                     read (storeOf ops)
@@ -255,8 +250,8 @@ suite =
                             S.emptyNode S.text (Id.ctx (Id.replica "base")) |> Tuple.first
 
                         ops =
-                            [ { id = alice 1, deps = [], action = SetPresence { target = [ IntoKey "notes", IntoKey "k" ], present = True, seed = emptyNote } }
-                            , { id = alice 5, deps = [ alice 1 ], action = SetPresence { target = [ IntoKey "notes", IntoKey "k" ], present = False, seed = emptyNote } }
+                            [ { id = alice 1, deps = [], action = SetKeyPresence { target = [ IntoKey "notes", IntoKey "k" ], present = True, seed = emptyNote } }
+                            , { id = alice 5, deps = [ alice 1 ], action = SetKeyPresence { target = [ IntoKey "notes", IntoKey "k" ], present = False, seed = emptyNote } }
                             ]
                     in
                     read (storeOf ops)
@@ -312,7 +307,7 @@ suite =
 
                         bobStore =
                             storeOf
-                                [ { id = bob 1, deps = [], action = SetPresence { target = notes ++ [ IntoKey "n" ], present = True, seed = emptyNote } } ]
+                                [ { id = bob 1, deps = [], action = SetKeyPresence { target = notes ++ [ IntoKey "n" ], present = True, seed = emptyNote } } ]
                     in
                     Expect.equal
                         (read (OpLog.merge aliceStore bobStore))

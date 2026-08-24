@@ -14,22 +14,25 @@ module Crdt.Edit exposing
 document and get its refs in the `Crdt` module; you _change_ it here.
 
 Every edit takes a `Ref` (naming the spot), whatever the operation needs, and the `Doc`,
-and returns `Result EditError (Doc doc)`. The ref's `kind` makes edits **safe**: the
-compiler rejects a nonsensical operation — `increment` on text, `move` on a non-movable
-list, `set` with the wrong value type — so most mistakes are compile errors, not runtime
-surprises. What's left, an `EditError`, is a target that didn't resolve against the current
-value; you can usually `Result.withDefault doc` past it.
+and returns `Result EditError (Doc doc)` (`contribute` also hands back the contribution's
+key, and the `read…` functions here return the value read). The ref's `kind` makes edits
+**safe**: the compiler rejects a nonsensical operation — `increment` on text, `move` on a
+non-movable list, `set` with the wrong value type — so most mistakes are compile errors,
+not runtime surprises. What's left, an `EditError`, is a target that didn't resolve
+against the current value; you can usually `Result.withDefault doc` past it.
 
     import Crdt
     import Crdt.Edit as Edit
 
     doc1 =
-        Edit.set board.refs.title "Trip plan" doc
+        Edit.set board.title "Trip plan" doc
+            |> Result.withDefault doc
 
     doc2 =
-        Edit.increment board.refs.votes 1 doc1
+        Edit.increment board.votes 1 doc1
+            |> Result.withDefault doc1
 
-    -- Edit.increment board.refs.title  =>  a compile error
+    -- Edit.increment board.title  =>  a compile error
 
 
 # Errors
@@ -193,9 +196,16 @@ firstMapValue node =
 -- SIMPLE VALUES ---------------------------------------------------------------
 
 
-{-| Set the value at a ref. Total across kinds: a present spot is overwritten; a
-sum-type payload ref edits the payload iff that variant is active, else it is a
-silent no-op. Emits minimal ops; a text spot still merges character-wise.
+{-| Set the value at a ref: a present spot is overwritten, emitting minimal ops (a text
+spot still merges character-wise).
+
+Through a **sum-type payload ref**, the write lands only while that variant is active. If
+the variant was active at some point and isn't now, the payload key still exists and the
+write is a harmless no-op on the read. But for a variant that has **never** been active the
+key is absent entirely and there is nothing to write under, so you get
+`Err (PathNotFound …)` — use `switch` to make the variant active first. Call sites that
+don't care can `Result.withDefault doc` either way.
+
 -}
 set : Ref r kind a -> a -> Doc doc -> Result EditError (Doc doc)
 set (Ref r) value doc =
@@ -237,8 +247,8 @@ currently active. Given the `Status` type from `Crdt.custom`:
     doc |> Edit.switch statusRef (Archived "old project")
 
     -- vs. edit the reason text *within* an already-Archived status (a no-op if the
-    -- status is currently Planning or Active):
-    doc |> Edit.set (statusRef |> Crdt.at status.refs.archivedReason) "new reason"
+    -- status is currently Active or Snooze):
+    doc |> Edit.set (statusRef |> Crdt.at status.archivedReason) "new reason"
 
 So reach for `switch` when the case changes (`Active` → `Archived`), and a payload ref
 when the case stays the same but its contents change. Which variant is active merges
@@ -312,6 +322,10 @@ setKey (Ref r) k value doc =
 
 
 {-| Remove a dict key (LWW tombstone).
+
+Removing a key this replica has not observed does nothing: a delete races only against
+writes it has actually seen, so a concurrent `setKey` of an unseen key wins.
+
 -}
 removeKey : Ref r (DictK vk v) dictType -> String -> Doc doc -> Result EditError (Doc doc)
 removeKey (Ref r) k doc =
@@ -331,7 +345,7 @@ Takes the **node bundle** (the same one you gave `Crdt.tree`) for the payload sc
 tree seeds an empty forest, so the node schema can't be recovered and is passed here.
 
 -}
-addChild : Ref r (TreeK ek a) forest -> { s | schema : Schema ek a } -> a -> Maybe Id.OpId -> Doc doc -> Result EditError (Doc doc)
+addChild : Ref r (TreeK ek a) forest -> Crdt.Crdt ek a s -> a -> Maybe Id.OpId -> Doc doc -> Result EditError (Doc doc)
 addChild (Ref r) nodeBundle value parent doc =
     DocI.treeAddChild r.path parent (SI.with value nodeBundle.schema) doc
         |> mapEdit
@@ -498,7 +512,7 @@ value; it is written under a fresh op-id, so concurrent contributions from any r
 all survive and the op-set's `fold` sees them all. Returns the contribution's key (its
 op-id string), which you can keep to `retract` exactly that contribution later.
 
-    case Edit.contribute board.refs.highScore Crdt.int 42 doc of
+    case Edit.contribute board.highScore Crdt.int 42 doc of
         Ok ( key, doc1 ) ->
             -- keep `key` if you'll want to `retract` this contribution later
             ...
@@ -507,7 +521,7 @@ op-id string), which you can keep to `retract` exactly that contribution later.
             ...
 
 -}
-contribute : Ref r (OpSetK c) a -> { s | schema : Schema ck c } -> c -> Doc doc -> Result EditError ( String, Doc doc )
+contribute : Ref r (OpSetK ck c) a -> Crdt.Crdt ck c s -> c -> Doc doc -> Result EditError ( String, Doc doc )
 contribute (Ref r) contributionBundle value doc =
     DocI.contribute r.path (SI.with value contributionBundle.schema) doc
         |> mapEdit
@@ -546,7 +560,7 @@ If you want removal keyed by value rather than by contribution id, keep your own
 `Dict value key` alongside the document and look the key up when removing.
 
 -}
-retract : Ref r (OpSetK c) a -> String -> Doc doc -> Result EditError (Doc doc)
+retract : Ref r (OpSetK ck c) a -> String -> Doc doc -> Result EditError (Doc doc)
 retract (Ref r) contributionKey doc =
     DocI.retract r.path contributionKey doc
         |> mapEdit

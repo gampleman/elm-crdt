@@ -7,11 +7,12 @@ module Crdt.RichText exposing
 analogue of a document with bold, links, headings and lists.
 
 You never construct these yourself. You describe a rich-text field with `Crdt.richText`,
-edit it through the `Crdt` module (type into it, and turn formatting on and off with
-`Crdt.Edit.mark`/`Crdt.Edit.unmark`, or restructure it with `Crdt.Edit.splitBlock` and friends), and
+edit it through `Crdt.Edit` (type into it with `Crdt.Edit.setRich` /
+`Crdt.Edit.setBlockText`, turn formatting on and off with `Crdt.Edit.mark`/`Crdt.Edit.unmark`,
+or restructure it with `Crdt.Edit.splitBlock` and friends), and
 read it back as the shapes below:
 
-  - `Crdt.read` decodes a rich-text field to a flat `List Span` — the text broken into
+  - `Crdt.Doc.read` decodes a rich-text field to a flat `List Span` — the text broken into
     runs, each run tagged with the formatting active over it. This is enough to render
     inline formatting (bold, italic, links).
   - `Crdt.Edit.readBlocks` gives you a `List Block` — the same text grouped into the
@@ -98,10 +99,11 @@ type MarkValue
     your editor decides what the vocabulary means and how to render it.
   - `depth` is the indent level, starting at `0`, changed with `Crdt.Edit.indentBlock` and
     `Crdt.Edit.outdentBlock`.
-  - `spans` is the block's inline content, exactly as `Crdt.read` gives them — so
+  - `spans` is the block's inline content, exactly as `Crdt.Doc.read` gives them — so
     the same `viewSpan` renders both.
-  - `marker` is an internal identity for the block, used by the block-editing functions
-    in the `Crdt` module. You will rarely read it directly.
+  - `marker` is an internal identity for the block (`Nothing` for the leading block,
+    which has no marker element), used by the block-editing functions in `Crdt.Edit`.
+    You will rarely read it directly.
 
 -}
 type alias Block =

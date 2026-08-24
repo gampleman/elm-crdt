@@ -3,8 +3,10 @@ module Crdt.OpJson exposing (encodeOps, opsDecoder)
 {-| JSON wire format for operations, so an op-log document can be synced.
 
 Mirrors `Crdt.Json` (which serializes the `Node` state tree) but for the
-`Crdt.OpLog` operation types. A delta or a full document is just a list of `Op`s;
-the receiver merges them into its own store. `Node` seeds inside insert ops and
+`Crdt.OpLog` operation types. A delta — or a whole document that has never been
+compacted — is just a list of `Op`s; the receiver merges them into its own store.
+(The payload envelope around them, and the compacted `base` node a snapshot ships
+alongside them, live in `Crdt.Doc.Internal`.) `Node` seeds inside insert ops and
 the `OpId`/`Prim` leaves reuse the `Crdt.Json` codecs, so there is one source of
 truth for value serialization.
 
@@ -18,7 +20,18 @@ an action is tagged by `"k"`:
     — a run-length text insert: `x` is the whole run, `e` its first char's id (`start`);
     char `i` gets the derived id `start+i` and chains as a right-spine (see
     `OpLog.insertTextRun`). One op per typed run instead of one per character.
+  - `{ "k": "tok", "t": <target>, "e": <opid>, "p": <opid>|null, "sd": <side>, "tk": "m"|"n" }`
+    — insert one block-structure element into a rich sequence: a boundary marker (`"m"`) or
+    one nest/indent unit (`"n"`). Separate from `ins` because a rich element is a character
+    or a token, never a whole node (see `design-docs/16-typed-sequence-content.md`).
   - `{ "k": "del", "t": <target>, "e": <opid> }`
+  - `{ "k": "mov", "t": <target>, "e": <opid>, "o": <opid>|null }`
+  - `{ "k": "inc", "t": <target>, "d": <int> }`
+  - `{ "k": "tree", "t": <target>, "c": <opid>, "p": <opid>|null, "pos": [<int>...],
+    "s": <node>|null }`
+  - `{ "k": "mark", "t": <target>, "m": <opid>, "ty": <string>, "v": <prim>,
+    "st": <anchor>, "en": <anchor> }` — an anchor is `Crdt.Json`'s
+    `{ "r": <opid>|null, "sd": "b"|"a" }`.
 
 A target is a list of steps: `{ "key": <string> }` or `{ "elem": <opid> }`.
 
@@ -59,7 +72,7 @@ encodeAction action =
                 , ( "v", Json.encodePrim prim )
                 ]
 
-        SetPresence { target, present, seed } ->
+        SetKeyPresence { target, present, seed } ->
             JE.object
                 [ ( "k", JE.string "pres" )
                 , ( "t", encodeTarget target )
@@ -82,6 +95,23 @@ encodeAction action =
                   )
                 , ( "sd", Json.encodeSide side )
                 , ( "s", Json.encodeNode seed )
+                ]
+
+        InsertToken { container, elemId, parent, side, token } ->
+            JE.object
+                [ ( "k", JE.string "tok" )
+                , ( "t", encodeTarget container )
+                , ( "e", Json.encodeOpId elemId )
+                , ( "p"
+                  , case parent of
+                        Just p ->
+                            Json.encodeOpId p
+
+                        Nothing ->
+                            JE.null
+                  )
+                , ( "sd", Json.encodeSide side )
+                , ( "tk", Json.encodeBlockToken token )
                 ]
 
         InsertText { container, start, text, parent, side } ->
@@ -210,7 +240,7 @@ actionDecoder =
                             (JD.field "v" Json.primDecoder)
 
                     "pres" ->
-                        JD.map3 (\t p s -> SetPresence { target = t, present = p, seed = s })
+                        JD.map3 (\t p s -> SetKeyPresence { target = t, present = p, seed = s })
                             (JD.field "t" targetDecoder)
                             (JD.field "p" JD.bool)
                             (JD.field "s" Json.nodeDecoder)
@@ -230,6 +260,14 @@ actionDecoder =
                             (JD.field "x" JD.string)
                             (JD.field "p" (JD.nullable Json.opIdDecoder))
                             (JD.field "sd" Json.sideDecoder)
+
+                    "tok" ->
+                        JD.map5 (\t e p sd tk -> InsertToken { container = t, elemId = e, parent = p, side = sd, token = tk })
+                            (JD.field "t" targetDecoder)
+                            (JD.field "e" Json.opIdDecoder)
+                            (JD.field "p" (JD.nullable Json.opIdDecoder))
+                            (JD.field "sd" Json.sideDecoder)
+                            (JD.field "tk" Json.blockTokenDecoder)
 
                     "del" ->
                         JD.map2 (\t e -> DeleteElem { container = t, elem = e })

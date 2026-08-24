@@ -132,7 +132,7 @@ churn hits the quadratic.
 ## Delta ingest — the demo's per-message path (`npm run delta`)
 
 `decodeInto` a one-edit `encodeSince` delta into a size-`n` doc. The incremental merge
-(docs/12) already folded only the added ops onto the cache, so the *fold* was delta-bound
+(design-docs/12) already folded only the added ops onto the cache, so the *fold* was delta-bound
 — but two pieces of bookkeeping still scanned the whole doc on every merge/decode:
 
 1. **Clock catch-up** — `Node.maxCounter cached` walked the entire materialized tree to
@@ -229,3 +229,80 @@ Convergence/law/fuzz suites stay green.
 (The demo compounded this: `scrubPosition` inverted version→step by calling `versionAt`
 across every step each render — O(n) × the sort. Fixed separately by storing the scrub step
 in the model, making it O(1); the library fix above is what makes each `versionAt` cheap.)
+
+---
+
+## Pending-ops gate (`OpLog.canApply`) — cost of the precheck
+
+The pending-ops precheck (`design-docs/15-pending-ops.md`) adds a test per op in the fold:
+can this op's target actually be reached? A/B on the same tree, gate ON vs the call site
+neutered to `if True ||`, `npm run scrub` (ITERS=50, build subtracted):
+
+| workload | n | ms/readAt, gate ON | gate neutered |
+|----------|--:|-------------------:|--------------:|
+| `deletes` (half the log is `DeleteElem`) | 1000 | **5.16** | 5.76 |
+| `deletes` | 400 | 1.95 | 2.12 |
+| `demo` | 1000 | 29.19 | 30.22 |
+| `list` | 1000 | 3.42 | 3.31 |
+
+**No measurable cost**, including in the worst case the gate can have (`deletes` on the
+re-fold path — deletes are gated, and `readAt` re-folds the whole log rather than reading the
+cache). Differences land on both sides of zero, i.e. noise. `merge`, `delta` and `bench`
+likewise show no change, which is expected: `canApply` skips the target walk entirely unless
+the action is gated (`DeleteElem`/`MoveElem`/`AddMark`) or the target contains an `IntoElem`
+step, so registers, text and inserts never pay for it, and local commits don't go through it
+at all.
+
+Two things this run measured incidentally, both pre-existing:
+
+- **`deletes` build is O(n²)** — 9 ms at n=100, 150 ms at 400, **1050 ms at 1000**. That's
+  `remove` resolving a visible index by walking the RGA, the same tail `churn` shows for
+  `move`; it is a *build* cost, not a fold cost (which is why `run-scrub.js` subtracts a
+  build).
+- **`readAt` on a delete-heavy log is superlinear** — 0.42 / 1.95 / 5.16 ms at n = 100 / 400
+  / 1000 (~2.6× per 2.5× in n, and n here counts inserts while the log also carries n/2
+  deletes). Fine at demo scale, worth a look if scrubbing a delete-heavy document ever
+  matters.
+
+---
+
+## Typed sequence content (design-docs/16) — measured
+
+`Txt` became `Rga String` and `Rich` became `Rga RichElem`, so a character no longer rides
+inside a whole LWW register with a stamp of its own, and a block marker is no longer a magic
+`PInt` in one. Element ids, anchors and tombstones are untouched — only the **content**.
+
+**Wire.** Only the `Node` *state* encoding changed; the op encoding did not (`itxt` already
+carried a plain string). The state encoding travels in exactly one payload — a compacted
+**snapshot**, sent to a peer behind our compaction boundary — which the harness did not
+measure at all. `run-wire.js` now has a snapshot column, and the before/after was computed
+element-by-element on real snapshot data:
+
+| payload | per element | all text elements | whole snapshot |
+|---|---:|---:|---:|
+| `text` n=2000 (1959 chars, one rich file) | 120 → 72 B | 231 830 → 138 878 | 234 336 → 141 384 (**−40%**) |
+| `demo` n=400 (11 327 chars over 841 rich files) | 120 → 72 B | 1 358 038 → 757 720 | 1 583 188 → 982 870 (**−38%**) |
+| `typing` n=1000 (979 chars, plain text) | 122 → 67 B | 121 422 → 67 238 | 122 881 → 68 697 (**−44%**) |
+
+Plain `Txt` gains most (`"c":"a"` becomes just `"a"`). The saving is proportional to how much
+of a document is text, so a text-free document sees nothing.
+
+**Heap.** `text` n=2000 live heap **758 654 → 597 164 B (−21%)**, same harness
+(`WORKLOADS=text SIZES=2000 npm run mem`), comparable to the run-length row above. One
+`Register` record plus one `OpId` per character, gone.
+
+**Latency.** `text` build @400 0.51 → 0.20 ms (less to allocate per character); read, merge,
+and every other workload unchanged within run-to-run variance:
+
+| workload | build 100 / 400 / 1000 (ms) | read @400 (ms) | merge @400 (ms) |
+|---|---|---:|---:|
+| demo | 14.0 / 55.8 / 142.9 | 11.41 | 0.711 |
+| text | 0.05 / 0.21 / 0.54 | 0.56 | 0.005 |
+| list | 0.92 / 3.73 / 9.31 | 1.73 | 0.150 |
+| dict | 0.23 / 0.89 / 2.20 | 0.22 | 0.121 |
+| tree | 0.86 / 3.65 / 10.95 | 2.65 | 0.153 |
+
+All still linear in `n`. Caveat on the two before-numbers quoted above (heap 758 654 and the
+`text` build 0.51): they come from the earlier rows in this file rather than a same-session
+A/B, so machine and Node version may differ — the wire figures are exact, being computed from
+the same bytes.

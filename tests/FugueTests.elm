@@ -2,7 +2,7 @@ module FugueTests exposing (suite)
 
 {-| The Fugue ordering guarantee: **concurrent runs inserted at the same position do
 not interleave.** This is the merge-quality property RGA lacks and the whole reason
-for `docs/09-fugue.md`. Convergence (agreement) held under RGA too; what Fugue adds
+for `design-docs/09-fugue.md`. Convergence (agreement) held under RGA too; what Fugue adds
 is that each replica's run stays a contiguous block.
 
 We drive it end-to-end through the public `Crdt.Doc` text API (`setText`) and the

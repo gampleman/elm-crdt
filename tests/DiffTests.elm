@@ -1,7 +1,7 @@
 module DiffTests exposing (suite)
 
 {-| The merge/ingest **diff** (`Doc.mergeWithDiff` / `decodeWithDiff`), queried through
-the typed `Crdt.Doc.touched` / `origins` front door (see `docs/12`). Asserts that:
+the typed `Crdt.Doc.touched` / `origins` front door (see `design-docs/12`). Asserts that:
 
   - a change reports the correct `Origin` (Local vs the authoring Remote replica);
   - `touched` fires for the ref that changed and for its ancestors, and stays `Nothing`

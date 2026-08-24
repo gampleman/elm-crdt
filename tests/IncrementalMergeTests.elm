@@ -1,7 +1,7 @@
 module IncrementalMergeTests exposing (suite)
 
 {-| `Doc.merge` / `decodeInto` now apply only the **added** ops onto the existing
-cache instead of re-materializing from base (see `docs/12`). The correctness oracle is
+cache instead of re-materializing from base (see `design-docs/12`). The correctness oracle is
 `Doc.cacheConsistent` — it holds iff the incrementally-maintained cache equals a full
 re-materialize. These tests assert it survives the adversarial cases the incremental
 path could get wrong:
@@ -88,17 +88,17 @@ type alias BoardDoc =
     }
 
 
-todosList : { schema : C.Schema (C.ListK C.Movable C.Nested Todo) (List Todo), index : Int -> Ref r (C.ListK mv C.Nested Todo) (List Todo) -> Ref r C.Nested Todo }
+todosList : C.Crdt (C.ListK C.Movable C.Nested Todo) (List Todo) { index : Int -> Ref r (C.ListK mv C.Nested Todo) (List Todo) -> Ref r C.Nested Todo }
 todosList =
     C.movableList todoDoc
 
 
-filesDict : { schema : C.Schema (C.DictK C.RichK (List Span)) (Dict String (List Span)), key : String -> Ref r (C.DictK C.RichK (List Span)) (Dict String (List Span)) -> Ref r C.RichK (List Span) }
+filesDict : C.Crdt (C.DictK C.RichK (List Span)) (Dict String (List Span)) { key : String -> Ref r (C.DictK C.RichK (List Span)) (Dict String (List Span)) -> Ref r C.RichK (List Span) }
 filesDict =
     C.dict C.richText
 
 
-outlineTree : { schema : C.Schema (C.TreeK C.Nested ONode) (Tree.Forest ONode), node : Id.OpId -> Ref r (C.TreeK C.Nested ONode) (Tree.Forest ONode) -> Ref r C.Nested ONode }
+outlineTree : C.Crdt (C.TreeK C.Nested ONode) (Tree.Forest ONode) { node : Id.OpId -> Ref r (C.TreeK C.Nested ONode) (Tree.Forest ONode) -> Ref r C.Nested ONode }
 outlineTree =
     C.tree onodeDoc
 
@@ -194,7 +194,7 @@ suite =
             \_ ->
                 -- alice creates file "notes" AND types into it; bob (who has neither)
                 -- merges alice in. The char-insert ops target inside files/notes, and
-                -- must not be applied before the SetPresence that creates the key —
+                -- must not be applied before the SetKeyPresence that creates the key —
                 -- incremental merge folds added ops in causal order to guarantee this.
                 let
                     fileRef =

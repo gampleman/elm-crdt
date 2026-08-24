@@ -93,7 +93,15 @@ cursorAtRich (Ref r) offset doc =
 
 
 {-| Resolve a cursor back to its current character offset in this document, or `Nothing`
-if it no longer points anywhere (its text is gone). The inverse of `cursorAt`.
+if it no longer points anywhere. The inverse of `cursorAt`.
+
+Deleting the character a cursor sits after does **not** unresolve it — the caret lands at
+the nearest live spot, because the tombstone still marks the position. `Nothing` means this
+document genuinely cannot place the anchor: the cursor's text field is gone, or the anchor
+character is unknown here because `Crdt.Doc.compact` dropped its tombstone or the insert
+carrying it has not arrived yet. Render no caret in that case; cursors are ephemeral, so
+the peer's next broadcast resolves normally.
+
 -}
 cursorOffset : Cursor -> Doc doc -> Maybe Int
 cursorOffset =

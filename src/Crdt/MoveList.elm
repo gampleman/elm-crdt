@@ -2,14 +2,13 @@ module Crdt.MoveList exposing
     ( MoveList
     , empty, fromParts, cells, values, deletedIds
     , insert, move, delete, updateValue, mapValues
-    , merge
     , toList, toEntries, resolveOrder, get, homeCell, maxCounter
     )
 
 {-| A list whose elements can be **moved** (reordered) while keeping their
 identity — nested content and any cursor anchored to an item survive a move.
 
-The design (see `docs/05-move.md`): an element is a stable **value** identified by
+The design (see `design-docs/05-move.md`): an element is a stable **value** identified by
 an `OpId`; positions are **cells** in an append-only RGA, each carrying a
 valueId. Inserting a value appends a cell; **moving** it appends _another_ cell
 (at the new position) carrying the same valueId. A value's live position is the
@@ -17,20 +16,19 @@ valueId. Inserting a value appends a cell; **moving** it appends _another_ cell
 `(counter, replica)`, with no separate home register. Older cells are simply
 skipped, like tombstones.
 
-Why this and not "re-point the RGA origin": re-pointing creates origin cycles
-(`a→c→b→a`) the moment you move a non-tail element. Cells are **append-only** — a
-new cell always anchors after an _existing, older_ cell — so the cell RGA can
-never cycle, and order is a pure function of the cell set. That makes `merge` a
-plain semilattice (RGA-union of cells, dict-union of values, set-union of
-deletions) and the read a deterministic fold, so convergence needs no special
-argument.
+Why this and not "re-point the RGA anchor": re-pointing an element's `parent`
+creates anchor cycles (`a→c→b→a`) the moment you move a non-tail element. Cells
+are **append-only** — a new cell always anchors after an _existing, older_ cell —
+so the cell RGA can never cycle, and order is a pure function of the cell set.
+That makes the whole structure grow-only — cells, values and deletions each only ever
+accumulate, in any order — and the read a deterministic fold over what accumulated, so
+convergence under op replay needs no special argument.
 
 `c` is the item content (a `Node` in practice). Value identity is the `OpId`.
 
 @docs MoveList
 @docs empty, fromParts, cells, values, deletedIds
 @docs insert, move, delete, updateValue, mapValues
-@docs merge
 @docs toList, toEntries, resolveOrder, get, homeCell, maxCounter
 
 -}
@@ -46,7 +44,20 @@ import Set exposing (Set)
   - `cellRga` — append-only RGA of position cells; each cell's content is the
     `OpId` of the value it places. A value may have several cells (from moves);
     the max-id one is its current home.
+
+    **Cells are always live right-children.** A cell only ever anchors _after_ an
+    existing, older cell, so `side` is always `Right` (that is what makes the cell
+    RGA acyclic — see above); and a deletion is recorded as a valueId in
+    `tombstones`, never as a tombstone on a cell, so `deleted` is always `False`.
+    Both are enforced by construction: every write goes through `Rga.putRight`,
+    which cannot express any other shape. `Crdt.Json` relies on this to **omit
+    both fields from the wire** and reconstruct them on decode, so breaking the
+    invariant would not fail to compile or read wrong — it would make encode/decode
+    stop being the identity, and silently move or lose values across the network.
+    `tests/MoveListTests.elm` pins it.
+
   - `valueOf` — valueId → item content (stable across moves).
+
   - `tombstones` — deleted valueIds (grow-only; delete-wins on merge).
 
 -}
@@ -104,7 +115,7 @@ insert : OpId -> Maybe OpId -> c -> MoveList c -> MoveList c
 insert valueId afterCell content (MoveList m) =
     MoveList
         { m
-            | cellRga = Rga.put (Rga.element valueId afterCell Rga.Right valueId False) m.cellRga
+            | cellRga = Rga.putRight valueId afterCell valueId m.cellRga
             , valueOf = Dict.insert (Id.opIdToString valueId) content m.valueOf
         }
 
@@ -115,7 +126,7 @@ value's home) carrying the same valueId. Content and identity are untouched.
 -}
 move : OpId -> OpId -> Maybe OpId -> MoveList c -> MoveList c
 move moveOp valueId afterCell (MoveList m) =
-    MoveList { m | cellRga = Rga.put (Rga.element moveOp afterCell Rga.Right valueId False) m.cellRga }
+    MoveList { m | cellRga = Rga.putRight moveOp afterCell valueId m.cellRga }
 
 
 {-| Delete a value by id (delete-wins; idempotent).
@@ -138,35 +149,6 @@ sequences; the cell RGA (which encodes position/move order by id) is left untouc
 mapValues : (c -> c) -> MoveList c -> MoveList c
 mapValues f (MoveList m) =
     MoveList { m | valueOf = Dict.map (\_ v -> f v) m.valueOf }
-
-
-
--- MERGE ----------------------------------------------------------------------
-
-
-{-| Merge two movable lists: RGA-union the cells, dict-union the values (shared
-ids merge their content recursively via `mergeContent`), set-union the deletions.
-Each component is a semilattice, so the whole is commutative/associative/
-idempotent, and the order (max-cell-per-value over the merged cells) is a
-deterministic function of the result — hence convergent.
--}
-merge : (c -> c -> c) -> MoveList c -> MoveList c -> MoveList c
-merge mergeContent (MoveList a) (MoveList b) =
-    MoveList
-        { cellRga =
-            -- cell content is a valueId; a shared cell id always carries the same
-            -- valueId, so the content-merge is a trivial pick.
-            Rga.merge (\x _ -> x) a.cellRga b.cellRga
-        , valueOf =
-            Dict.merge
-                Dict.insert
-                (\k x y -> Dict.insert k (mergeContent x y))
-                Dict.insert
-                a.valueOf
-                b.valueOf
-                Dict.empty
-        , tombstones = Set.union a.tombstones b.tombstones
-        }
 
 
 

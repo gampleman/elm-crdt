@@ -7,10 +7,17 @@ The properties that matter:
 
   - add/move/delete read back a correct structure; payload survives a move;
   - **the cycle test**: concurrent X→under-Y and Y→under-X converge to the SAME
-    tree in both merge orders, with exactly one move skipped (the higher `moveOp`);
+    tree whichever order the moves are applied in, with exactly one move skipped
+    (the higher `moveOp`);
   - concurrent moves of different nodes both apply;
   - sibling order via fractional positions; delete drops a subtree;
-  - merge is commutative & idempotent on the read.
+  - applying the same move twice changes nothing.
+
+Concurrency is expressed by applying both replicas' moves to the shared starting
+tree, in each order. That _is_ the merge: a `Tree`'s `moveSet` is keyed by `moveOp`
+and its tombstones are grow-only, so applying both moves in either order yields the
+identical state the removed structural `Tree.merge` used to compute — which is also
+exactly what the op log does when it replays two peers' move ops.
 
 -}
 
@@ -131,20 +138,20 @@ suite =
 
                         -- alice moves A under B (moveOp a5)
                         aliceMove =
-                            Tree.moveOnly (a 5) (a 1) (Just (a 2)) mid start
+                            Tree.moveOnly (a 5) (a 1) (Just (a 2)) mid
 
                         -- bob concurrently moves B under A (moveOp b9 > a5)
                         bobMove =
-                            Tree.moveOnly (b 9) (a 2) (Just (a 1)) mid start
+                            Tree.moveOnly (b 9) (a 2) (Just (a 1)) mid
 
                         ab =
-                            Tree.merge always aliceMove bobMove
+                            start |> aliceMove |> bobMove
 
                         ba =
-                            Tree.merge always bobMove aliceMove
+                            start |> bobMove |> aliceMove
                     in
                     Expect.all
-                        [ -- converges regardless of merge order
+                        [ -- converges regardless of the order the moves arrive in
                           \_ -> Expect.equal (render ab) (render ba)
                         , -- moves fold in ascending moveOp order: a5 (A-under-B)
                           -- applies first; then b9 (B-under-A) would make B its own
@@ -174,35 +181,43 @@ suite =
                     in
                     Expect.equal 3 count
             ]
-        , describe "concurrency (different nodes) + merge laws"
+        , describe "concurrency (different nodes) + convergence laws"
             [ test "concurrent moves of different nodes both apply" <|
                 \_ ->
                     let
                         aliceMove =
-                            Tree.moveOnly (a 5) (a 3) (Just (a 2)) mid base
+                            Tree.moveOnly (a 5) (a 3) (Just (a 2)) mid
 
                         -- bob adds a child under A concurrently
                         bobAdd =
-                            Tree.move (b 9) (b 9) (Just (a 1)) (after mid) "B-child" base
+                            Tree.move (b 9) (b 9) (Just (a 1)) (after mid) "B-child"
                     in
                     Expect.equal
-                        (render (Tree.merge always aliceMove bobAdd))
-                        (render (Tree.merge always bobAdd aliceMove))
-            , test "merge is idempotent on the read" <|
+                        (render (base |> aliceMove |> bobAdd))
+                        (render (base |> bobAdd |> aliceMove))
+            , test "re-applying a move is idempotent" <|
                 \_ ->
-                    Expect.equal (render base) (render (Tree.merge always base base))
+                    -- ops are re-delivered freely, so a repeat must change nothing
+                    let
+                        moved =
+                            Tree.moveOnly (a 5) (a 3) (Just (a 2)) mid base
+                    in
+                    Expect.equal moved (Tree.moveOnly (a 5) (a 3) (Just (a 2)) mid moved)
             , test "delete-wins over a concurrent move" <|
                 \_ ->
                     let
                         aliceDelete =
-                            Tree.delete (a 3) base
+                            Tree.delete (a 3)
 
                         bobMove =
-                            Tree.moveOnly (b 9) (a 3) (Just (a 2)) mid base
+                            Tree.moveOnly (b 9) (a 3) (Just (a 2)) mid
                     in
                     Expect.all
-                        [ \_ -> Expect.equal (render (Tree.merge always aliceDelete bobMove)) (render (Tree.merge always bobMove aliceDelete))
-                        , \_ -> Expect.equal "A B" (render (Tree.merge always aliceDelete bobMove))
+                        [ \_ ->
+                            Expect.equal
+                                (render (base |> aliceDelete |> bobMove))
+                                (render (base |> bobMove |> aliceDelete))
+                        , \_ -> Expect.equal "A B" (render (base |> aliceDelete |> bobMove))
                         ]
                         ()
             ]

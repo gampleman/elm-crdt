@@ -1,4 +1,4 @@
-// Memory / size benchmark runner (see docs/02-oplog.md, "measure first").
+// Memory / size benchmark runner (see design-docs/02-oplog.md, "measure first").
 //
 // Two kinds of number per workload + size:
 //   • structural PROXIES from Elm — op count and encoded byte size. Deterministic,

@@ -1,17 +1,18 @@
 module Crdt.OpLog exposing
     ( Op, Action(..), Target, TargetStep(..), Frontier
-    , OpStore, empty, insert, ops, member, merge
-    , causalOrder, applyOps, opsMaxCounter, materialize, addedOpsInOrder, addedFromCandidates, checkout
-    , frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys, stableFrontier
+    , OpStore, empty, insert, ops, size, member, merge
+    , causalOrder, applyOps, applyOpsWithPending, actionTarget, opsMaxCounter, materialize, materializeWithPending, addedOpsInOrder, addedFromCandidates, checkout
+    , frontier, frontierOfOps, advanceFrontier, frontierCovers, opsAfter, ancestorsOf, compact, ancestorKeys, stableFrontier
     )
 
 {-| The operation log: the source of truth for an op-log-based document.
 
 A document's state is _derived_ by folding the ops into a `Node`
 (`materialize`), which the typed `Crdt.Schema` layer then reads. Conflict
-resolution (LWW for registers, RGA for sequences) lives in the fold, not in a
-structural `merge`. Merging two documents is set-union of their op stores —
-trivially commutative, associative and idempotent.
+resolution lives in that derivation, not in a structural `merge`: LWW-by-stamp as
+registers fold, and Fugue sequence order computed at read from the element set.
+Merging two documents is set-union of their op stores — trivially commutative,
+associative and idempotent.
 
 Each `Op` records its causal `deps` (the frontier it was created against), so the
 store forms a DAG. `materialize` folds ops in a **causal order** (every op after
@@ -24,9 +25,9 @@ The op-log core: real DAG + frontiers + causal materialize + checkout. `Crdt.Doc
 drives it — every document is materialized from an `OpStore`.
 
 @docs Op, Action, Target, TargetStep, Frontier
-@docs OpStore, empty, insert, ops, member, merge
-@docs causalOrder, applyOps, opsMaxCounter, materialize, addedOpsInOrder, addedFromCandidates, checkout
-@docs frontier, advanceFrontier, opsAfter, ancestorsOf, compact, ancestorKeys, stableFrontier
+@docs OpStore, empty, insert, ops, size, member, merge
+@docs causalOrder, applyOps, applyOpsWithPending, actionTarget, opsMaxCounter, materialize, materializeWithPending, addedOpsInOrder, addedFromCandidates, checkout
+@docs frontier, frontierOfOps, advanceFrontier, frontierCovers, opsAfter, ancestorsOf, compact, ancestorKeys, stableFrontier
 
 -}
 
@@ -42,6 +43,16 @@ import Set exposing (Set)
 
 {-| A point in the causal DAG: the set of op ids that are the current "tips"
 (ops not yet depended upon). An op created against a frontier lists it as `deps`.
+
+**Unordered** — semantically a set, and every operation over it here treats it as one.
+It stays a `List` for two reasons. `Set OpId` is not expressible (`OpId` is an opaque
+custom type, not `comparable`), so the alternative is a `Set String` of `opIdToString`
+keys plus a table to get the ids back — which every `deps` read and the wire encoder
+would have to undo. And it is **tiny**: one element in the common case (the last op the
+replica saw), bounded above by the number of concurrently diverged branches, i.e. active
+replicas. Nothing here scales with the frontier; the set work that scales with the
+_store_ already runs over `Set String` (`frontierKeys`, `ancestorKeys`).
+
 -}
 type alias Frontier =
     List OpId
@@ -62,9 +73,10 @@ is position-independent.
 -}
 type Action
     = SetReg Target Prim
-    | SetPresence { target : Target, present : Bool, seed : Node }
+    | SetKeyPresence { target : Target, present : Bool, seed : Node }
     | InsertElem { container : Target, elemId : OpId, parent : Maybe OpId, side : Rga.Side, seed : Node }
     | InsertText { container : Target, start : OpId, text : String, parent : Maybe OpId, side : Rga.Side }
+    | InsertToken { container : Target, elemId : OpId, parent : Maybe OpId, side : Rga.Side, token : Node.BlockToken }
     | DeleteElem { container : Target, elem : OpId }
     | MoveElem { container : Target, elem : OpId, after : Maybe OpId }
     | Increment { target : Target, delta : Int }
@@ -118,6 +130,14 @@ ops (OpStore d) =
     Dict.values d
 
 
+{-| How many ops the store holds. `O(1)` — for a count, never build the op list (let
+alone a `causalOrder`, which sorts a list only to measure it).
+-}
+size : OpStore -> Int
+size (OpStore d) =
+    Dict.size d
+
+
 {-| Whether an op id is present.
 -}
 member : OpId -> OpStore -> Bool
@@ -132,21 +152,55 @@ merge (OpStore a) (OpStore b) =
     OpStore (Dict.union a b)
 
 
+
+-- FRONTIERS ------------------------------------------------------------------
+-- Everything that computes with a `Frontier` lives here, so the one type's rules
+-- (it is a set; membership goes through `Id.opIdToString`) are stated in one place.
+-- A frontier is a fact about the op DAG, so this stays in the op-log module rather
+-- than becoming its own: a separate module could hold only the id-keying helpers,
+-- since `frontier`/`ancestorKeys`/`stableFrontier` all need `OpStore` and would have
+-- to stay behind — splitting the concept in two rather than isolating it.
+
+
+{-| The ids of a frontier as the `Set String` every membership test wants.
+-}
+frontierKeys : Frontier -> Set String
+frontierKeys =
+    List.foldl (\id acc -> Set.insert (Id.opIdToString id) acc) Set.empty
+
+
+{-| Every id any of these ops depends on. The complement of this within a set of ops
+is that set's frontier, which is what `frontier`/`frontierOfOps`/`advanceFrontier` all
+compute — hence one helper.
+-}
+depKeys : List Op -> Set String
+depKeys =
+    List.foldl (\op acc -> List.foldl (\dep s -> Set.insert (Id.opIdToString dep) s) acc op.deps) Set.empty
+
+
+tipsOf : Set String -> List OpId -> Frontier
+tipsOf depended =
+    List.filter (\id -> not (Set.member (Id.opIdToString id) depended))
+
+
 {-| The current frontier: ops that no other op depends on (the DAG tips).
 -}
 frontier : OpStore -> Frontier
 frontier (OpStore d) =
     let
-        depended : Set String
-        depended =
-            Dict.foldl
-                (\_ op acc -> List.foldl (\dep s -> Set.insert (Id.opIdToString dep) s) acc op.deps)
-                Set.empty
-                d
+        allOps =
+            Dict.values d
     in
-    Dict.values d
-        |> List.map .id
-        |> List.filter (\id -> not (Set.member (Id.opIdToString id) depended))
+    tipsOf (depKeys allOps) (List.map .id allOps)
+
+
+{-| The causal tips of a **set of ops** rather than a whole store: those no other op in
+the set depends on. For a causal-order prefix this is the frontier that checks out
+exactly the prefix, which is what linear-history scrubbing needs.
+-}
+frontierOfOps : List Op -> Frontier
+frontierOfOps batch =
+    tipsOf (depKeys batch) (List.map .id batch)
 
 
 {-| Advance a known frontier by a batch of newly-added ops, **without** rescanning the
@@ -161,22 +215,24 @@ frontier) and applying a delta. For a wholesale store rebuild use `frontier`.
 advanceFrontier : Frontier -> List Op -> Frontier
 advanceFrontier current newOps =
     let
-        newDepended : Set String
         newDepended =
-            List.foldl
-                (\op acc -> List.foldl (\dep s -> Set.insert (Id.opIdToString dep) s) acc op.deps)
-                Set.empty
-                newOps
-
-        keptOld =
-            List.filter (\id -> not (Set.member (Id.opIdToString id) newDepended)) current
-
-        addedTips =
-            newOps
-                |> List.map .id
-                |> List.filter (\id -> not (Set.member (Id.opIdToString id) newDepended))
+            depKeys newOps
     in
-    keptOld ++ addedTips
+    tipsOf newDepended current ++ tipsOf newDepended (List.map .id newOps)
+
+
+{-| Whether `have` (e.g. a peer's frontier) already includes every op of `needed` (e.g.
+our base frontier) — i.e. the peer is not behind our compaction boundary. Each needed id
+must appear in `have`; since frontiers are causal tips and ids are minted once, set
+membership is the right check.
+-}
+frontierCovers : Frontier -> Frontier -> Bool
+frontierCovers have needed =
+    let
+        haveKeys =
+            frontierKeys have
+    in
+    List.all (\id -> Set.member (Id.opIdToString id) haveKeys) needed
 
 
 
@@ -187,9 +243,11 @@ advanceFrontier current newOps =
 `deps`. Among ops that are simultaneously ready, ties break by `OpId` so the
 order is deterministic.
 
-Implementation is a Kahn-style topological sort. Ops whose `deps` point outside
-the store (e.g. a delta that hasn't brought in an ancestor) are treated as ready
-once their _present_ deps are satisfied, so a partial store still materializes.
+Implementation is a plain ascending sort by `OpId` (`O(n log n)`): Lamport ids
+guarantee every dep has a strictly smaller id than the op depending on it, so
+id order _is_ a causal order — see the comment in the body. A dep that points
+outside the store (e.g. a delta that hasn't brought in an ancestor) therefore
+costs nothing, and a partial store still materializes.
 
 -}
 causalOrder : OpStore -> List Op
@@ -223,8 +281,9 @@ applyOps base orderedOps =
 
 
 {-| The largest Lamport counter referenced by a batch of ops: each op's own id, plus
-any stamps buried in an insert/move/tree/mark seed (a seed register can carry a counter
-_higher_ than the op's own id — it was minted by a later edit on the source replica).
+any stamps buried in an insert/presence/tree seed, a text run's derived char ids, or a
+mark's range anchors (a seed register can carry a counter _higher_ than the op's own id
+— it was minted by a later edit on the source replica).
 
 This is the O(batch) clock catch-up for ingesting a delta of untrusted wire ops, where
 no incoming `Ctx` is available — replacing an O(whole-tree) `Node.maxCounter` scan of the
@@ -237,6 +296,13 @@ opsMaxCounter batch =
     List.foldl (\op acc -> max acc (opMaxCounter op)) 0 batch
 
 
+{-| Enumerated exhaustively rather than with a `_ ->` fallback. The four actions that
+contribute nothing are the ones that carry **no seed** and name only ids the author had
+already observed — so by Lamport's rule the op's own id (taken below) already dominates
+them. That reasoning is invisible in a wildcard, and a wildcard also swallows the next
+action added: a seed-carrying constructor would silently start reporting `0` and let the
+clock re-mint an id already in use. Spelling the cases out makes that a compile error.
+-}
 opMaxCounter : Op -> Int
 opMaxCounter op =
     let
@@ -250,7 +316,11 @@ opMaxCounter op =
                     -- each a char element id; the clock must clear the whole span.
                     Id.opIdCounter start + max 0 (String.length text - 1)
 
-                SetPresence { seed } ->
+                InsertToken _ ->
+                    -- the element id IS the op id (taken below); a token carries no stamp
+                    0
+
+                SetKeyPresence { seed } ->
                     Node.maxCounter seed
 
                 TreeMove { seed } ->
@@ -263,18 +333,96 @@ opMaxCounter op =
                     in
                     max (anchorMax start) (anchorMax end)
 
-                _ ->
+                -- seedless, and every id they name was observed before `op.id` was minted
+                SetReg _ _ ->
+                    0
+
+                DeleteElem _ ->
+                    0
+
+                MoveElem _ ->
+                    0
+
+                Increment _ ->
                     0
     in
     max (Id.opIdCounter op.id) seedMax
 
 
 {-| Materialize the whole store onto a base node (the schema's empty structure),
-folding in causal order.
+folding in causal order — holding back and retrying any op whose subject hasn't arrived
+(see `applyOpsWithPending`).
 -}
 materialize : Node -> OpStore -> Node
 materialize base store =
-    applyOps base (causalOrder store)
+    materializeWithPending base store |> Tuple.first
+
+
+{-| `materialize`, also reporting the ops it had to hold back. `[]` for any causally
+closed store — which is every store this library produces on its own.
+-}
+materializeWithPending : Node -> OpStore -> ( Node, List Op )
+materializeWithPending base store =
+    applyOpsWithPending base (causalOrder store)
+
+
+{-| Fold a batch like `applyOps`, but **hold back an op whose subject isn't there yet**,
+retry it once the rest of the batch has landed, and return whatever is still unsatisfied.
+
+Almost every action is a pure function of the op _set_: registers resolve LWW by stamp,
+sequence order is derived from the element set at read, counters/marks/tree-moves are keyed
+and resolved at read. Order is already irrelevant to those, and this changes nothing for
+them. But four mutators edit **in place** and silently evaporate when their subject is
+absent — `Rga.delete`, `Rga.updateElement`, `MoveList.updateValue`, `Tree.updateValue` — so
+an op naming an element whose insert hasn't been folded is not delayed by them, it is
+_lost_: the delete never happens (deleted content reappears, permanently), the nested edit
+into a list item or tree node vanishes for good.
+
+A causal order rules that out — an op's `deps` include the insert it names, and Lamport ids
+put every dep first — so this never fires on a store the library assembled itself. It is
+the safety net for the stores it can be _handed_: a filtering intermediary answering delta
+queries out of an op table, a torn or truncated persisted log, a damaged payload. `canApply`
+decides what would land; anything that wouldn't is deferred and retried, looping while a
+pass makes progress. What is still unsatisfied comes back for the caller to hold and
+re-offer when more ops arrive (`Crdt.Doc.Internal` keeps it on the document).
+
+Iterating to a fixpoint is sound because **satisfaction is monotone**: elements, keys,
+values and tree payloads are only ever added — a delete tombstones in place, it never
+removes — so an op that can apply now could not have failed later, and the fixpoint depends
+only on the op set, not on arrival order. Retrying is sound because applying an op twice is
+a no-op: keyed dicts overwrite with the same value, equal stamps lose the LWW comparison,
+and `Rga.put` keeps an existing tombstone (which is exactly why it must).
+
+-}
+applyOpsWithPending : Node -> List Op -> ( Node, List Op )
+applyOpsWithPending base batch =
+    let
+        pass : List Op -> Node -> ( Node, List Op )
+        pass remaining node =
+            let
+                ( node1, deferred ) =
+                    List.foldl
+                        (\op ( acc, held ) ->
+                            if canApply acc op then
+                                ( applyOp op acc, held )
+
+                            else
+                                ( acc, op :: held )
+                        )
+                        ( node, [] )
+                        remaining
+
+                stillPending =
+                    List.reverse deferred
+            in
+            if List.isEmpty stillPending || List.length stillPending == List.length remaining then
+                -- nothing held back, or a whole pass unblocked nothing: fixpoint.
+                ( node1, stillPending )
+
+            else
+                pass stillPending node1
+    in
+    pass batch base
 
 
 {-| The ops present in `merged` but **not** in `prior`, in `merged`'s causal order.
@@ -289,9 +437,9 @@ They are causally ordered among **themselves only** — we sort a store of just 
 ops, not the whole merged store. `causalOrder` treats a dep absent from the store it is
 sorting as already satisfied; the deps we drop this way are exactly the `prior` ops that
 are already folded into the cache, so the order is valid **relative to that cache**.
-Sorting only the added ops keeps a steady-state merge O(k²) in the small delta `k`
-rather than O(n²) in the whole document — the difference between "merge cost scales with
-the delta" and "with the doc".
+Sorting only the added ops keeps a steady-state merge `O(k log k)` in the small delta
+`k` rather than `O(n log n)` in the whole document — the difference between "merge cost
+scales with the delta" and "with the doc".
 
 -}
 addedOpsInOrder : OpStore -> OpStore -> List Op
@@ -464,8 +612,13 @@ absent from the store as satisfied, and `base'` contains their effect).
 
 `compact` is a pure, equivalence-preserving rewrite of `(base, store)`. It is
 **not** a soundness decision: whether a given `cut` is safe to _discard_ across
-merges is the caller's policy (see `docs/04-gc.md`) — `compact` itself never
+merges is the caller's policy (see `design-docs/04-gc.md`) — `compact` itself never
 loses information that `materialize` would have used.
+
+An op below the cut that `materialize` would have **held back** (`applyOpsWithPending`)
+is therefore kept in the returned store instead of being folded into the base: folding it
+would discard it as a no-op, and it may yet become applicable when the op it waits on
+arrives.
 
 -}
 compact : Node -> Frontier -> OpStore -> ( Node, OpStore )
@@ -478,11 +631,11 @@ compact base cut store =
             ops store
                 |> List.partition (\op -> Set.member (Id.opIdToString op.id) belowCut)
 
-        base1 =
-            applyOps base (causalOrder (List.foldl insert empty below))
+        ( base1, stillPending ) =
+            applyOpsWithPending base (causalOrder (List.foldl insert empty below))
 
         store1 =
-            List.foldl insert empty above
+            List.foldl insert empty (above ++ stillPending)
     in
     ( base1, store1 )
 
@@ -500,38 +653,314 @@ applyOp : Op -> Node -> Node
 applyOp { id, action } root =
     case action of
         SetReg target prim ->
-            updateAt target id (setRegLww id prim) root
+            updateAt target (setRegLww id prim) root
 
-        SetPresence { target, present, seed } ->
-            setPresenceAt target id present seed root
+        SetKeyPresence { target, present, seed } ->
+            setKeyPresenceAt target id present seed root
 
         InsertElem { container, elemId, parent, side, seed } ->
-            updateAt container id (insertElem elemId parent side seed) root
+            updateAt container (insertElem elemId parent side seed) root
 
         InsertText { container, start, text, parent, side } ->
-            updateAt container id (insertTextRun start text parent side) root
+            updateAt container (insertTextRun start text parent side) root
+
+        InsertToken { container, elemId, parent, side, token } ->
+            updateAt container (insertToken elemId parent side token) root
 
         DeleteElem { container, elem } ->
-            updateAt container id (deleteElem elem) root
+            updateAt container (deleteElem elem) root
 
         MoveElem { container, elem, after } ->
-            updateAt container id (moveElem id elem after) root
+            updateAt container (moveElem id elem after) root
 
         Increment { target, delta } ->
-            updateAt target id (incrementBy id delta) root
+            updateAt target (incrementBy id delta) root
 
         TreeMove { container, child, parent, pos, seed } ->
-            updateAt container id (treeMove id child parent pos seed) root
+            updateAt container (treeMove id child parent pos seed) root
 
         AddMark { container, markId, type_, value, start, end } ->
-            updateAt container id (addMark markId type_ value start end) root
+            updateAt container (addMark markId type_ value start end) root
 
 
-{-| Apply `f` at `steps`, creating intermediate map entries (stamped `stamp`) as
-needed. Sequence/text elements are descended into by id.
+{-| The container/target an action addresses — where in the document it changes something.
 -}
-updateAt : List TargetStep -> OpId -> (Node -> Node) -> Node -> Node
-updateAt steps stamp f node =
+actionTarget : Action -> Target
+actionTarget action =
+    case action of
+        SetReg target _ ->
+            target
+
+        SetKeyPresence { target } ->
+            target
+
+        InsertElem { container } ->
+            container
+
+        InsertText { container } ->
+            container
+
+        InsertToken { container } ->
+            container
+
+        DeleteElem { container } ->
+            container
+
+        MoveElem { container } ->
+            container
+
+        Increment { target } ->
+            target
+
+        TreeMove { container } ->
+            container
+
+        AddMark { container } ->
+            container
+
+
+{-| Whether `op` would actually **land** on `node` — `False` when it names something that
+has not arrived, so applying it now would be a silent no-op that a later op could make
+meaningful. `applyOpsWithPending` defers those; this is the whole of its judgement.
+
+Only actions whose present behaviour on an absent subject already _is_ a no-op are gated.
+The rest — `SetReg`, a **creating** `SetKeyPresence`, `Increment`, `InsertElem`, `InsertText`,
+`TreeMove` — **construct** the container they address when it is missing; that is how a
+fresh dict key or a nested structure comes into being, so gating them would turn working
+behaviour into a permanently pending op. What is gated:
+
+  - every `IntoElem` step of the target must resolve, mirroring `updateAt`'s descent
+    exactly. An `IntoKey` never blocks — `updateAt` creates a missing key — but the empty
+    map it would create holds no elements, so an `IntoElem` beneath one correctly fails.
+  - `DeleteElem` must find its element: in a sequence that means the element itself, since
+    `Rga.delete` tombstones in place. A movable list or tree instead records the deleted id
+    in a **grow-only** set that a later insert consults, so there only the container has to
+    exist.
+  - `MoveElem` needs a movable list and `AddMark` a rich-text node — the two actions that
+    no-op on every other kind of node.
+  - a **removing** `SetKeyPresence` must find its key. It is the one action that is gated on
+    something a sibling op _creates_ rather than something that merely has to have arrived:
+    `setKeyPresenceAt` deliberately will not let a removal create the entry it tombstones (that
+    would make it order-dependent against a concurrent creation), so a removal delivered
+    ahead of the creation it followed has to wait for it. The wait is what keeps it from
+    being lost, and monotonicity still holds — a key is only ever added.
+
+-}
+canApply : Node -> Op -> Bool
+canApply node op =
+    let
+        target =
+            actionTarget op.action
+
+        container =
+            if gatedOnContainer op.action || List.any isIntoElem target then
+                walkTarget target node
+
+            else
+                -- nothing to check, so skip the walk: this is the hot path, taken by
+                -- every register/text/insert op in a well-formed batch.
+                Just node
+    in
+    case container of
+        Nothing ->
+            False
+
+        Just c ->
+            case op.action of
+                DeleteElem { elem } ->
+                    deleteLands elem c
+
+                MoveElem _ ->
+                    isMovableList c
+
+                AddMark _ ->
+                    isRichText c
+
+                InsertToken _ ->
+                    -- a block token only means anything in a rich sequence, and
+                    -- `insertToken`'s fallback is a silent no-op, so hold the op until its
+                    -- container shows up rather than dropping it (same rule as `AddMark`).
+                    isRichText c
+
+                SetKeyPresence presence ->
+                    presence.present || keyIsThere presence.target node
+
+                _ ->
+                    True
+
+
+{-| The actions whose own fallback on the wrong (or absent) kind of container is a silent
+no-op, so the container itself has to be checked. Deliberately excludes every action that
+_creates_ its container — see `canApply`.
+-}
+gatedOnContainer : Action -> Bool
+gatedOnContainer action =
+    case action of
+        DeleteElem _ ->
+            True
+
+        MoveElem _ ->
+            True
+
+        AddMark _ ->
+            True
+
+        InsertToken _ ->
+            True
+
+        _ ->
+            False
+
+
+isIntoElem : TargetStep -> Bool
+isIntoElem step =
+    case step of
+        IntoElem _ ->
+            True
+
+        IntoKey _ ->
+            False
+
+
+{-| Follow a target through `node` as `updateAt` would, yielding the container the op would
+be applied to — `Nothing` when an `IntoElem` names an element that has not arrived. A
+missing map key yields the empty map `updateAt` would create there, so the walk continues
+and only a deeper `IntoElem` fails.
+-}
+walkTarget : Target -> Node -> Maybe Node
+walkTarget steps node =
+    case steps of
+        [] ->
+            Just node
+
+        (IntoKey k) :: rest ->
+            walkTarget rest (childAtKey k node)
+
+        (IntoElem x) :: rest ->
+            childAtElem x node |> Maybe.andThen (walkTarget rest)
+
+
+{-| Whether the map key a presence op names is already there (present or tombstoned) —
+the gate on a removal, which `setKeyPresenceAt` will not let create its own entry.
+
+Unlike `walkTarget`, a missing key on the way down is an answer (`False`), not a synthesized
+empty map: if the parent isn't there yet, the key certainly isn't. A target that doesn't end
+in a key isn't a shape this action takes, so it is left ungated.
+
+-}
+keyIsThere : Target -> Node -> Bool
+keyIsThere steps node =
+    case steps of
+        [ IntoKey k ] ->
+            case node of
+                Map entries ->
+                    Dict.member k entries
+
+                _ ->
+                    False
+
+        (IntoKey k) :: rest ->
+            keyIsThere rest (childAtKey k node)
+
+        (IntoElem x) :: rest ->
+            childAtElem x node |> Maybe.map (keyIsThere rest) |> Maybe.withDefault False
+
+        [] ->
+            True
+
+
+childAtKey : String -> Node -> Node
+childAtKey k node =
+    case node of
+        Map entries ->
+            Dict.get k entries |> Maybe.map .value |> Maybe.withDefault emptyMap
+
+        _ ->
+            emptyMap
+
+
+{-| The child `updateAt`'s `IntoElem` branch would descend into, if it is there. Mirrors
+that branch case for case — including its omissions, so an op addressing something
+`updateAt` cannot descend into stays pending rather than silently evaporating.
+-}
+childAtElem : OpId -> Node -> Maybe Node
+childAtElem x node =
+    case node of
+        Seq rga ->
+            Rga.get x rga |> Maybe.map .content
+
+        Mov ml ->
+            Dict.get (Id.opIdToString x) (MoveList.values ml)
+
+        Tree t ->
+            Dict.get (Id.opIdToString x) (Tree.payloads t)
+
+        _ ->
+            Nothing
+
+
+{-| Whether a `DeleteElem` would record anything. Sequences tombstone the element in place,
+so it has to be present; movable lists and trees keep a grow-only set of deleted ids that
+a later insert is filtered through, so the container alone suffices.
+-}
+deleteLands : OpId -> Node -> Bool
+deleteLands elem container =
+    case container of
+        Seq rga ->
+            Rga.get elem rga /= Nothing
+
+        Txt rga ->
+            Rga.get elem rga /= Nothing
+
+        Rich r ->
+            Rga.get elem r.text /= Nothing
+
+        Mov _ ->
+            True
+
+        Tree _ ->
+            True
+
+        _ ->
+            False
+
+
+isMovableList : Node -> Bool
+isMovableList node =
+    case node of
+        Mov _ ->
+            True
+
+        _ ->
+            False
+
+
+isRichText : Node -> Bool
+isRichText node =
+    case node of
+        Rich _ ->
+            True
+
+        _ ->
+            False
+
+
+{-| Apply `f` at `steps`, creating any map entry on the way that isn't there yet.
+Sequence/text elements are descended into by id.
+
+A key created this way is stamped `Id.unwrittenStamp` — **not** the id of the op that
+happened to create it. The stamp is the key's presence LWW value, and no op here said
+anything about presence: the key exists only because something was written _inside_ it. If
+the creating op's id went in instead, the stamp would depend on which op reached the key
+first, and an incremental fold (arrival order) and a full `materialize` (causal order) reach
+it in different orders — so the same op set would produce two different documents. Losing to
+every real presence op is also the behaviour we want: whichever `SetKeyPresence` arrives, before
+or after, decides presence, and a removal is never silently outranked by a write that merely
+passed through.
+
+-}
+updateAt : List TargetStep -> (Node -> Node) -> Node -> Node
+updateAt steps f node =
     case steps of
         [] ->
             f node
@@ -560,40 +989,58 @@ updateAt steps stamp f node =
                 newEntry =
                     case existing of
                         Just e ->
-                            { e | value = updateAt rest stamp f childNode }
+                            { e | value = updateAt rest f childNode }
 
                         Nothing ->
-                            Node.entry stamp True (updateAt rest stamp f childNode)
+                            Node.entry Id.unwrittenStamp True (updateAt rest f childNode)
             in
             Node.mapFromEntries (Dict.insert k newEntry entries)
 
         (IntoElem x) :: rest ->
             case node of
                 Seq rga ->
-                    Seq (Rga.updateElement x (updateAt rest stamp f) rga)
+                    Seq (Rga.updateElement x (updateAt rest f) rga)
 
-                Txt rga ->
-                    Txt (Rga.updateElement x (updateAt rest stamp f) rga)
-
+                -- no `Txt`/`Rich` case: a text element is a character, so there is nothing
+                -- inside it for a target to address. It used to be a whole `Node`, and this
+                -- descent existed only because the type allowed it.
                 Mov ml ->
                     -- descend into the value `x` (by valueId) and edit its content
-                    Mov (MoveList.updateValue x (updateAt rest stamp f) ml)
+                    Mov (MoveList.updateValue x (updateAt rest f) ml)
 
                 Tree t ->
                     -- descend into tree node `x` (by nodeId) and edit its payload
-                    Tree (Tree.updateValue x (updateAt rest stamp f) t)
+                    Tree (Tree.updateValue x (updateAt rest f) t)
 
                 _ ->
                     node
 
 
-{-| Set a map key's presence (LWW by stamp), creating the key if absent. This is
+{-| Set whether a **map key exists** (LWW by stamp), creating the key if absent. This is
 how dict set/remove is expressed as an op. A newly-created key is seeded with the
 value sub-schema's empty structure (carried by the op), not a bare map — the same
 seeding rule `InsertElem` follows.
+
+"Presence" here is the name of the `Node.Entry` field this writes: a map entry's
+existence is itself an LWW boolean with its own stamp, which is what makes key removal
+converge against a concurrent write to the same key. It has **nothing to do with
+`Crdt.Presence`**, the ephemeral who-is-online side channel — that never reaches the op
+log at all. The `Key` in the name is there to keep the two apart.
+
+**Only a `present = True` op creates the key.** A removal that finds no key leaves the map
+alone: it has nothing to tombstone, and the seed it carries is not the one a creation would
+install, so letting it create the entry would make the pair order-dependent (remove-then-create
+would keep the removal's placeholder as the value, and the create's own seed would be dropped
+as a second seed for a key that now exists). `canApply` defers such a removal until the key
+shows up, so an out-of-order delivery lands it rather than losing it — and the seed a
+creation _does_ install is the value's canonical skeleton (`Node.vacate`), identical on every
+replica, so which of two concurrent creations wins the race no longer changes the result.
+Together those two make this a commutative function of the op set, which is what
+`addedOpsInOrder`'s incremental fold assumes of every action.
+
 -}
-setPresenceAt : List TargetStep -> OpId -> Bool -> Node -> Node -> Node
-setPresenceAt steps stamp present seed node =
+setKeyPresenceAt : List TargetStep -> OpId -> Bool -> Node -> Node -> Node
+setKeyPresenceAt steps stamp present seed node =
     case steps of
         [] ->
             node
@@ -617,10 +1064,15 @@ setPresenceAt steps stamp present seed node =
                         Node.mapFromEntries entries
 
                 Nothing ->
-                    Node.mapFromEntries (Dict.insert k (Node.entry stamp present seed) entries)
+                    if present then
+                        Node.mapFromEntries (Dict.insert k (Node.entry stamp present seed) entries)
+
+                    else
+                        -- nothing to tombstone; `canApply` holds this op until there is
+                        Node.mapFromEntries entries
 
         step :: rest ->
-            updateAt [ step ] stamp (\child -> setPresenceAt rest stamp present seed child) node
+            updateAt [ step ] (\child -> setKeyPresenceAt rest stamp present seed child) node
 
 
 emptyMap : Node
@@ -642,12 +1094,16 @@ setRegLww stamp prim current =
             Node.reg prim stamp
 
 
+{-| Insert an element whose content is a whole document. That is only the
+**document-shaped** containers: a `Seq` element and a `Mov` value hold a `Node`, while a
+`Txt` element holds a character and a `Rich` element a `RichElem`, so neither can take this
+op's seed (`design-docs/16-typed-sequence-content.md`). Text is inserted by `InsertText` (a
+run of characters) and block structure by `InsertToken`; the type split is what makes those
+separate actions rather than one loosely-typed one.
+-}
 insertElem : OpId -> Maybe OpId -> Rga.Side -> Node -> Node -> Node
 insertElem elemId parent side seed current =
     case current of
-        Txt rga ->
-            Txt (Rga.put (Rga.element elemId parent side seed False) rga)
-
         Mov ml ->
             -- movable list: elemId is the valueId, `parent` the cell to follow. A
             -- MoveList cell is always a right-child (structural), so `side` is
@@ -657,12 +1113,35 @@ insertElem elemId parent side seed current =
         Seq rga ->
             Seq (Rga.put (Rga.element elemId parent side seed False) rga)
 
-        Rich r ->
-            -- rich text: characters live in the node's `.text` sequence
-            Rich { r | text = Rga.put (Rga.element elemId parent side seed False) r.text }
+        Txt _ ->
+            -- The wrong op for this container: the seed is a document and a text element is
+            -- a character. Leave it ALONE — falling through to the create case below would
+            -- replace the whole text field with a `Seq`, destroying it. Text is inserted by
+            -- `InsertText`.
+            current
+
+        Rich _ ->
+            current
 
         _ ->
+            -- create the sequence: the container is a slot that no op has shaped yet (an
+            -- implicitly created map key), which is why this action is not gated on its
+            -- container in `canApply`.
             Seq (Rga.put (Rga.element elemId parent side seed False) Rga.empty)
+
+
+{-| Insert a block-structure token — a boundary marker or one unit of indent — into a rich
+text sequence. The only non-character element a rich sequence can hold, and meaningless in
+any other container (`design-docs/11-block-structure.md`).
+-}
+insertToken : OpId -> Maybe OpId -> Rga.Side -> Node.BlockToken -> Node -> Node
+insertToken elemId parent side token current =
+    case current of
+        Rich r ->
+            Rich { r | text = Rga.put (Rga.element elemId parent side (Node.Token token) False) r.text }
+
+        _ ->
+            current
 
 
 {-| **Explode a run-length text op** into the same per-character right-spine the store
@@ -688,8 +1167,10 @@ insertTextRun start text parent side current =
             Id.opIdCounter start
 
         -- fold the chars left→right into `rga0`, threading the previous char's id as the
-        -- next char's parent; the first char uses the op's own (parent, side).
-        putChars rga0 =
+        -- next char's parent; the first char uses the op's own (parent, side). `toContent`
+        -- says what a character *is* in the target container — the one thing that differs
+        -- between the three, now that they no longer share a content type.
+        putChars toContent rga0 =
             String.toList text
                 |> List.foldl
                     (\ch ( i, prevId, rga ) ->
@@ -708,27 +1189,30 @@ insertTextRun start text parent side current =
 
                                     Nothing ->
                                         ( parent, side )
-
-                            seed =
-                                Node.reg (Node.PString (String.fromChar ch)) elemId
                         in
-                        ( i + 1, Just elemId, Rga.put (Rga.element elemId p s seed False) rga )
+                        ( i + 1
+                        , Just elemId
+                        , Rga.put (Rga.element elemId p s (toContent elemId (String.fromChar ch)) False) rga
+                        )
                     )
                     ( 0, Nothing, rga0 )
                 |> (\( _, _, rga ) -> rga)
     in
     case current of
         Txt rga ->
-            Txt (putChars rga)
+            Txt (putChars (\_ ch -> ch) rga)
 
         Seq rga ->
-            Seq (putChars rga)
+            -- a plain sequence of one-character registers. Not something the library emits
+            -- (text edits target a `Txt`/`Rich`), but honoured rather than dropped: a `Seq`
+            -- can hold a character, it just wraps it like any other value.
+            Seq (putChars (\elemId ch -> Node.reg (Node.PString ch) elemId) rga)
 
         Rich r ->
-            Rich { r | text = putChars r.text }
+            Rich { r | text = putChars (\_ ch -> Node.TextChar ch) r.text }
 
         _ ->
-            Txt (putChars Rga.empty)
+            Txt (putChars (\_ ch -> ch) Rga.empty)
 
 
 deleteElem : OpId -> Node -> Node

@@ -1,4 +1,4 @@
-// Merge-timing benchmark (see docs/12-referential-stability-and-diff.md).
+// Merge-timing benchmark (see design-docs/12-referential-stability-and-diff.md).
 //
 // Measures how long `OpDoc.merge` takes to integrate a small remote delta into a
 // size-`n` document. This is the every-incoming-message path in the demo, and the case

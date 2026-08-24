@@ -187,12 +187,13 @@ in git history for reference.
    call `toElementsInOrder`; a general sub-linear visible-index lookup needs a
    persistent order index. Tracked in `tests/OpLogPhase1Gaps.elm`.
 
-## Browser benchmark
+## Browser benchmark — removed
 
-`src/Main.elm` is an `elm-explorations/benchmark` suite (statistical sampling,
-needs a browser):
-
-```sh
-../node_modules/.bin/elm make src/Main.elm --output benchmark.js
-# open an HTML page that loads benchmark.js and calls Elm.Main.init()
-```
+There was an `elm-explorations/benchmark` suite in `src/Main.elm` (statistical sampling in a
+browser). It was deleted: it predated several architecture changes and imported modules that
+no longer exist (`Crdt.OpDoc`, `Crdt.Path`, `Crdt.Schema`), so it had stopped compiling, and
+its question — cached read vs full re-materialization — is answered in Node by `run.js` (the
+same table) and `run-scrub.js` (the fold in isolation). Nothing in the harness depended on
+it; `npm run build` only ever compiled `src/Headless.elm`. Its dependencies
+(`elm-explorations/benchmark`, `elm/html`) went with it, so `elm.json` is now just
+`elm/core` + `elm/json`.

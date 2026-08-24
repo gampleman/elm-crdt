@@ -6,11 +6,11 @@ module Crdt.Tree exposing
 {-| The value you read out of a **tree** field — hierarchical, re-orderable data such
 as an outline, a file tree, or threaded comments.
 
-You describe a tree with `Crdt.tree`, edit it through the `Crdt` module (move a node
+You describe a tree with `Crdt.tree`, edit it through `Crdt.Edit` (move a node
 under a new parent, reorder it among its siblings, change its contents, or delete it),
 and read it back as a `Forest` of `Item`s. Each item keeps a **stable id** across every
 move, so the ids you get from a read are exactly what you pass back to the editing
-functions in the `Crdt` module to say _which_ node to act on.
+functions in `Crdt.Edit` to say _which_ node to act on.
 
     view : Forest Comment -> Html msg
     view forest =
@@ -38,8 +38,8 @@ consistent order for everyone.
 If you'd rather work with a richer tree type, a `Forest` maps cleanly onto a
 [rosetree](https://package.elm-lang.org/packages/gampleman/elm-rosetree/latest/) — a
 `Forest a` becomes a `List (Tree a)`, since a rosetree has a single root while a `Forest`
-can have several. Build each one with `Tree.unfold`, seeding from an `Item`, so the
-construction stays stack-safe on deep trees:
+can have several. Build each one with the rosetree package's own `unfold` (`Rose.unfold`
+below), seeding from an `Item`, so the construction stays stack-safe on deep trees:
 
     import Tree as Rose
 
@@ -77,7 +77,7 @@ type alias Item a =
     I.Item a
 
 
-{-| The node's stable id. Pass this to the tree-editing functions in the `Crdt` module
+{-| The node's stable id. Pass this to the tree-editing functions in `Crdt.Edit`
 (`Crdt.Edit.moveInto`, `Crdt.Edit.removeNode`, …) to say which node you mean; it does not change
 when the node is moved or edited.
 -}

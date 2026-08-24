@@ -13,7 +13,7 @@ op log addresses edits with) plus an `Anchor` for the spot _within_ that
 container. Because it is anchored to element `OpId`s — which are immutable — a
 cursor stays meaningful as other replicas concurrently insert, delete, or
 reorder around it. Resolve one back to a current offset with
-`Crdt.Doc.cursorOffset`.
+`Crdt.Cursor.cursorOffset`.
 
 Cursors are **ephemeral presence data**, not document state: you broadcast them
 on the `Crdt.Presence` channel and each viewer resolves them locally against its
@@ -52,14 +52,14 @@ type Anchor
 
 
 {-| A stable position: an id-based path to a sequence/text container, plus the
-anchor within it. Opaque; build with `Crdt.Doc.cursorAt`.
+anchor within it. Opaque; build with `Crdt.Cursor.cursorAt`.
 -}
 type Cursor
     = Cursor Target Anchor
 
 
 {-| Construct a cursor from a container target and an anchor. (Normally you'd use
-`Crdt.Doc.cursorAt`, which derives both from a visible-index path + offset.)
+`Crdt.Cursor.cursorAt`, which derives both from a visible-index path + offset.)
 -}
 fromParts : Target -> Anchor -> Cursor
 fromParts =
@@ -73,7 +73,7 @@ anchor (Cursor _ a) =
     a
 
 
-{-| The container target steps of a cursor (used by `Crdt.Doc` to resolve it).
+{-| The container target steps of a cursor (used by `Crdt.Doc.Internal` to resolve it).
 -}
 steps : Cursor -> Target
 steps (Cursor t _) =

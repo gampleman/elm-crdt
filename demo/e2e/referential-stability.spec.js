@@ -1,4 +1,4 @@
-// Referential-stability + diff verification (docs/12). The demo keeps a stable decoded
+// Referential-stability + diff verification (design-docs/12). The demo keeps a stable decoded
 // `todosSlice` in its Model, refreshed ONLY when a change actually touched the todos
 // (asked of the merge/ingest `Diff` via the typed `Ref.touched`). A `Html.Lazy` view
 // over that slice (`viewTodoSummary`) logs "render:todo-summary" whenever it actually

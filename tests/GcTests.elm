@@ -1,6 +1,6 @@
 module GcTests exposing (suite)
 
-{-| Garbage collection / shallow snapshots (see `docs/04-gc.md`).
+{-| Garbage collection / shallow snapshots (see `design-docs/04-gc.md`).
 
 The load-bearing guarantee is **read-equivalence**: `gc` folds the ops at-or-below
 a causal cut into `base` and drops them, and the document reads **identically**
@@ -82,9 +82,38 @@ removeItem i doc =
     Doc.listRemove todosPath i doc |> ok doc
 
 
+{-| Edit a field _inside_ a list element — the shape that a re-applied insert op destroys,
+since `Rga.insertElement` rebuilds the element from the op's own seed.
+-}
+setItemLabel : Int -> String -> Doc Sample -> Doc Sample
+setItemLabel i label doc =
+    Doc.setText (todosPath |> Path.index i |> Path.field "label") label doc |> ok doc
+
+
 bytes : Doc Sample -> Int
 bytes doc =
     Doc.encode doc |> JE.encode 0 |> String.length
+
+
+title : Doc Sample -> String
+title doc =
+    read doc |> Result.map .title |> Result.withDefault "READ-FAILED"
+
+
+{-| One user-level edit, bracketed for undo the way an app does it.
+-}
+edit : (Doc Sample -> Doc Sample) -> Doc Sample -> Doc Sample
+edit f doc =
+    Doc.recordEdit (Doc.version doc) (f doc)
+
+
+{-| Two recorded edits, so there is an undo stack to compact across.
+-}
+recorded : Doc Sample
+recorded =
+    initDoc "alice"
+        |> edit (setTitle "one")
+        |> edit (setTitle "one two")
 
 
 read : Doc Sample -> Result S.Error Sample
@@ -123,6 +152,45 @@ applyEdit n doc =
 buildFrom : List Int -> Doc Sample
 buildFrom edits =
     List.foldl applyEdit (initDoc "alice") edits
+
+
+labels : Doc Sample -> List String
+labels doc =
+    read doc |> Result.map (.items >> List.map .label) |> Result.withDefault [ "READ-FAILED" ]
+
+
+{-| A replica that starts from `doc`'s state, over the wire (so it shares the lineage).
+-}
+forkOf : String -> Doc Sample -> Doc Sample
+forkOf name doc =
+    Doc.decodeInto (Doc.encode doc) (initDoc name) |> Result.withDefault (initDoc name)
+
+
+{-| The shared starting point for the in-memory-merge-across-compaction tests.
+-}
+sharedStart : Doc Sample
+sharedStart =
+    initDoc "alice" |> setTitle "shared"
+
+
+{-| B: forked from `sharedStart`, did work offline, then **compacted it all away** into
+its base (`compact (version doc) doc` — the documented local-save policy). Its op store
+is empty, so the only carrier of its work is `base`.
+-}
+offlinePeer : Doc Sample
+offlinePeer =
+    let
+        worked =
+            forkOf "bob" sharedStart |> addItem "B-offline"
+    in
+    Doc.compact (Doc.version worked) worked
+
+
+{-| A: stayed on the shared lineage and made its own concurrent edit.
+-}
+localAhead : Doc Sample
+localAhead =
+    setTitle "shared+A" sharedStart
 
 
 
@@ -249,6 +317,63 @@ suite =
 
                     Nothing ->
                         Expect.fail "cursorAt failed"
+        , test "a cursor whose anchor was DELETED, then compacted away, unresolves" <|
+            \_ ->
+                let
+                    doc =
+                        initDoc "alice" |> setTitle "hello"
+
+                    -- caret between "hel" and "lo", anchored to the second 'l'
+                    cur =
+                        Doc.cursorAt titlePath 3 doc |> Result.toMaybe
+
+                    -- delete the anchored characters: "hello" -> "heo". The tombstones
+                    -- still mark the spot, so the caret lands at the nearest live one.
+                    deleted =
+                        setTitle "heo" doc
+
+                    -- ...but a full compaction physically drops those tombstones, and
+                    -- then nothing in the sequence can place the anchor. Reporting an
+                    -- offset anyway means reporting the END of the text (the live count
+                    -- of a walk that never meets its anchor) — a caret that has silently
+                    -- teleported, and is indistinguishable from a real end-of-text
+                    -- caret. `Nothing` lets the caller draw no caret instead.
+                    compacted =
+                        Doc.compact (Doc.version deleted) deleted
+                in
+                case cur of
+                    Just c ->
+                        Expect.equal
+                            { text = Ok "heo", beforeGc = Just 2, afterGc = Nothing }
+                            { text = read compacted |> Result.map .title
+                            , beforeGc = Doc.cursorOffset c deleted
+                            , afterGc = Doc.cursorOffset c compacted
+                            }
+
+                    Nothing ->
+                        Expect.fail "cursorAt failed"
+        , test "an anchor from an insert that has not ARRIVED yet also unresolves" <|
+            \_ ->
+                let
+                    -- alice types, and captures a caret in the middle of her text
+                    alice =
+                        initDoc "alice" |> setTitle "hello"
+
+                    cur =
+                        Doc.cursorAt titlePath 3 alice |> Result.toMaybe
+
+                    -- bob shares the field but has never received alice's characters, so
+                    -- her anchor is unknown to him — same unplaceable case as a compacted
+                    -- tombstone, and equally wrong to report as "end of text".
+                    bob =
+                        initDoc "bob" |> setTitle ""
+                in
+                case cur of
+                    Just c ->
+                        Doc.cursorOffset c bob |> Expect.equal Nothing
+
+                    Nothing ->
+                        Expect.fail "cursorAt failed"
         , test "snapshot transfer catches up a peer behind the compaction boundary" <|
             \_ ->
                 let
@@ -305,6 +430,64 @@ suite =
                             |> Result.withDefault bob
                 in
                 Expect.equal (read aliceMore) (read bobCaught)
+        , describe "a peer must not hand back ops we already folded into `base`"
+            [ test "our version names the base boundary, so the delta a peer offers is empty" <|
+                \_ ->
+                    -- The sender's side of it. `version` carries `baseFrontier` alongside
+                    -- the store's tips; without that, our post-compaction edit is the only
+                    -- tip we advertise, the peer cannot resolve it (it has never seen it),
+                    -- and `opsAfter` concludes we know nothing and re-sends everything.
+                    let
+                        -- bob holds every op alice has
+                        bob =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encode sample)
+                                |> Result.withDefault (initDoc "bob")
+
+                        -- alice folds her whole history away, then edits on top of `base`
+                        alice =
+                            Doc.compact (Doc.version sample) sample |> setTitle "Trip plan v2"
+
+                        -- what bob would send her: she is missing nothing of his
+                        delta =
+                            Doc.encodeSince (Doc.version alice) bob
+
+                        -- count the ops in that delta by handing it to an empty peer
+                        probe =
+                            initDoc "carol"
+                                |> Doc.decodeInto delta
+                                |> Result.withDefault (initDoc "carol")
+                    in
+                    Doc.opCount probe |> Expect.equal 0
+            , test "and a peer who re-sends anyway cannot clobber our post-compaction edits" <|
+                \_ ->
+                    -- The receiver's side, which must not depend on the sender: `encode`
+                    -- ignores our version entirely, and a re-applied insert op would rebuild
+                    -- the element from its original seed — reverting the label alice set
+                    -- after the insert had already been folded into her base.
+                    let
+                        bob =
+                            initDoc "bob"
+                                |> Doc.decodeInto (Doc.encode sample)
+                                |> Result.withDefault (initDoc "bob")
+
+                        alice =
+                            Doc.compact (Doc.version sample) sample
+                                |> setItemLabel 0 "packed"
+
+                        back =
+                            alice
+                                |> Doc.decodeInto (Doc.encode bob)
+                                |> Result.withDefault alice
+                    in
+                    Expect.all
+                        [ \d -> read d |> Expect.equal (read alice)
+                        , -- nothing was re-imported into the store
+                          \d -> Doc.opCount d |> Expect.equal (Doc.opCount alice)
+                        , \d -> Doc.cacheConsistent d |> Expect.equal True
+                        ]
+                        back
+            ]
         , test "gc is idempotent: gc-ing an already-compacted doc is a no-op on the read" <|
             \_ ->
                 let
@@ -315,6 +498,86 @@ suite =
                         Doc.compact (Doc.version once) once
                 in
                 Expect.equal (read once) (read twice)
+        , describe "local undo/redo across a compaction boundary"
+            [ test "a full compact drops the undo stack instead of leaving dead entries" <|
+                \_ ->
+                    let
+                        doc =
+                            recorded
+
+                        -- everything the undo entries would invert is now folded into
+                        -- `base`. `inverseBetween` collects ops from the STORE, so it
+                        -- would find none: undo would silently do nothing while popping
+                        -- the entry, and the UI's undo button would lie.
+                        compacted =
+                            Doc.compact (Doc.version doc) doc
+                    in
+                    Expect.equal
+                        { liveCanUndo = True, gcCanUndo = False, gcUndoIsNoOp = True }
+                        { liveCanUndo = Doc.canUndo doc
+                        , gcCanUndo = Doc.canUndo compacted
+                        , gcUndoIsNoOp = title (Doc.undo compacted) == title compacted
+                        }
+            , test "undo still works up to the cut: entries ABOVE it survive" <|
+                \_ ->
+                    let
+                        -- cut after the first recorded edit, then make a second one
+                        upToFirst =
+                            initDoc "alice" |> edit (setTitle "one")
+
+                        cut =
+                            Doc.version upToFirst
+
+                        doc =
+                            upToFirst
+                                |> edit (setTitle "one two")
+                                |> Doc.compact cut
+                    in
+                    -- the second edit's ops are above the cut and still in the store, so
+                    -- its entry is honest and undo really unwinds it; the first edit's
+                    -- entry was folded away and is gone.
+                    Expect.equal
+                        { canUndo = True, undone = "one", thenCanUndo = False }
+                        { canUndo = Doc.canUndo doc
+                        , undone = title (Doc.undo doc)
+                        , thenCanUndo = Doc.canUndo (Doc.undo doc)
+                        }
+            , test "a surviving entry's undo emits real ops and syncs to a peer" <|
+                \_ ->
+                    let
+                        upToFirst =
+                            initDoc "alice" |> edit (setTitle "one")
+
+                        alice =
+                            upToFirst
+                                |> edit (setTitle "one two")
+                                |> Doc.compact (Doc.version upToFirst)
+                                |> Doc.undo
+
+                        bob =
+                            forkOf "bob" alice
+                    in
+                    Expect.equal
+                        { alice = "one", bob = Ok "one", consistent = True }
+                        { alice = title alice
+                        , bob = read bob |> Result.map .title
+                        , consistent = Doc.cacheConsistent alice
+                        }
+            , test "the redo stack is pruned the same way (no dead redo either)" <|
+                \_ ->
+                    let
+                        doc =
+                            recorded |> Doc.undo
+
+                        compacted =
+                            Doc.compact (Doc.version doc) doc
+                    in
+                    Expect.equal
+                        { liveCanRedo = True, gcCanRedo = False }
+                        { liveCanRedo = Doc.canRedo doc
+                        , gcCanRedo = Doc.canRedo compacted
+                        }
+            ]
         , describe "tombstone compaction (phase 4): a full compact physically drops dead tombstones"
             [ test "read is unchanged after compacting a heavily-deleted list" <|
                 \_ ->
@@ -734,6 +997,92 @@ suite =
                         , -- some ops remain (the tail above the cut), but fewer than full
                           \_ -> Expect.greaterThan 0 (Doc.opCount peer)
                         , \_ -> Expect.lessThan (Doc.opCount full) (Doc.opCount peer)
+                        ]
+                        ()
+            ]
+        , describe "in-memory merge across a compaction boundary"
+            -- REGRESSION: `merge` unions op stores and used to keep `local.base`
+            -- unconditionally, ignoring `incoming.base`. History the incoming replica had
+            -- folded into its base is in NO store, so it vanished — silently (the result
+            -- still passed `cacheConsistent`), and asymmetrically (`merge a b` disagreed
+            -- with `merge b a`). Only the wire path (`decodeInto`, snapshot adoption)
+            -- handled it, and only that path was covered. Scenario throughout: B works
+            -- offline, compacts (the documented single-replica save policy), reconnects.
+            [ test "the incoming doc really does hold its work in `base` alone" <|
+                \_ ->
+                    Expect.all
+                        [ \_ -> Doc.opCount offlinePeer |> Expect.equal 0
+                        , \_ -> labels offlinePeer |> List.member "B-offline" |> Expect.equal True
+                        ]
+                        ()
+            , test "merging it in adopts that base instead of dropping its work" <|
+                \_ ->
+                    let
+                        merged =
+                            Doc.merge localAhead offlinePeer
+                    in
+                    Expect.all
+                        [ \_ -> labels merged |> List.member "B-offline" |> Expect.equal True
+                        , -- and our own concurrent edit survives the adoption
+                          \_ -> Result.map .title (read merged) |> Expect.equal (Ok "shared+A")
+                        ]
+                        ()
+            , test "merge is commutative across the boundary" <|
+                \_ ->
+                    Expect.equal
+                        (read (Doc.merge localAhead offlinePeer))
+                        (read (Doc.merge offlinePeer localAhead))
+            , test "and idempotent: merging twice changes nothing" <|
+                \_ ->
+                    let
+                        once =
+                            Doc.merge localAhead offlinePeer
+                    in
+                    Expect.equal (read once) (read (Doc.merge once offlinePeer))
+            , test "the adopted result is cache-consistent and keeps editing safely" <|
+                \_ ->
+                    let
+                        merged =
+                            Doc.merge localAhead offlinePeer
+
+                        edited =
+                            merged |> addItem "after-adopt" |> setTitle "final"
+                    in
+                    Expect.all
+                        [ \_ -> Doc.cacheConsistent merged |> Expect.equal True
+                        , \_ -> Doc.cacheConsistent edited |> Expect.equal True
+                        , -- a fresh id must not collide with anything the adopted base
+                          -- carried, or one of these two items would be lost
+                          \_ -> labels edited |> List.member "after-adopt" |> Expect.equal True
+                        , \_ -> labels edited |> List.member "B-offline" |> Expect.equal True
+                        , \_ -> Result.map .title (read edited) |> Expect.equal (Ok "final")
+                        ]
+                        ()
+            , test "in-memory merge now agrees with the wire path" <|
+                \_ ->
+                    let
+                        viaMerge =
+                            Doc.merge localAhead offlinePeer
+
+                        viaWire =
+                            Doc.decodeInto (Doc.encode offlinePeer) localAhead
+                                |> Result.withDefault localAhead
+                    in
+                    Expect.equal (read viaMerge) (read viaWire)
+            , test "an UNcompacted incoming doc still takes the incremental path" <|
+                \_ ->
+                    -- the fix must not change the common case: nothing is adopted, so
+                    -- containers the merge didn't touch keep their identity.
+                    let
+                        peer =
+                            forkOf "bob" sample |> addItem "peer-item"
+                    in
+                    Expect.all
+                        [ \_ -> labels (Doc.merge sample peer) |> List.member "peer-item" |> Expect.equal True
+                        , \_ ->
+                            Expect.equal
+                                (read (Doc.merge sample peer))
+                                (read (Doc.merge peer sample))
                         ]
                         ()
             ]

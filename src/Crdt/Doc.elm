@@ -20,17 +20,19 @@ the same time, on different devices, even while offline, and always end up agree
 the result. You never reconcile conflicts by hand: concurrent edits **merge**
 automatically and every replica converges to the same value.
 
-You **create** a document (`Crdt.init`) and **read** it (`Crdt.read`) through the `Crdt`
-module, where the schema lives, and **edit** it through that module's typed refs. This
-module is everything else you do with a document once you have one:
+You **create** a document with `Crdt.init` (in the `Crdt` module, where the schema lives)
+and **edit** it through that module's typed refs, via `Crdt.Edit`. Everything else you do
+with a document once you have one is here:
 
-1.  **sync** it with other replicas by shipping bytes over any transport you like
+1.  **read** its current typed value (`read`), or its value at a past `Version` (`readAt`);
+
+2.  **sync** it with other replicas by shipping bytes over any transport you like
     (`encode` / `decodeInto`, or the smaller `encodeSince` delta), and merging what
     arrives — the library guarantees convergence, the network is entirely yours;
 
-2.  **react** to what a merge changed (`mergeWithDiff` + `Doc.touched`);
+3.  **react** to what a merge changed (`mergeWithDiff` + `Doc.touched`);
 
-3.  travel through **history** (`version` / `restoreTo`), **undo/redo**, name
+4.  travel through **history** (`version` / `restoreTo`), **undo/redo**, name
     **checkpoints**, and **compact** old history away.
 
     -- sync: send `Doc.encode doc` to a peer; on receipt:
@@ -117,7 +119,7 @@ edits are concurrent with the mainline's and both survive the merge — see [`fo
 # Undo and redo
 
 Undo here is **per-user**, and different from the time-travel above. Time-travel
-(`Crdt.readAt` / `restoreTo`) works on the _whole shared timeline_ — every replica's edits
+(`readAt` / `restoreTo`) works on the _whole shared timeline_ — every replica's edits
 together — and `restoreTo` rewinds the document for everyone. Undo instead walks back
 only **your own** recent actions, and leaves concurrent edits from other people alone: if
 you type a word while a collaborator deletes a paragraph elsewhere, your undo removes your
@@ -190,10 +192,10 @@ be a point you (or your peers) will never need to merge from again. Three safe c
         payloadForPeers =
             Doc.encodeFrom safe model.doc
 
-`encodeFrom` also enables **privacy redaction**: exporting above a cut yields a payload with
-no ops — hence no record of edits, authors, or superseded text — below it. (It scrubs
-_history_ below the cut, not data still live _at_ the cut, which remains in the exported
-base; see [`encodeFrom`](#encodeFrom).)
+`encodeFrom` drops the _operations_ below the cut, so a peer receives no per-edit record of
+who changed what and when. It is **not** a redaction tool, though: the snapshot it folds
+those ops into still carries deleted text (as tombstones that keep their content), removed
+dictionary values, and replica-identifying ids — see [`encodeFrom`](#encodeFrom).
 
 @docs compact, stableFrontier, opCount
 
@@ -250,7 +252,15 @@ idempotent: merging in any order, more than once, always converges to the same v
 so you can gossip documents around a network of peers without coordination.
 
 Usually you merge over the wire with `decodeInto` rather than holding two live documents;
-`merge` is the in-memory form.
+`merge` is the in-memory form. It handles a `compact`ed argument the same way
+`decodeInto` handles a compacted peer's snapshot: history the incoming document folded
+into its base is adopted rather than lost.
+
+The exception, for both paths, is two documents that were compacted **independently** at
+cuts where neither covers the other — each base then holds folded history the other
+lacks, and one result can only carry one base, so the local one wins and the other's
+folded history is dropped. That only arises by compacting at a cut a future merge partner
+had not reached, which `compact` already documents as unsafe.
 
 -}
 merge : Doc a -> Doc a -> Doc a
@@ -292,21 +302,25 @@ given `Version` but discarding the history before it.
 `v`; the earlier operations are collapsed into a starting snapshot. The result is smaller,
 and decodes to a document with the **same value** but a shorter history.
 
-Two uses:
+The use for it: **archive the full history, share a shallow copy.** Persist `encode doc` for
+yourself so you keep undo and time-travel, but send peers `encodeFrom v doc` so they get a
+small document without your entire edit log. A good `v` is
+[`stableFrontier`](#stableFrontier) over the connected peers (the point they've all already
+reached).
 
-  - **Archive the full history, share a shallow copy.** Persist `encode doc` for yourself so
-    you keep undo and time-travel, but send peers `encodeFrom v doc` so they get a small
-    document without your entire edit log. A good `v` is [`stableFrontier`](#stableFrontier)
-    over the connected peers (the point they've all already reached).
-  - **Privacy redaction.** Because the operations before `v` are gone from the payload, so is
-    every trace of them — who edited, when, and any text that was later changed or deleted.
-    Pick a `v` late enough that the sensitive edits are all before it (and no longer visible
-    in the current value).
+**It is not a redaction tool.** It drops the _operations_ below `v` — so the fine-grained
+"who typed what, when" is gone — but the snapshot it folds them into carries more than the
+document's visible value:
 
-Note the second point removes past _edits_, not the current _value_: anything still present
-in the document at `v` remains in the shallow copy. So choose a `v` after which the sensitive
-content is no longer part of the value. See [`compact`](#compact) and the module's
-**Compacting history** section.
+  - a deleted list or text element survives as a **tombstone that still holds its content**,
+    along with the anchors giving its position, so deleted text is reconstructible;
+  - a removed dictionary key keeps its **value node**;
+  - every element `OpId` names the **replica** that minted it.
+
+(Tombstones can't be dropped here the way [`compact`](#compact) drops them when it folds the
+whole store, because an operation above `v` may still anchor after one.) So do not reach for
+`encodeFrom` to strip sensitive content that was typed and later deleted — it won't. See
+[`compact`](#compact) and the module's **Compacting history** section.
 
 -}
 encodeFrom : Version -> Doc a -> JE.Value
@@ -387,7 +401,7 @@ diffBetween =
 
 {-| Did the spot a `ref` points at — or anything under it, or a container it lives in —
 change in `diff`, and if so who? You ask with the same typed refs you edit through (from
-your schema's `.refs`); the `Origin` in a `Just` says whether the change was `Local` or
+your schema bundle); the `Origin` in a `Just` says whether the change was `Local` or
 from a particular remote replica. `doc` is the post-merge document.
 
 Use it to _react_ to an incoming change (your `view` already reflects the new state) — e.g.
@@ -397,7 +411,7 @@ to flash a highlight on a field a collaborator just touched:
         Doc.mergeWithDiff model.doc incoming
 
     highlightTitle =
-        case Doc.touched board.refs.title doc1 diff of
+        case Doc.touched board.title doc1 diff of
             Just origin ->
                 not (Doc.isLocal origin)
 
@@ -421,6 +435,11 @@ origins =
 {-| A point in the document's shared history — the state at some moment. Two replicas
 holding the same edits agree on it, so a `Version` can be stored, sent, and revisited
 later. Capture the current one with `version`.
+
+It describes **everything the document has**, including history that `compact` has folded
+away — which is what lets a peer answer `encodeSince` with a real delta rather than
+re-sending ops you have already garbage-collected.
+
 -}
 type alias Version =
     I.Version
@@ -453,7 +472,7 @@ versionAt =
 
 {-| Serialize a `Version` to JSON — a tiny payload (a causal frontier is a handful of op
 ids), for broadcasting your position to peers. The counterpart to `decodeVersion`. This is
-how a stable-frontier GC policy gathers everyone's version: each peer sends
+how a stable-frontier compaction policy gathers everyone's version: each peer sends
 `encodeVersion (version doc)`, and `stableFrontier` turns the collected versions into a
 safe compaction cut.
 -}

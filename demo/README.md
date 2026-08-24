@@ -23,7 +23,7 @@ presence channel, so the tab bar and "who's here" list show where each peer is):
   indent depth — Enter to split, Backspace to merge, Tab/Shift-Tab to indent) uses
   in-sequence block markers so concurrent split/merge/type/indent all converge. Open
   the same file in two tabs to edit together. See
-  [`../docs/10`](../docs/10-rich-text.md) + [`../docs/11`](../docs/11-block-structure.md).
+  [`../design-docs/10`](../design-docs/10-rich-text.md) + [`../design-docs/11`](../design-docs/11-block-structure.md).
 - **Outline** — a **movable tree** (`S.tree`): add/nest/re-parent nodes with the
   →/←/+/✕ controls. Concurrent re-parents that would form a cycle converge safely
   (Kleppmann's move algorithm), and siblings stay ordered via a fractional index.
@@ -76,7 +76,7 @@ can see where you are; every tab's document keeps converging behind whichever is
 hidden. The Files editor is a **TipTap / ProseMirror** view in a `<crdt-richtext>`
 custom element: Elm owns the CRDT, the element reports edit intents up
 (`richTextInput` port) and re-renders from spans pushed down (`renderRichText` port).
-See [`../docs/10-rich-text.md`](../docs/10-rich-text.md).
+See [`../design-docs/10-rich-text.md`](../design-docs/10-rich-text.md).
 
 To just build the app once (no server), run `npm run build` (builds `elm.js` and
 `bundle.js`).

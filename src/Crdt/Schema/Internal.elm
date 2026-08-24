@@ -1,5 +1,5 @@
 module Crdt.Schema.Internal exposing
-    ( Crdt, Error(..), Seed
+    ( Crdt, Error(..), Seed, runSeed
     , Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
     , int, float, string, bool, text, counter, register
     , optional, withDefault, map
@@ -10,22 +10,25 @@ module Crdt.Schema.Internal exposing
     , with, seedOneFrom, decodeNode, emptyNode, errorToString
     )
 
-{-| The combinator layer: a `Crdt a` describes a CRDT's shape and ties it to a
+{-| The combinator layer: a `Crdt kind a` describes a CRDT's shape and ties it to a
 typed Elm value `a`, the way an `elm/json` decoder ties JSON to a value. Compose
 them to build records, lists, dicts and text out of the primitives.
 
-A `Crdt a` carries three capabilities, all keyed off the uniform `Node`:
+A `Crdt kind a` carries four capabilities, all keyed off the uniform `Node`:
 
   - **decode** a `Node` into a typed `a` (the read path the demo renders from);
   - construct an **empty** `Node` for a fresh document;
   - **seed** a `Node` from a concrete value (used by `with`, so edits like
     "append this todo" can mint a whole subtree).
+  - read policy, `whenAbsent`, for schema evolution (what the schema reads when
+    its slot is missing entirely — see `optional` / `withDefault`).
 
 There is deliberately no `encode : a -> Node` that reconciles with existing
 state — that is the hard diff problem. All in-place mutation goes through the
-op-log edit APIs in `Crdt.Doc.Internal` (surfaced as `Crdt`), decoupled from this layer.
+op-log edit APIs in `Crdt.Doc.Internal` (surfaced as `Crdt.Edit`), decoupled from this
+layer.
 
-@docs Crdt, Error, Seed
+@docs Crdt, Error, Seed, runSeed
 @docs Settable, Counter, Nested, Variants, ListK, Fixed, Movable, DictK, TreeK, RichK, OpSetK
 @docs int, float, string, bool, text, counter, register
 @docs optional, withDefault, map
@@ -38,7 +41,6 @@ op-log edit APIs in `Crdt.Doc.Internal` (surfaced as `Crdt`), decoupled from thi
 -}
 
 import Crdt.Id.Internal as Id exposing (Ctx)
-import Crdt.Internal as I
 import Crdt.MoveList as MoveList
 import Crdt.Node as Node exposing (Node, Prim(..))
 import Crdt.Rga as Rga
@@ -51,12 +53,23 @@ import Json.Decode as JD
 import Json.Encode as JE
 
 
-{-| An opaque builder of a fresh subtree from a value, produced by `with` and
-consumed by the edit APIs. Re-exported from `Crdt.Internal` so the edit APIs can
-name it without leaking the internal `Node` type.
+{-| An opaque builder of a fresh subtree from a value, produced by `with` and consumed by
+the edit APIs.
+
+**Opaque** (it wraps a `Ctx -> (Node, Ctx)`, and `Node` is package-internal) so that
+`Crdt.Edit`'s signatures can _name_ it without `Node` reaching the public API. Exactly the
+same trick, for the same reason, as `VariantSeed` below.
+
 -}
-type alias Seed =
-    I.Seed
+type Seed
+    = Seed (Ctx -> ( Node, Ctx ))
+
+
+{-| Run a seed against a clock.
+-}
+runSeed : Seed -> Ctx -> ( Node, Ctx )
+runSeed (Seed f) =
+    f
 
 
 {-| A schema tying a typed value `a` to CRDT `Node` state, tagged with a phantom
@@ -70,7 +83,7 @@ type Crdt kind a
         , empty : Ctx -> ( Node, Ctx )
         , seed : a -> Ctx -> ( Node, Ctx )
 
-        -- Schema-evolution support (see docs/13). What this schema reads when its slot
+        -- Schema-evolution support (see design-docs/13). What this schema reads when its slot
         -- is **absent** from its parent (a record field the writer's schema didn't have
         -- yet): `Nothing` = required, absence is a `MissingField` error (the default for
         -- every leaf/container); `Just v` = absence reads as `v` (set by `optional` /
@@ -145,11 +158,14 @@ type RichK
     = RichK Never
 
 
-{-| Kind marker: a user-defined **op-set** CRDT over contribution type `c` (see
-`opSet` / `docs/14`). Its only edit verbs are `Crdt.contribute`/`retract` — it
-is not `set`/`increment`-able — so the phantom carries `c` to type those verbs.
+{-| Kind marker: a user-defined **op-set** CRDT whose contributions have kind `ck` and
+type `c` (see `opSet` / `design-docs/14`). Its only edit verbs are `Crdt.Edit.contribute`/`retract` — it
+is not `set`/`increment`-able — so the phantom carries `ck`/`c` to type those verbs.
+Carrying the contribution's _kind_ (not just its type) is what stops `contribute` accepting
+a differently-merging schema of the same type — e.g. a `counter` where the op-set declared
+an `int` register would seed the wrong node shape.
 -}
-type OpSetK c
+type OpSetK ck c
     = OpSetK Never
 
 
@@ -160,30 +176,86 @@ variant — the forward-compatibility case where a newer peer wrote a variant th
 doesn't know. It is kept distinct from `BadValue` (genuinely malformed data) so that
 `withDefault`/`catchAll` can tolerate _just_ it while real errors still fail loudly.
 
+`At` carries the **location**: schemas compose, so without it a nested failure reports
+only its innermost complaint ("missing field: title") and a document of any size leaves
+you searching. Every combinator that descends into a child wraps that child's error with
+the step it took to get there (`at`), so the leaf arrives with a trail —
+`notes › 3 › title: missing field: x`. This is the same shape as `Json.Decode.Error`'s
+`Field`/`Index`, for the same reason.
+
+Code that reacts to a _kind_ of error must therefore match on `leafError err`, never on
+`err` directly, or it will stop matching as soon as the failure happens one level down.
+
 -}
 type Error
     = TypeMismatch String
     | MissingField String
     | BadValue String
     | UnknownVariant String
+    | At String Error
 
 
-{-| Render an error for display.
+{-| Record that a failure happened inside `step` (a field name, list index, dict key,
+tree node id or variant argument position).
+-}
+at : String -> Result Error a -> Result Error a
+at step =
+    Result.mapError (At step)
+
+
+{-| Strip the location trail, leaving what actually went wrong. Match on this rather than
+on an `Error` when you care about the kind of failure — see `withDefault`/`optional`,
+which tolerate an `UnknownVariant` no matter how deep it occurred.
+-}
+leafError : Error -> Error
+leafError err =
+    case err of
+        At _ inner ->
+            leafError inner
+
+        leaf ->
+            leaf
+
+
+{-| Render an error for display, as `where: what` — the path from the document root down
+to the failure, then the failure itself. A leaf error at the root has no path and renders
+as just the `what`.
 -}
 errorToString : Error -> String
 errorToString err =
-    case err of
-        TypeMismatch s ->
-            "type mismatch: " ++ s
+    let
+        describe leaf =
+            case leaf of
+                TypeMismatch s ->
+                    "type mismatch: " ++ s
 
-        MissingField s ->
-            "missing field: " ++ s
+                MissingField s ->
+                    "missing field: " ++ s
 
-        BadValue s ->
-            "bad value: " ++ s
+                BadValue s ->
+                    "bad value: " ++ s
 
-        UnknownVariant s ->
-            "unknown variant: " ++ s
+                UnknownVariant s ->
+                    "unknown variant: " ++ s
+
+                At _ inner ->
+                    -- unreachable: `path` peels every `At` before this is called
+                    describe inner
+
+        path acc e =
+            case e of
+                At step inner ->
+                    path (step :: acc) inner
+
+                leaf ->
+                    ( List.reverse acc, leaf )
+    in
+    case path [] err of
+        ( [], leaf ) ->
+            describe leaf
+
+        ( steps, leaf ) ->
+            String.join " › " steps ++ ": " ++ describe leaf
 
 
 
@@ -212,7 +284,7 @@ edit APIs pass to `listAppend` / `setKey`.
 -}
 with : a -> Crdt kind a -> Seed
 with value (Crdt c) =
-    I.Seed (c.seed value)
+    Seed (c.seed value)
 
 
 {-| Seed a **single element** from a _container_ schema (list/movableList/dict/tree),
@@ -225,13 +297,13 @@ destructure the element type out of the container's `kind`), so we go through th
 container's own `seed`: `mkSingleton value` builds the one-element collection value that
 `seed` accepts, we seed it **from the live `Ctx`** (so stamps are minted from the
 document's clock — stamp-sound, no duplicate OpIds under concurrent edits), then `extract`
-pulls the lone element's content node back out. The caller in `Doc.Internal` supplies
+pulls the lone element's content node back out. The caller in `Crdt.Edit` supplies
 `mkSingleton`/`extract` because it statically knows the container's concrete kind.
 
 -}
 seedOneFrom : (element -> collection) -> (Node -> Maybe Node) -> Crdt containerKind collection -> element -> Seed
 seedOneFrom mkSingleton extract (Crdt c) value =
-    I.Seed
+    Seed
         (\ctx ->
             let
                 ( containerNode, ctx1 ) =
@@ -402,15 +474,16 @@ register default encode decoder =
 -- SCHEMA EVOLUTION -----------------------------------------------------------
 --
 -- Read-time tolerance so a document written by one schema version reads sensibly under
--- another (see docs/13). These evolve the *decoder*, never the data: the Node tree
+-- another (see design-docs/13). These evolve the *decoder*, never the data: the Node tree
 -- already syncs unknown fields losslessly (merge is schema-blind), so the only place
 -- drift bites is read, and these make read tolerant. All are pure read policy — they
 -- never gate a write or a merge, so convergence is untouched.
 
 
-{-| Make a schema **optional**: reads `Nothing` when the value is a null sentinel or the
-field is absent (a document that predates the field), and `Just v` when present, instead
-of failing. Seeding `Nothing` writes a null register; `Just v` seeds the inner value.
+{-| Make a schema **optional**: reads `Nothing` when the `"just"` key is absent or
+tombstoned, or the field itself is absent (a document that predates the field), and
+`Just v` when present, instead of failing. Seeding `Nothing` writes the empty map;
+`Just v` seeds the inner value under the `"just"` key.
 
     -- adding `priority` to an existing record is non-breaking:
     |> field "priority" .priority (S.optional prioritySchema)
@@ -440,16 +513,12 @@ optional (Crdt inner) =
                         case Dict.get justKey entries of
                             Just e ->
                                 if e.present then
-                                    case inner.decode e.value |> Result.map Just of
-                                        -- an unknown custom-type tag (a newer peer's
-                                        -- variant) reads as `Nothing`, like an absent
-                                        -- value — the same evolution tolerance as
-                                        -- `withDefault`.
-                                        Err (UnknownVariant _) ->
-                                            Ok Nothing
-
-                                        result ->
-                                            result
+                                    -- an unknown custom-type tag (a newer peer's variant)
+                                    -- reads as `Nothing`, like an absent value — the same
+                                    -- evolution tolerance as `withDefault`. Matched on the
+                                    -- LEAF, so it still applies when the unknown tag sits
+                                    -- inside a nested record rather than at this level.
+                                    tolerating Nothing (inner.decode e.value |> Result.map Just)
 
                                 else
                                     Ok Nothing
@@ -490,7 +559,7 @@ write.
 
     |> field "priority" .priority (S.withDefault Medium prioritySchema)
 
-**How this works across peers** (see docs/13): the empty base **seeds the `default`
+**How this works across peers** (see design-docs/13): the empty base **seeds the `default`
 value**, not the inner leaf's arbitrary empty (`0`/`False`/`""`). Since every replica
 builds its own base from its own schema, a newer peer that adds this field seeds it as
 `default`; when it merges an older peer's document (which lacks the field), the field is
@@ -511,24 +580,42 @@ withDefault : a -> Crdt kind a -> Crdt kind a
 withDefault default (Crdt inner) =
     Crdt
         { whenAbsent = Just default
-        , decode =
-            \node ->
-                case inner.decode node of
-                    Err (UnknownVariant _) ->
-                        Ok default
-
-                    result ->
-                        result
+        , decode = \node -> tolerating default (inner.decode node)
         , empty = \ctx -> inner.seed default ctx
         , seed = inner.seed
         }
+
+
+{-| Absorb an `UnknownVariant` — wherever in the value it occurred — as `fallback`, and
+pass every other failure through untouched. Shared by `withDefault` and `optional`, whose
+tolerance rule is the same one.
+
+Matching `leafError` rather than the error itself is what makes it hold for a nested
+value: `S.withDefault someRecord (S.record …)` must still collapse to the default when the
+unknown tag is on a _field_ of that record, which is where the location trail puts an `At`
+in front of it.
+
+-}
+tolerating : a -> Result Error a -> Result Error a
+tolerating fallback result =
+    case result of
+        Err err ->
+            case leafError err of
+                UnknownVariant _ ->
+                    Ok fallback
+
+                _ ->
+                    result
+
+        ok ->
+            ok
 
 
 {-| Transform the value a schema reads/seeds, in **both directions** (`to` on read,
 `from` on seed). Covers value-shape evolution — re-spelling an enum, int↔string, a unit
 change — while keeping the stored `Node` unchanged. Both directions are required (unlike
 Cambria's one-way `convert`) so seeding round-trips coherently; a non-invertible change
-(two fields folded into one) is not a `map` — that would be a Layer-4 lens (docs/13).
+(two fields folded into one) is not a `map` — that would be a Layer-4 lens (design-docs/13).
 
     -- store an enum as a string, read it as a custom type:
     S.map statusFromString statusToString S.string
@@ -550,7 +637,7 @@ map to from (Crdt inner) =
 
 {-| A PN-counter, read as its integer total. Unlike an `int` register (which is
 last-write-wins, so concurrent `+1`/`+1` collapses to 1), concurrent increments
-from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.increment` to change it.
+from different replicas **sum** — `+1` and `+1` give 2. Use `Crdt.Edit.increment` to change it.
 -}
 counter : Crdt Counter Int
 counter =
@@ -594,7 +681,7 @@ text =
             \node ->
                 case Node.asTxt node of
                     Just rga ->
-                        Ok (Text.toString rga)
+                        Ok (Text.read rga)
 
                     Nothing ->
                         Err (TypeMismatch "expected text")
@@ -611,7 +698,7 @@ text =
 
 {-| Collaborative **rich** (formatted) text, read as a list of `Span`s (maximal runs
 sharing formatting). Backed by a Fugue character sequence plus a Peritext mark set;
-edited by text insert/delete plus `mark`/`unmark` (see the `Crdt` module).
+edited by text insert/delete plus `mark`/`unmark` (see `Crdt.Edit`).
 -}
 richText : Crdt RichK (List Span)
 richText =
@@ -652,7 +739,7 @@ list (Crdt elem) =
                 case Node.asSeq node of
                     Just rga ->
                         Rga.toList rga
-                            |> List.map elem.decode
+                            |> List.indexedMap (\i n -> at (String.fromInt i) (elem.decode n))
                             |> combine
 
                     Nothing ->
@@ -685,7 +772,7 @@ list (Crdt elem) =
 
 
 {-| A **reorderable** list of `a` — like `list`, but items can be moved with
-`Crdt.Doc.listMove` and keep their identity (nested edits and cursors follow a
+`Crdt.Edit.move` and keep their identity (nested edits and cursors follow a
 moved item). Backed by `Crdt.MoveList`. Reads as a plain `List a` in order.
 -}
 movableList : Crdt ek a -> Crdt (ListK Movable ek a) (List a)
@@ -697,7 +784,7 @@ movableList (Crdt elem) =
                 case Node.asMov node of
                     Just ml ->
                         MoveList.toList ml
-                            |> List.map elem.decode
+                            |> List.indexedMap (\i n -> at (String.fromInt i) (elem.decode n))
                             |> combine
 
                     Nothing ->
@@ -731,7 +818,7 @@ movableList (Crdt elem) =
 
 {-| A movable **tree** of `a`: hierarchical, re-parentable, sibling-ordered data
 backed by `Crdt.Tree`. Reads as a `Crdt.Tree.Forest a` (ordered nested items with
-stable ids). Edit it through the `Crdt` module (`addChild` / `moveInto` / `removeNode`).
+stable ids). Edit it through `Crdt.Edit` (`addChild` / `moveInto` / `removeNode`).
 A fresh tree is empty; nodes are added by ref, not seeded, so `seed` yields empty.
 -}
 tree : Crdt ek a -> Crdt (TreeK ek a) (Tree.Forest a)
@@ -763,10 +850,12 @@ decodeForest dec t =
         forest =
             Tree.toForest (\n -> dec n |> Result.toMaybe) t
 
+        -- keyed by node id, so a failure names the node it came from — a forest gives no
+        -- index or field to point at, and "some node's payload is wrong" is not actionable
         anyError =
             Tree.payloads t
-                |> Dict.values
-                |> List.filterMap (\n -> dec n |> resultError)
+                |> Dict.toList
+                |> List.filterMap (\( nodeId, n ) -> at nodeId (dec n) |> resultError)
                 |> List.head
     in
     case anyError of
@@ -802,7 +891,7 @@ dict (Crdt val) =
         , decode =
             \node ->
                 Node.presentEntries node
-                    |> List.map (\( k, v ) -> val.decode v |> Result.map (Tuple.pair k))
+                    |> List.map (\( k, v ) -> at k (val.decode v) |> Result.map (Tuple.pair k))
                     |> combine
                     |> Result.map Dict.fromList
         , empty = \ctx -> ( Node.mapFromEntries Dict.empty, ctx )
@@ -832,23 +921,23 @@ dict (Crdt val) =
 -- OP-SET (user-defined CRDT) -------------------------------------------------
 
 
-{-| A **user-defined operation-based CRDT** (see `docs/14`): a grow-only/removable set of
+{-| A **user-defined operation-based CRDT** (see `design-docs/14`): a grow-only/removable set of
 **contributions**, each written under its own op-id key, read by folding the present
 contributions into a value. Convergence is free — merge is `Dict.union` of the keys, so
 concurrent contributions from any replicas all survive — and the semantics is entirely
 your `fold`. This is the shape of the built-in counter (op-keyed deltas, summed) opened up.
 
     -- a grow-only maximum register:
-    maxReg : Crdt (OpSetK Int) Int
+    maxReg : Crdt (OpSetK Settable Int) Int
     maxReg =
         opSet { contribution = int, fold = List.maximum >> Maybe.withDefault 0 }
 
     -- a multi-value register (keeps all concurrent values):
-    mvReg : Crdt (OpSetK a) (List a)
+    mvReg : Crdt (OpSetK ck a) (List a)
     mvReg =
         opSet { contribution = mySchema, fold = identity }
 
-Edited only through `Crdt.contribute` (add a contribution) and `retract` (tombstone
+Edited only through `Crdt.Edit.contribute` (add a contribution) and `retract` (tombstone
 one); it is not `set`-able, since its value is derived, not stored.
 
 **Law:** `fold` must be a pure function of the _set_ of contributions — order-independent
@@ -857,7 +946,7 @@ and idempotent-friendly — or the read won't converge. `List.maximum`, `Set.fro
 not. The node is a `Map`; contributions are its present entries.
 
 -}
-opSet : { contribution : Crdt ck c, fold : List c -> a } -> Crdt (OpSetK c) a
+opSet : { contribution : Crdt ck c, fold : List c -> a } -> Crdt (OpSetK ck c) a
 opSet config =
     let
         (Crdt contrib) =
@@ -868,7 +957,7 @@ opSet config =
         , decode =
             \node ->
                 Node.presentEntries node
-                    |> List.map (\( _, v ) -> contrib.decode v)
+                    |> List.map (\( k, v ) -> at k (contrib.decode v))
                     |> combine
                     |> Result.map config.fold
         , empty = \ctx -> ( Node.mapFromEntries Dict.empty, ctx )
@@ -921,7 +1010,7 @@ field name getter schema rb =
 
 
 {-| Add a field that also reads from **older names** (`aliases`), in order, when the
-current `name` is absent — a schema-evolution rename (see docs/13). Reads always prefer
+current `name` is absent — a schema-evolution rename (see design-docs/13). Reads always prefer
 `name`; writes/seeds always go to `name`, so once a value is written the old key becomes
 inert (a tolerated extra key). A v1 peer (which only knows the old name) and a v2 peer
 (new name + alias) converge on the same `Node` and each reads it through its own names.
@@ -937,13 +1026,13 @@ aliasedField name aliases getter (Crdt fieldSchema) (RecordBuilder rb) =
         -- entry — LWW across the rename. This is what makes a rename converge safely
         -- even though every replica base-seeds its own canonical name: a base seed is
         -- minted at `init` (a low stamp), so a real write to *any* name — old or new —
-        -- outranks the seed, and the latest write across names wins (see docs/13).
+        -- outranks the seed, and the latest write across names wins (see design-docs/13).
         -- Falls back to the schema's `whenAbsent` (a `withDefault`/`optional` rename is
         -- tolerant on all sides), else `MissingField`.
         readField entries =
             case highestStamped (name :: aliases) entries of
                 Just e ->
-                    fieldSchema.decode e.value
+                    at name (fieldSchema.decode e.value)
 
                 Nothing ->
                     case fieldSchema.whenAbsent of
@@ -975,7 +1064,7 @@ aliasedField name aliases getter (Crdt fieldSchema) (RecordBuilder rb) =
                 -- replica-id tiebreak, masking the real value — so only real writes may
                 -- carry a stamp for these names. A tolerant field reads its fallback
                 -- until written. Required, non-aliased fields are still seeded so a fresh
-                -- document satisfies its own reader. See docs/13.
+                -- document satisfies its own reader. See design-docs/13.
                 if not (List.isEmpty aliases) || fieldSchema.whenAbsent /= Nothing then
                     ( accValues, ctx1 )
 
@@ -1072,7 +1161,7 @@ stampEntries ( pairs, ctx ) =
 -- A sum type materializes to a `Map` with a reserved LWW `$tag` register naming
 -- the active variant, plus one key per non-nullary variant holding a positional
 -- payload map ("0".."N-1"). The active variant is LWW; each payload merges as its
--- own sub-CRDT. See `docs/06-sum-types.md`. This is schema sugar over `Map`+`Reg`
+-- own sub-CRDT. See `design-docs/06-sum-types.md`. This is schema sugar over `Map`+`Reg`
 -- — the `Node`/merge core is untouched.
 
 
@@ -1110,10 +1199,10 @@ type CustomBuilder match value
         , decoders : Dict String (Node -> Result Error value)
         , default : Maybe VariantSeed
 
-        -- Schema-evolution fallback (see docs/13): how to read a `$tag` that names no
+        -- Schema-evolution fallback (see design-docs/13): how to read a `$tag` that names no
         -- declared variant — the forward-compatibility case where a peer on a newer
         -- schema wrote a variant this (older) schema doesn't know. `Nothing` = unknown
-        -- tags are a `BadValue` error (the default); `Just f` = read them as `f tag`
+        -- tags are an `UnknownVariant` error (the default); `Just f` = read them as `f tag`
         -- (set by `catchAll`), so an added variant doesn't break old peers.
         , catchAll : Maybe (String -> value)
         }
@@ -1124,7 +1213,7 @@ one handler per variant (in declaration order) plus the value to match, and retu
 the handler applied to that variant's payload. Elm can't reflect on a custom type,
 so you supply the `case`:
 
-    statusSchema : Crdt Status
+    statusSchema : Crdt (Variants Status) Status
     statusSchema =
         custom
             (\active snoozed done value ->
@@ -1151,9 +1240,9 @@ custom match =
     CustomBuilder { match = match, decoders = Dict.empty, default = Nothing, catchAll = Nothing }
 
 
-{-| Declare a **catch-all variant** for schema evolution (see `docs/13`): a variant of
+{-| Declare a **catch-all variant** for schema evolution (see `design-docs/13`): a variant of
 your Elm type, carrying the raw `$tag` string, that unknown tags decode to instead of
-failing the read with `BadValue`. This makes adding a variant **forward-compatible** — a
+failing the read with `UnknownVariant`. This makes adding a variant **forward-compatible** — a
 peer on an older schema reads a newer peer's variant as `Unknown "the-tag"` rather than
 erroring.
 
@@ -1181,7 +1270,7 @@ catch-all is a real variant of your type, so `match` must handle it. Declare it 
 `Unknown t` writes `$tag = t` with **no payload** — so the tag is _preserved_ on the
 wire and a newer peer still reads its real variant. (Conservation caveat: an old peer
 that switches away from an unknown value can't reproduce its payload — documented in
-`docs/13`. Merely holding the value loses nothing, since it isn't rewritten.)
+`design-docs/13`. Merely holding the value loses nothing, since it isn't rewritten.)
 
 -}
 catchAll : (String -> value) -> CustomBuilder ((String -> VariantSeed) -> b) value -> CustomBuilder b value
@@ -1386,8 +1475,8 @@ seedCustomNodeRaw name argSeeders ctx =
 
 {-| Decode a custom-type node: read `$tag`, dispatch to that variant's decoder,
 handing it the variant's payload map (an empty map for a nullary variant). An unknown
-tag routes to the `catchAll` fallback if the schema declared one, else it is a
-`BadValue` error (see `docs/13`).
+tag routes to the `catchAll` fallback if the schema declared one, else it is an
+`UnknownVariant` error (see `design-docs/13`).
 -}
 decodeCustom : Dict String (Node -> Result Error value) -> Maybe (String -> value) -> Node -> Result Error value
 decodeCustom decoders fallback node =
@@ -1430,7 +1519,7 @@ arg i s payload =
         Just entries ->
             case Dict.get (String.fromInt i) entries of
                 Just e ->
-                    s.decode e.value
+                    at ("variant argument " ++ String.fromInt i) (s.decode e.value)
 
                 Nothing ->
                     Err (MissingField ("variant argument " ++ String.fromInt i))

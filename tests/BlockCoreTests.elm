@@ -53,8 +53,8 @@ build elems marks =
 
         contentOf e =
             case e of
-                Char n c ->
-                    Node.reg (PString (String.fromChar c)) (rid n)
+                Char _ c ->
+                    Node.TextChar (String.fromChar c)
 
                 Marker _ ->
                     RichText.markerNode

@@ -1,6 +1,6 @@
 module MigrationTests exposing (suite)
 
-{-| Schema evolution (docs/13): a document written under one schema version reads
+{-| Schema evolution (design-docs/13): a document written under one schema version reads
 sensibly under another, and peers on different versions converge. The mechanism is
 read-time tolerance plus **seed-the-default** — never data rewriting:
 
@@ -62,7 +62,7 @@ priorityToString p =
             "high"
 
 
-prioritySchema : C.Leaf C.Settable Priority
+prioritySchema : C.Crdt C.Settable Priority {}
 prioritySchema =
     C.map priorityFromString priorityToString C.string
 
@@ -161,7 +161,7 @@ joinReadV1 from =
 
 suite : Test
 suite =
-    describe "schema evolution / migration (docs/13)"
+    describe "schema evolution / migration (design-docs/13)"
         [ test "a v1 doc joined by a v2 peer: defaults fill in, rename resolves" <|
             \_ ->
                 let

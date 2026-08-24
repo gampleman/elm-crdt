@@ -180,17 +180,17 @@ todoDoc =
 `todosList.index i` points into an element with the element schema already captured (no
 schema needed at the call site). The `files` dict and `outline` tree are the same idea.
 -}
-todosList : { schema : C.Schema (C.ListK C.Movable C.Nested Todo) (List Todo), index : Int -> Ref r (C.ListK mv C.Nested Todo) (List Todo) -> Ref r C.Nested Todo }
+todosList : C.Crdt (C.ListK C.Movable C.Nested Todo) (List Todo) { index : Int -> Ref r (C.ListK mv C.Nested Todo) (List Todo) -> Ref r C.Nested Todo }
 todosList =
     C.movableList todoDoc
 
 
-filesDict : { schema : C.Schema (C.DictK C.RichK (List Span)) (Dict String (List Span)), key : String -> Ref r (C.DictK C.RichK (List Span)) (Dict String (List Span)) -> Ref r C.RichK (List Span) }
+filesDict : C.Crdt (C.DictK C.RichK (List Span)) (Dict String (List Span)) { key : String -> Ref r (C.DictK C.RichK (List Span)) (Dict String (List Span)) -> Ref r C.RichK (List Span) }
 filesDict =
     C.dict C.richText
 
 
-outlineTree : { schema : C.Schema (C.TreeK C.Nested Node) (Tree.Forest Node), node : OpId -> Ref r (C.TreeK C.Nested Node) (Tree.Forest Node) -> Ref r C.Nested Node }
+outlineTree : C.Crdt (C.TreeK C.Nested Node) (Tree.Forest Node) { node : OpId -> Ref r (C.TreeK C.Nested Node) (Tree.Forest Node) -> Ref r C.Nested Node }
 outlineTree =
     C.tree nodeDoc
 
@@ -351,7 +351,7 @@ type alias Model =
 
     -- Stable-frontier GC (regime 2): each connected peer's last-broadcast `Version`, keyed
     -- by replica id. We combine these with our own version via `Doc.stableFrontier` to find
-    -- the causal cut everyone has seen, which is safe to `compact` below (docs/04-gc.md).
+    -- the causal cut everyone has seen, which is safe to `compact` below (design-docs/04-gc.md).
     -- `historyCap` bounds the op log: once it's exceeded we auto-compact to that cut, so the
     -- scrubber (and memory) stay bounded no matter how long a session runs.
     , peerVersions : Dict String Version
@@ -365,7 +365,7 @@ type alias Model =
     -- doc change actually touched `refs.todos` (via the merge/ingest `Diff`). Held
     -- separately from the live `read` so an `Html.Lazy` view over it keeps the same
     -- reference — and skips re-rendering — when an unrelated part of the tree changed.
-    -- This is the demonstration of the referential-stability + diff work (docs/12);
+    -- This is the demonstration of the referential-stability + diff work (design-docs/12);
     -- see `viewTodoSummary` (lazy, with a Debug.log render marker).
     , todosSlice : List Todo
     }
@@ -1131,7 +1131,7 @@ recordPush before model =
 ones a change since `before` actually touched (asking the `Diff` with the same typed
 refs used to write). An untouched slice keeps its previous reference, so an
 `Html.Lazy` view over it skips re-rendering. This is the demo-side payoff of the
-merge/ingest diff (docs/12): local edits and remote merges alike flow through here.
+merge/ingest diff (design-docs/12): local edits and remote merges alike flow through here.
 -}
 refreshSlices : Version -> Model -> Model
 refreshSlices before model =
@@ -1866,7 +1866,7 @@ viewFieldCarets textRef model =
             (\( name, color, offset ) ->
                 -- positioned over the input: 0.5rem left padding + 1px border,
                 -- then `offset` character-widths in. Vertical: just inside the
-                -- input's top/bottom padding. `ch`-approximation (see docs/03).
+                -- input's top/bottom padding. `ch`-approximation (see design-docs/03).
                 span
                     [ class "remote-caret"
                     , A.style "position" "absolute"

@@ -61,7 +61,7 @@ priorityDecoder =
             )
 
 
-prioritySchema : C.Leaf C.Settable Priority
+prioritySchema : C.Crdt C.Settable Priority {}
 prioritySchema =
     C.register Low encodePriority priorityDecoder
 

@@ -1,15 +1,14 @@
 module Crdt.Node exposing
     ( Node(..), Register, Prim(..), Entry, Increment, MovNode, TreeNode
-    , RichNode, MarkOp, MarkAnchor, AnchorSide(..)
+    , RichNode, RichElem(..), BlockToken(..), MarkOp, MarkAnchor, AnchorSide(..)
     , reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
     , asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
-    , merge, maxCounter, compactTombstones
+    , maxCounter, compactTombstones, vacate
     , reStamp, reStampWithMap
     , Element, RgaNode
     )
 
-{-| The uniform replicated-state type that every CRDT document is made of, plus
-its structural `merge`.
+{-| The uniform replicated-state type that every CRDT document is made of.
 
 `Node` is a closed recursive union:
 
@@ -21,36 +20,64 @@ its structural `merge`.
     ambiguous set-vs-remove race;
   - `Seq` — a sequence, backed by `Crdt.Rga` at `Rga Node`;
   - `Txt` — collaborative text, also an `Rga Node` (of single-char registers);
-  - `Cnt` — a PN-counter: a map of per-op signed contributions, summed to a value.
+  - `Cnt` — a PN-counter: a map of per-op signed contributions, summed to a value;
+  - `Mov` — a movable (reorderable) list, backed by `Crdt.MoveList`;
+  - `Tree` — a movable tree, backed by `Crdt.Tree.Internal`;
+  - `Rich` — rich text: a character `Rga` plus a set of Peritext mark ops.
 
-`merge` is monomorphic over `Node` and never touches the typed schema layer —
-convergence correctness lives here and nowhere else.
+A `Node` is **derived state**, never merged as state: documents converge by
+op-union plus deterministic replay (`Crdt.OpLog`), which folds ops onto a `Node` one
+element at a time via the container mutators (`Rga.put`/`delete`, `Tree.move`,
+`MoveList.move`, …). The conflict rules therefore live in that fold plus the read-time
+ordering, not in a structural join — see `Crdt.OpLog`'s module docs. This module once
+also carried a state-level `merge` (the join of each container, with LWW-by-stamp /
+presence-AND / tombstone-OR written down explicitly); it was removed once nothing but
+its own tests called it, since an unenforced parallel specification can drift from the
+op path silently. `tests/NodeFuzzTests.elm` now fuzzes arbitrary (including
+adversarial) `Node` values against the paths that _do_ ship.
 
 @docs Node, Register, Prim, Entry, Increment, MovNode, TreeNode
-@docs RichNode, MarkOp, MarkAnchor, AnchorSide
+@docs RichNode, RichElem, BlockToken, MarkOp, MarkAnchor, AnchorSide
 @docs reg, mapFromEntries, entry, seq, txt, counter, increment, mov, tree, rich
 @docs asPrim, asMap, presentEntries, asSeq, asTxt, asCounter, asMov, asTree, asRich
-@docs merge, maxCounter, compactTombstones
+@docs maxCounter, compactTombstones, vacate
 @docs reStamp, reStampWithMap
 @docs Element, RgaNode
 
 -}
 
-import Crdt.Frac
 import Crdt.Id.Internal as Id exposing (OpId)
 import Crdt.MoveList as MoveList exposing (MoveList)
 import Crdt.Rga as Rga exposing (Rga)
 import Crdt.Tree.Internal as Tree exposing (Tree)
 import Dict exposing (Dict)
+import Set exposing (Set)
 
 
 {-| The replicated state.
+
+**Content is typed per container** (`design-docs/16-typed-sequence-content.md`). All the
+sequence-shaped containers share `Crdt.Rga`'s ordering, tombstone rules and compaction —
+that is what `Rga`'s content polymorphism is for — but they do **not** share a content type:
+
+  - `Seq`/`Mov`/`Tree` hold arbitrary documents (`Node`), because a list element or a tree
+    payload genuinely is one;
+  - `Txt` holds one character per element (a `String` of exactly one `Char`, checked at the
+    decoder — `Crdt.Json.charDecoder`);
+  - `Rich` holds a `RichElem` — a character, a block marker, or a nest token.
+
+These used to all be `Rga Node`, with a text character represented as a whole LWW register
+and a block marker as a magic `PInt` inside one. That cost an `OpId` stamp per character that
+nothing read, made `Rich`'s three element kinds an unchecked convention, and let an op put a
+map inside a text field — which the read then silently skipped, identically on every replica,
+so no convergence test could see the loss. The types rule all three out.
+
 -}
 type Node
     = Reg Register
     | Map (Dict String Entry)
-    | Seq RgaNode
-    | Txt RgaNode
+    | Seq (Rga Node)
+    | Txt (Rga String)
     | Cnt (Dict String Increment)
     | Mov MovNode
     | Tree TreeNode
@@ -69,7 +96,7 @@ type alias TreeNode =
     Tree Node
 
 
-{-| Rich (formatted) text: a Fugue character sequence plus an append-only set of
+{-| Rich (formatted) text: a Fugue sequence of `RichElem` plus an append-only set of
 **mark operations** keyed by each op's `OpId`. Marks are Peritext-style ranges
 anchored to character identities, not offsets, so they survive concurrent editing
 and are agnostic to the ordering algorithm. Merge of the mark set is a `Dict.union`
@@ -77,9 +104,33 @@ and are agnostic to the ordering algorithm. Merge of the mark set is a `Dict.uni
 and cover logic live in `Crdt.RichText`.
 -}
 type alias RichNode =
-    { text : RgaNode
+    { text : Rga RichElem
     , marks : Dict String MarkOp
     }
+
+
+{-| One element of a rich-text sequence. Block structure lives **in the character
+sequence** rather than in a separate container (`design-docs/11-block-structure.md`): a
+`Marker` is a block boundary, and the `Nest` tokens following one give that block's indent
+depth. So a rich sequence is a three-case sum, and this is it.
+
+Only characters are visible text; the tokens are structural. Every offset a caller supplies
+counts **characters only** (that is what an editor reports and what `markRange` marks over),
+so the two must never be conflated — counting tokens drifts a caret one position per
+preceding block boundary, which is a bug this representation has already produced once.
+
+-}
+type RichElem
+    = TextChar String
+    | Token BlockToken
+
+
+{-| Which structural token an element is. Separate from `RichElem` because an op inserting
+one carries the choice without a character to go with it (`OpLog.InsertToken`).
+-}
+type BlockToken
+    = Marker
+    | Nest
 
 
 {-| One mark operation: sets (or, with `value = PNull`, clears) a formatting mark of
@@ -87,6 +138,13 @@ kind `type_` over the range `[start, end]`. `id` is the op's Lamport id and driv
 per-character last-writer-wins at read time (a later op over the same character and
 type wins). `value` is `PBool True` for a boolean mark being turned on, `PString _`
 for a value mark (link href, color), or `PNull` to clear.
+
+`MarkOp`/`MarkAnchor`/`AnchorSide` live here rather than in `Crdt.RichText.Internal`
+(where the logic that interprets them lives) only because they are _part of the `Rich`
+node_ — and `RichText.Internal` imports this module for `Node`/`RgaNode`, so defining
+them there would be an import cycle. They are data with no behaviour attached; the
+flatten-to-spans and cover rules that give them meaning are all in `RichText`.
+
 -}
 type alias MarkOp =
     { id : OpId
@@ -111,6 +169,17 @@ type alias MarkAnchor =
 
 
 {-| Which side of its `ref` character a `MarkAnchor` binds to.
+
+Isomorphic to `Rga.Side` (`Left`/`Right`) — both name a gap either side of an element —
+and kept separate on purpose. `Rga.Side` is an **insertion** decision consumed by the
+Fugue ordering walk: it says where a new element attaches in the sequence tree, and it is
+meaningless outside that algorithm. This is a **range boundary** on a mark op, read long
+after insertion to decide expansion, and Peritext marks are deliberately agnostic to how
+the sequence is ordered (swapping Fugue for something else must not touch a mark). Sharing
+one type would tie the two together and put an ordering-algorithm word (`Left`) where the
+domain word is `Before`. They also encode differently on the wire (`"L"`/`"R"` vs
+`"b"`/`"a"`), so collapsing them would not even shrink the format.
+
 -}
 type AnchorSide
     = Before
@@ -161,6 +230,25 @@ type alias Register =
 
 
 {-| The primitive values a register can hold (the leaves of the JSON-like tree).
+
+Spelled out rather than being a `Json.Decode.Value`, for two reasons that both bite:
+
+1.  **`==` is this library's convergence oracle.** Two replicas agree iff their `Node`s
+    are structurally equal — that is what every merge law, every delivery-order property
+    and `Doc.cacheConsistent` assert. `Value` wraps an opaque JS object, so `==` on it is
+    a deep JS comparison Elm makes no promises about (and the compiler cannot warn you):
+    the one operator the whole test suite rests on would become untrustworthy.
+
+2.  **JSON cannot tell `3` from `3.0`.** A `Value`-backed register would encode `PFloat 3`
+    and `PInt 3` identically and decode both to whichever the reader guesses, so a float
+    field would silently fail to round-trip. Tagging the constructor on the wire
+    (`{"k":"float","x":3}` — see `Crdt.Json`) is what makes the format lossless, which
+    `tests/OpJsonTests.elm` pins.
+
+Arbitrary JSON still round-trips — `Crdt.Schema.Internal.register` (the `Crdt.custom`
+escape hatch) stores a value as a `PString` of its serialization, so a user type of any
+shape rides in a register while the tagging and the equality both keep working.
+
 -}
 type Prim
     = PNull
@@ -204,7 +292,7 @@ seq =
 
 {-| A text node.
 -}
-txt : RgaNode -> Node
+txt : Rga String -> Node
 txt =
     Txt
 
@@ -300,7 +388,7 @@ asSeq node =
 
 {-| Extract the array, if this is text.
 -}
-asTxt : Node -> Maybe RgaNode
+asTxt : Node -> Maybe (Rga String)
 asTxt node =
     case node of
         Txt r ->
@@ -359,265 +447,90 @@ asCounter node =
             Nothing
 
 
+{-| The **canonical empty skeleton** of a node: the same kind, holding nothing — or
+`Nothing` for the kinds that cannot be rebuilt from empty (below).
 
--- MERGE ----------------------------------------------------------------------
+This exists for the one place a `Node` has to travel inside an op that **two replicas may
+emit for the same slot**: a map key's creation (`SetKeyPresence`). A map key is the only
+container slot without its own identity — an element/tree node is named by the id of the op
+that inserted it, so no two ops ever create the same one, whereas two replicas that both
+`setKey "k"` on an absent key are both creating _that_ key. Only the first to be folded
+installs its seed (see `Crdt.OpLog.setKeyPresenceAt`), so if the seeds differ the state depends
+on **arrival order** — and a merge that folds only the ops it has just added (the
+incremental path every merge/decode takes) has no chance to re-decide later. The fix is for
+every such op to carry a seed that is a function of the value's _shape_ alone, so whichever
+one wins installs the identical thing and the value itself arrives as ordinary ops
+afterwards (`Crdt.Doc.Internal.setKey`).
 
+So: registers keep their primitive's _type_ but lose its value, and every collection is
+emptied. Stamps become `Id.unwrittenStamp`, which loses to every real write — that is what
+lets the follow-up ops fill the skeleton in.
 
-{-| Merge two nodes. Commutative, associative and idempotent.
--}
-merge : Node -> Node -> Node
-merge a b =
-    case ( a, b ) of
-        ( Reg ra, Reg rb ) ->
-            Reg (mergeRegister ra rb)
-
-        ( Map da, Map db ) ->
-            Map (mergeMaps da db)
-
-        ( Seq sa, Seq sb ) ->
-            Seq (Rga.merge merge sa sb)
-
-        ( Txt ta, Txt tb ) ->
-            Txt (Rga.merge merge ta tb)
-
-        ( Cnt ca, Cnt cb ) ->
-            -- union of per-op contributions. In real use a shared key carries an
-            -- identical contribution (one op mints one delta), so this just sums
-            -- distinct contributions. On a key collision with differing deltas
-            -- (only possible from corrupt/adversarial input) pick the larger delta
-            -- deterministically, so merge stays commutative on ANY input.
-            Cnt
-                (Dict.merge
-                    Dict.insert
-                    (\k x y -> Dict.insert k (mergeIncrement x y))
-                    Dict.insert
-                    ca
-                    cb
-                    Dict.empty
-                )
-
-        ( Mov ma, Mov mb ) ->
-            Mov (MoveList.merge merge ma mb)
-
-        ( Tree ta, Tree tb ) ->
-            Tree (Tree.merge merge ta tb)
-
-        ( Rich ra, Rich rb ) ->
-            -- text merges as the char RGA; marks are an append-only set unioned by
-            -- op id (each mark op is unique, so a shared key carries an identical
-            -- op; the merge fn only guards corrupt/adversarial input).
-            Rich
-                { text = Rga.merge merge ra.text rb.text
-                , marks =
-                    Dict.merge
-                        Dict.insert
-                        (\k x y -> Dict.insert k (mergeMarkOp x y))
-                        Dict.insert
-                        ra.marks
-                        rb.marks
-                        Dict.empty
-                }
-
-        _ ->
-            -- constructor mismatch: deterministic, order-independent tiebreak.
-            -- Does not arise under a single shared schema.
-            if rank a >= rank b then
-                a
-
-            else
-                b
-
-
-
--- RESTORE --------------------------------------------------------------------
-
-
-{-| Revert `current` to look like `old` (a checkpoint snapshot), as a fresh CRDT
-edit rather than a merge.
-
-`merge` cannot do this: `current` evolved from `old` by last-write-wins edits, so
-every current value already carries a higher stamp and would always win — merging
-the snapshot back is a no-op. `restore` instead re-asserts the snapshot's values
-with **freshly minted, winning stamps**, so the revert propagates and converges
-like any other edit. Keys/elements that were added after the snapshot are
-tombstoned; keys absent from `current` but present in `old` are re-created.
-
-New ids are minted from the context, which is threaded through and returned.
+Three kinds answer **`Nothing`** — they cannot be safely emptied: `Mov`, `Tree` and `Rich`.
+The edit engine's diff (`Crdt.Doc.Internal.restoreNode`) has no case that rebuilds rich text
+at all, and refilling a movable list / tree from empty re-mints every id, so emptying them
+would trade a rare convergence edge for certain data loss. Callers ship those whole, as
+before; a dict _of_ rich text can therefore still resolve two concurrent creations of one key
+by arrival order. Nothing else can.
 
 -}
-restore : Id.Ctx -> Node -> Node -> ( Node, Id.Ctx )
-restore ctx old current =
-    case ( old, current ) of
-        ( Reg ro, Reg rc ) ->
-            if ro.value == rc.value then
-                ( current, ctx )
-
-            else
-                let
-                    ( stamp, ctx1 ) =
-                        Id.nextId ctx
-                in
-                ( Reg { value = ro.value, stamp = stamp }, ctx1 )
-
-        ( Map mo, Map mc ) ->
-            restoreMap ctx mo mc
-
-        ( Seq _, Seq _ ) ->
-            restoreSequence ctx Seq old current
-
-        ( Txt _, Txt _ ) ->
-            restoreSequence ctx Txt old current
-
-        ( Cnt co, Cnt cc ) ->
-            -- revert a counter by adding one fresh contribution that cancels the
-            -- difference, so it reads the old sum but stays a valid PN-counter.
-            let
-                diff =
-                    sumIncrements co - sumIncrements cc
-            in
-            if diff == 0 then
-                ( current, ctx )
-
-            else
-                let
-                    ( stamp, ctx1 ) =
-                        Id.nextId ctx
-                in
-                ( Cnt (Dict.insert (Id.opIdToString stamp) (increment stamp diff) cc), ctx1 )
-
-        _ ->
-            -- shape changed between versions (shouldn't happen under one schema):
-            -- re-assert the old node wholesale with fresh stamps.
-            reStamp ctx old
-
-
-sumIncrements : Dict String Increment -> Int
-sumIncrements =
-    Dict.foldl (\_ inc acc -> acc + inc.delta) 0
-
-
-restoreMap : Id.Ctx -> Dict String Entry -> Dict String Entry -> ( Node, Id.Ctx )
-restoreMap ctx mo mc =
-    let
-        keys =
-            (Dict.keys mo ++ Dict.keys mc)
-                |> List.foldr
-                    (\k acc ->
-                        if List.member k acc then
-                            acc
-
-                        else
-                            k :: acc
-                    )
-                    []
-
-        step : String -> ( Dict String Entry, Id.Ctx ) -> ( Dict String Entry, Id.Ctx )
-        step k ( acc, c ) =
-            case ( Dict.get k mo, Dict.get k mc ) of
-                ( Just eo, Just ec ) ->
-                    -- present in both: restore the value; re-assert presence if
-                    -- the key had been removed since the snapshot.
-                    let
-                        ( v, c1 ) =
-                            restore c eo.value ec.value
-
-                        ( present, stamp, c2 ) =
-                            if eo.present /= ec.present then
-                                let
-                                    ( s, cc ) =
-                                        Id.nextId c1
-                                in
-                                ( eo.present, s, cc )
-
-                            else
-                                ( ec.present, ec.stamp, c1 )
-                    in
-                    ( Dict.insert k { value = v, present = present, stamp = stamp } acc, c2 )
-
-                ( Just eo, Nothing ) ->
-                    -- key existed at the snapshot but not now: re-create it.
-                    let
-                        ( v, c1 ) =
-                            reStamp c eo.value
-
-                        ( s, c2 ) =
-                            Id.nextId c1
-                    in
-                    ( Dict.insert k { value = v, present = eo.present, stamp = s } acc, c2 )
-
-                ( Nothing, Just ec ) ->
-                    -- key added after the snapshot: tombstone it.
-                    let
-                        ( s, c1 ) =
-                            Id.nextId c
-                    in
-                    ( Dict.insert k { ec | present = False, stamp = s } acc, c1 )
-
-                ( Nothing, Nothing ) ->
-                    ( acc, c )
-
-        ( entries, ctx1 ) =
-            List.foldl step ( Dict.empty, ctx ) keys
-    in
-    ( Map entries, ctx1 )
-
-
-{-| Restore a sequence/text node: tombstone every current element and re-insert
-the snapshot's visible contents as a fresh chain of new elements. Convergent
-because the new elements carry fresh ids and the tombstones are permanent.
-`wrap` is `Seq` or `Txt`.
--}
-restoreSequence : Id.Ctx -> (RgaNode -> Node) -> Node -> Node -> ( Node, Id.Ctx )
-restoreSequence ctx wrap old current =
-    let
-        oldRga =
-            rgaOf old
-
-        currentRga =
-            rgaOf current
-
-        -- 1. tombstone everything currently visible
-        tombstoned =
-            List.foldl (\el acc -> Rga.delete el.id acc)
-                currentRga
-                (Rga.elements currentRga)
-
-        -- 2. re-insert the snapshot's visible contents, deep-restamping each so
-        -- nested ids are fresh too, chaining each after the previous one
-        ( rebuilt, ctx1 ) =
-            Rga.toList oldRga
-                |> List.foldl
-                    (\childOld ( acc, c, origin ) ->
-                        let
-                            ( child, c1 ) =
-                                reStamp c childOld
-
-                            ( acc1, c2 ) =
-                                Rga.insertAfter c1 origin child acc
-                        in
-                        ( acc1, c2, Rga.lastVisibleId acc1 )
-                    )
-                    ( tombstoned, ctx, Nothing )
-                |> (\( acc, c, _ ) -> ( acc, c ))
-    in
-    ( wrap rebuilt, ctx1 )
-
-
-rgaOf : Node -> RgaNode
-rgaOf node =
+vacate : Node -> Maybe Node
+vacate node =
     case node of
-        Seq r ->
-            r
+        Reg r ->
+            Just (Reg { value = vacatePrim r.value, stamp = Id.unwrittenStamp })
 
-        Txt r ->
-            r
+        Map _ ->
+            Just (Map Dict.empty)
 
-        _ ->
-            Rga.empty
+        Seq _ ->
+            Just (Seq Rga.empty)
+
+        Txt _ ->
+            Just (Txt Rga.empty)
+
+        Cnt _ ->
+            Just (Cnt Dict.empty)
+
+        Mov _ ->
+            Nothing
+
+        Tree _ ->
+            Nothing
+
+        Rich _ ->
+            Nothing
 
 
-{-| Deep-copy a node with entirely fresh ids/stamps, building new sequence
-elements. Used to re-create content during a restore.
+{-| A primitive reduced to its type's zero, so a skeleton register reads as _something_
+(rather than failing its schema on kind) until the write that fills it lands.
+-}
+vacatePrim : Prim -> Prim
+vacatePrim prim =
+    case prim of
+        PNull ->
+            PNull
+
+        PBool _ ->
+            PBool False
+
+        PInt _ ->
+            PInt 0
+
+        PFloat _ ->
+            PFloat 0
+
+        PString _ ->
+            PString ""
+
+
+{-| Deep-copy a node with entirely fresh ids/stamps, building new sequence elements.
+
+Used wherever content has to be **re-created rather than resurrected**: `Crdt.Doc`'s
+`restoreTo` re-creating a key or element that was deleted since the target version, and
+undo reviving a deleted subtree. Tombstones are permanent, so the copy necessarily has new
+identity — see `reStampWithMap` when the caller needs the old → new id mapping.
+
 -}
 reStamp : Id.Ctx -> Node -> ( Node, Id.Ctx )
 reStamp ctx node =
@@ -669,10 +582,11 @@ reStampWithMap ctx node =
             ( Map newEntries, ctx1, remap )
 
         Seq r ->
-            reStampRga ctx Seq r
+            reStampRga Seq reStampWithMap ctx r
 
         Txt r ->
-            reStampRga ctx Txt r
+            -- a character carries no ids, so only the element ids are re-minted
+            reStampRga Txt reStampInert ctx r
 
         Cnt d ->
             -- re-stamp each contribution with a fresh id; the sum is preserved.
@@ -717,7 +631,11 @@ reStampWithMap ctx node =
             ( Mov rebuilt, ctx1, remap )
 
         Tree t ->
-            reStampTree ctx t
+            let
+                ( rebuilt, ctx1, remap ) =
+                    Tree.reStamp reStampWithMap ctx t
+            in
+            ( Tree rebuilt, ctx1, remap )
 
         Rich r ->
             -- re-stamp the char sequence (getting old→new id map), then rebuild the
@@ -725,7 +643,7 @@ reStampWithMap ctx node =
             -- a revived mark still covers the revived characters.
             let
                 ( newText, ctx1, textRemap ) =
-                    reStampRga ctx Txt r.text
+                    Rga.reStamp reStampInert ctx r.text
 
                 remapAnchor a =
                     { a | ref = Maybe.map (remapId textRemap) a.ref }
@@ -744,16 +662,8 @@ reStampWithMap ctx node =
                         )
                         ( Dict.empty, ctx1 )
                         r.marks
-
-                textNode =
-                    case newText of
-                        Txt t ->
-                            t
-
-                        _ ->
-                            Rga.empty
             in
-            ( Rich { text = textNode, marks = newMarks }, ctx2, textRemap )
+            ( Rich { text = newText, marks = newMarks }, ctx2, textRemap )
 
 
 {-| Resolve an id through a remap table (used when re-stamping mark anchors).
@@ -772,256 +682,27 @@ mergeRemap a b =
     Dict.union b a
 
 
-{-| Rebuild a tree with entirely fresh node ids + move ids, preserving structure.
-Walks roots-first (breadth order over the live tree) so a child's re-minted parent
-already exists in the id remap. Positions are re-derived densely.
+{-| `Rga.reStamp` with the result wrapped back into whichever sequence variant it came
+from. The walk itself lives in `Crdt.Rga`, next to the ordering rules it depends on
+(`compactTombstones` is the same shape); all this module contributes is what the content
+re-stamps to.
 -}
-reStampTree : Id.Ctx -> TreeNode -> ( Node, Id.Ctx, Dict String OpId )
-reStampTree ctx t =
-    let
-        step : Maybe OpId -> OpId -> ( Tree Node, Id.Ctx, Dict String OpId ) -> ( Tree Node, Id.Ctx, Dict String OpId )
-        step newParent oldId ( acc, c, m ) =
-            case Tree.get oldId t of
-                Nothing ->
-                    ( acc, c, m )
-
-                Just content ->
-                    let
-                        ( childContent, c1, m1 ) =
-                            reStampWithMap c content
-
-                        ( newId, c2 ) =
-                            Id.nextId c1
-
-                        ( moveId, c3 ) =
-                            Id.nextId c2
-
-                        pos =
-                            Tree.siblingPos oldId t |> Maybe.withDefault (Crdt.Frac.between Nothing Nothing)
-
-                        acc1 =
-                            Tree.move moveId newId newParent pos childContent acc
-
-                        m2 =
-                            mergeRemap (Dict.insert (Id.opIdToString oldId) newId m) m1
-
-                        -- recurse into this node's children under the new id
-                        ( acc2, c4, m3 ) =
-                            List.foldl (step (Just newId)) ( acc1, c3, m2 ) (Tree.childrenOf oldId t)
-                    in
-                    ( acc2, c4, m3 )
-
-        ( rebuilt, ctx1, remap ) =
-            List.foldl (step Nothing) ( Tree.empty, ctx, Dict.empty ) (Tree.roots t)
-    in
-    ( Tree rebuilt, ctx1, remap )
-
-
-reStampRga : Id.Ctx -> (RgaNode -> Node) -> RgaNode -> ( Node, Id.Ctx, Dict String OpId )
-reStampRga ctx wrap rga =
+reStampRga : (Rga c -> Node) -> (Id.Ctx -> c -> ( c, Id.Ctx, Dict String OpId )) -> Id.Ctx -> Rga c -> ( Node, Id.Ctx, Dict String OpId )
+reStampRga wrap reStampContent ctx rga =
     let
         ( rebuilt, ctx1, remap ) =
-            Rga.toElementsInOrder rga
-                |> List.filter (not << .deleted)
-                |> List.foldl
-                    (\elOld ( acc, c, ( origin, m ) ) ->
-                        let
-                            ( child, c1, m1 ) =
-                                reStampWithMap c elOld.content
-
-                            ( acc1, c2 ) =
-                                Rga.insertAfter c1 origin child acc
-
-                            newId =
-                                Rga.lastVisibleId acc1
-                        in
-                        ( acc1
-                        , c2
-                        , ( newId
-                          , case newId of
-                                Just nid ->
-                                    mergeRemap (Dict.insert (Id.opIdToString elOld.id) nid m) m1
-
-                                Nothing ->
-                                    mergeRemap m m1
-                          )
-                        )
-                    )
-                    ( Rga.empty, ctx, ( Nothing, Dict.empty ) )
-                |> (\( acc, c, ( _, m ) ) -> ( acc, c, m ))
+            Rga.reStamp reStampContent ctx rga
     in
     ( wrap rebuilt, ctx1, remap )
 
 
-mergeMaps : Dict String Entry -> Dict String Entry -> Dict String Entry
-mergeMaps da db =
-    Dict.merge
-        Dict.insert
-        (\k ea eb -> Dict.insert k (mergeEntry ea eb))
-        Dict.insert
-        da
-        db
-        Dict.empty
-
-
-mergeEntry : Entry -> Entry -> Entry
-mergeEntry a b =
-    let
-        -- the value always merges recursively, regardless of presence
-        mergedValue =
-            merge a.value b.value
-
-        -- presence is an LWW boolean by stamp; on equal stamps, remove wins
-        -- (present = AND), which keeps the tiebreak commutative & associative.
-        ( present, stamp ) =
-            case Id.compareOpId a.stamp b.stamp of
-                GT ->
-                    ( a.present, a.stamp )
-
-                LT ->
-                    ( b.present, b.stamp )
-
-                EQ ->
-                    ( a.present && b.present, a.stamp )
-    in
-    { value = mergedValue, present = present, stamp = stamp }
-
-
-mergeRegister : Register -> Register -> Register
-mergeRegister a b =
-    case Id.compareOpId a.stamp b.stamp of
-        GT ->
-            a
-
-        LT ->
-            b
-
-        EQ ->
-            -- same stamp: pick the larger value so the result is independent of
-            -- argument order. Equal values make this a no-op.
-            if comparePrim a.value b.value == LT then
-                b
-
-            else
-                a
-
-
-{-| Two contributions for the same op id should be identical; if they disagree
-(corrupt input), pick the larger delta so merge is commutative.
+{-| A content re-stamper for content that holds **no ids** — a text character, a rich-text
+element. There is nothing to re-mint and nothing to add to the remap table; only the element
+ids around it change, and `Rga.reStamp` handles those.
 -}
-mergeIncrement : Increment -> Increment -> Increment
-mergeIncrement a b =
-    if a.delta >= b.delta then
-        a
-
-    else
-        b
-
-
-{-| Combine two mark ops sharing an id. They mint from one op so are normally
-identical; this only guards corrupt/adversarial input, resolving deterministically
-(by `type_`, then value) so merge stays order-independent.
--}
-mergeMarkOp : MarkOp -> MarkOp -> MarkOp
-mergeMarkOp a b =
-    case compare a.type_ b.type_ of
-        LT ->
-            b
-
-        GT ->
-            a
-
-        EQ ->
-            if comparePrim a.value b.value == LT then
-                b
-
-            else
-                a
-
-
-rank : Node -> Int
-rank node =
-    case node of
-        Reg _ ->
-            0
-
-        Map _ ->
-            1
-
-        Seq _ ->
-            2
-
-        Txt _ ->
-            3
-
-        Cnt _ ->
-            4
-
-        Mov _ ->
-            5
-
-        Tree _ ->
-            6
-
-        Rich _ ->
-            7
-
-
-
--- PRIM ORDER -----------------------------------------------------------------
-
-
-{-| A total order over primitives, used as the equal-stamp tiebreak in
-`mergeRegister`.
--}
-comparePrim : Prim -> Prim -> Order
-comparePrim a b =
-    case ( a, b ) of
-        ( PNull, PNull ) ->
-            EQ
-
-        ( PBool x, PBool y ) ->
-            compare (boolToInt x) (boolToInt y)
-
-        ( PInt x, PInt y ) ->
-            compare x y
-
-        ( PFloat x, PFloat y ) ->
-            compare x y
-
-        ( PString x, PString y ) ->
-            compare x y
-
-        _ ->
-            compare (primRank a) (primRank b)
-
-
-boolToInt : Bool -> Int
-boolToInt b =
-    if b then
-        1
-
-    else
-        0
-
-
-primRank : Prim -> Int
-primRank p =
-    case p of
-        PNull ->
-            0
-
-        PBool _ ->
-            1
-
-        PInt _ ->
-            2
-
-        PFloat _ ->
-            3
-
-        PString _ ->
-            4
+reStampInert : Id.Ctx -> c -> ( c, Id.Ctx, Dict String OpId )
+reStampInert ctx content =
+    ( content, ctx, Dict.empty )
 
 
 
@@ -1044,10 +725,11 @@ maxCounter node =
                 d
 
         Seq rga ->
-            rgaMaxCounter rga
+            rgaMaxCounter maxCounter rga
 
         Txt rga ->
-            rgaMaxCounter rga
+            -- element ids only: a character has no stamp of its own to clear
+            rgaMaxCounter (always 0) rga
 
         Cnt d ->
             Dict.foldl (\_ inc acc -> max acc (Id.opIdCounter inc.stamp)) 0 d
@@ -1059,7 +741,7 @@ maxCounter node =
             Tree.maxCounter maxCounter t
 
         Rich r ->
-            max (rgaMaxCounter r.text) (marksMaxCounter r.marks)
+            max (rgaMaxCounter (always 0) r.text) (marksMaxCounter r.marks)
 
 
 {-| Largest counter referenced by a mark set — each op's own id plus its anchor
@@ -1079,10 +761,10 @@ marksMaxCounter marks =
         marks
 
 
-rgaMaxCounter : RgaNode -> Int
-rgaMaxCounter rga =
+rgaMaxCounter : (c -> Int) -> Rga c -> Int
+rgaMaxCounter contentMax rga =
     List.foldl
-        (\el acc -> max acc (maxCounter el.content))
+        (\el acc -> max acc (contentMax el.content))
         (Rga.maxCounter rga)
         (Rga.elements rga)
 
@@ -1096,7 +778,10 @@ tree payloads) are compacted too.
 
 **Only sound below a stable cut** every replica has incorporated — dropping a tombstone an
 incoming op still anchors after would dangle it (see `Rga.compactTombstones` /
-`docs/04-gc.md`). The caller (`Doc.gc`, regime 1) owns that.
+`design-docs/04-gc.md`). The caller (`Crdt.Doc.compact`) owns that.
+
+Rich text needs more than the RGA pass, because its **marks** anchor to character ids:
+see `compactRich`.
 
 v1 scope: it does not yet prune a movable-list's or tree's own tombstone **sets** (deleted
 valueIds / nodeIds), only the RGA `.deleted` tombstones of `Seq`/`Txt`/`Rich` — which the
@@ -1119,13 +804,172 @@ compactTombstones node =
             Seq (Rga.compactTombstones compactTombstones rga)
 
         Txt rga ->
-            Txt (Rga.compactTombstones compactTombstones rga)
+            -- nothing to recurse into: the content is a character
+            Txt (Rga.compactTombstones identity rga)
 
         Rich r ->
-            Rich { r | text = Rga.compactTombstones compactTombstones r.text }
+            Rich (compactRich r)
 
         Mov ml ->
             Mov (MoveList.mapValues compactTombstones ml)
 
         Tree t ->
             Tree (Tree.mapPayloads compactTombstones t)
+
+
+{-| Compact a rich-text node: drop the character tombstones **and re-anchor the marks
+onto survivors**.
+
+The RGA pass alone is not enough here. A `MarkOp` names its endpoints by character id,
+and the cover logic resolves them against the _tombstone-inclusive_ element order
+(`Crdt.RichText.Internal.boundaryPos`), so an anchor left pointing at a dropped tombstone
+resolves to nothing and its mark stops covering **everything** — including the characters
+that are still alive. Bold a word, delete its first letter, compact: the bold would
+vanish from the rest of the word.
+
+The rewrite is **coverage-preserving**, so the read model is unchanged. Only an endpoint
+that named a _dropped tombstone_ moves; a `Nothing` ref (±∞, the text's own start/end —
+this is also what a leading block-type marker uses) and an endpoint naming a survivor are
+left exactly as they were, since they already mean the same thing before and after. A
+moved start becomes `Before` the first survivor the old boundary covered, a moved end
+`After` the last, which is the same survivor set by construction (compaction preserves
+the relative order of survivors). A mark that covered no survivor is **dropped**: none of
+its characters exist any more, so nothing can consult it again, and keeping it would mean
+keeping their tombstones forever.
+
+The one behaviour that does change is for an op that anchors _into_ the dropped region —
+a character inserted immediately after a dead tombstone would have been covered by a mark
+whose boundary sat there. Such an op is exactly what `compactTombstones`'s stable-cut
+requirement already excludes (`design-docs/04-gc.md`).
+
+-}
+compactRich : RichNode -> RichNode
+compactRich r =
+    let
+        indexed =
+            Rga.toElementsInOrder r.text |> List.indexedMap Tuple.pair
+
+        -- position of every element, tombstones included: the index space the mark
+        -- boundaries are expressed in before compaction.
+        posOf =
+            indexed
+                |> List.map (\( i, el ) -> ( Id.opIdToString el.id, i ))
+                |> Dict.fromList
+
+        survivors =
+            indexed
+                |> List.filterMap
+                    (\( i, el ) ->
+                        if el.deleted then
+                            Nothing
+
+                        else
+                            Just ( i, el.id )
+                    )
+
+        liveIds =
+            survivors |> List.map (\( _, id ) -> Id.opIdToString id) |> Set.fromList
+    in
+    { text = Rga.compactTombstones identity r.text
+    , marks =
+        Dict.foldl
+            (\key m acc ->
+                case reAnchorMark posOf liveIds survivors m of
+                    Just m1 ->
+                        Dict.insert key m1 acc
+
+                    Nothing ->
+                        acc
+            )
+            Dict.empty
+            r.marks
+    }
+
+
+{-| Re-anchor one mark for `compactRich`, or `Nothing` to drop it (it covers no
+surviving character). A mark neither of whose endpoints named a dropped tombstone comes
+back untouched.
+-}
+reAnchorMark : Dict String Int -> Set String -> List ( Int, OpId ) -> MarkOp -> Maybe MarkOp
+reAnchorMark posOf liveIds survivors m =
+    let
+        -- True only for an endpoint whose `ref` is a tombstone this pass drops. An
+        -- absent ref (the character has not arrived yet) is left alone: it may still
+        -- turn up, and until it does the mark covers nothing either way.
+        moves anchor =
+            case anchor.ref of
+                Nothing ->
+                    False
+
+                Just id ->
+                    let
+                        key =
+                            Id.opIdToString id
+                    in
+                    Dict.member key posOf && not (Set.member key liveIds)
+    in
+    if not (moves m.start) && not (moves m.end) then
+        Just m
+
+    else
+        case ( boundaryOf posOf m.start, boundaryOf posOf m.end ) of
+            ( Just s, Just e ) ->
+                let
+                    covered =
+                        survivors |> List.filter (\( i, _ ) -> s < toFloat i && toFloat i < e)
+                in
+                case ( List.head covered, List.head (List.reverse covered) ) of
+                    ( Just ( _, firstId ), Just ( _, lastId ) ) ->
+                        Just
+                            { m
+                                | start =
+                                    if moves m.start then
+                                        { ref = Just firstId, side = Before }
+
+                                    else
+                                        m.start
+                                , end =
+                                    if moves m.end then
+                                        { ref = Just lastId, side = After }
+
+                                    else
+                                        m.end
+                            }
+
+                    _ ->
+                        -- covers no survivor: the mark is dead
+                        Nothing
+
+            _ ->
+                -- an endpoint we cannot place (its character is not here at all); leave
+                -- the mark as it stands rather than guess
+                Just m
+
+
+{-| The boundary position of a mark anchor in the tombstone-inclusive order: just
+before/after its `ref` (a half-integer, so no element sits exactly on a boundary), or
+±∞ for a `Nothing` ref. Must agree with `Crdt.RichText.Internal.boundaryPos`, which is
+the same function over the read path.
+-}
+boundaryOf : Dict String Int -> MarkAnchor -> Maybe Float
+boundaryOf posOf anchor =
+    case anchor.ref of
+        Nothing ->
+            case anchor.side of
+                Before ->
+                    Just (-1 / 0)
+
+                After ->
+                    Just (1 / 0)
+
+        Just id ->
+            Dict.get (Id.opIdToString id) posOf
+                |> Maybe.map
+                    (\i ->
+                        case anchor.side of
+                            Before ->
+                                toFloat i - 0.5
+
+                            After ->
+                                toFloat i + 0.5
+                    )
