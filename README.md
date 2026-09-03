@@ -191,4 +191,4 @@ Speaking of those libraries, we have some [performance comparisons](https://gith
 
 ## License
 
-BSD-3-Clause.
+MIT.

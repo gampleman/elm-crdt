@@ -2,7 +2,7 @@
     "type": "package",
     "name": "gampleman/elm-crdt",
     "summary": "Pure-Elm CRDTs: compose records, lists, dicts and text",
-    "license": "BSD-3-Clause",
+    "license": "MIT",
     "version": "1.0.0",
     "exposed-modules": [
         "Crdt",
